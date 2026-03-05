@@ -1,0 +1,126 @@
+"""Knowledge retrieval tool — wraps the existing HybridSearch infrastructure."""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Optional
+
+from pydantic import BaseModel, Field
+
+from src.agent.tools.base import Tool
+from src.agent.types import ToolContext, ToolResult
+
+logger = logging.getLogger(__name__)
+
+
+class KnowledgeQueryArgs(BaseModel):
+    query: str = Field(..., description="检索查询文本")
+    top_k: int = Field(default=5, ge=1, le=20, description="返回结果数量")
+    collection: str = Field(default="computer_network", description="知识库 collection 名称，默认 computer_network，必须使用英文")
+
+
+class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
+    """Retrieves relevant knowledge chunks using HybridSearch (Dense + Sparse + RRF)."""
+
+    def __init__(self, settings: Any = None, hybrid_search: Any = None, reranker: Any = None) -> None:
+        self._settings = settings
+        self._hybrid_search = hybrid_search
+        self._reranker = reranker
+        self._initialized = hybrid_search is not None
+        self._current_collection: Optional[str] = None
+        self._embedding_client: Any = None
+
+    @property
+    def name(self) -> str:
+        return "knowledge_query"
+
+    @property
+    def description(self) -> str:
+        return "从知识库中检索与查询相关的课程内容，返回带引用的文本片段"
+
+    def get_args_schema(self) -> type[KnowledgeQueryArgs]:
+        return KnowledgeQueryArgs
+
+    def _ensure_initialized(self, collection: str = "computer_network") -> None:
+        if self._initialized and self._current_collection == collection:
+            return
+        if self._settings is None:
+            raise RuntimeError("KnowledgeQueryTool requires settings or a pre-built HybridSearch")
+
+        from src.core.settings import load_settings, resolve_path
+        from src.core.query_engine.query_processor import QueryProcessor
+        from src.core.query_engine.hybrid_search import create_hybrid_search
+        from src.core.query_engine.dense_retriever import create_dense_retriever
+        from src.core.query_engine.sparse_retriever import create_sparse_retriever
+        from src.core.query_engine.reranker import create_core_reranker
+        from src.ingestion.storage.bm25_indexer import BM25Indexer
+        from src.libs.embedding.embedding_factory import EmbeddingFactory
+        from src.libs.vector_store.vector_store_factory import VectorStoreFactory
+
+        settings = load_settings() if not hasattr(self._settings, 'embedding') else self._settings
+
+        if self._embedding_client is None:
+            self._embedding_client = EmbeddingFactory.create(settings)
+        if self._reranker is None:
+            self._reranker = create_core_reranker(settings=settings)
+
+        vector_store = VectorStoreFactory.create(settings, collection_name=collection)
+        dense_retriever = create_dense_retriever(
+            settings=settings,
+            embedding_client=self._embedding_client,
+            vector_store=vector_store,
+        )
+        bm25_indexer = BM25Indexer(index_dir=str(resolve_path(f"data/db/bm25/{collection}")))
+        sparse_retriever = create_sparse_retriever(
+            settings=settings,
+            bm25_indexer=bm25_indexer,
+            vector_store=vector_store,
+        )
+        sparse_retriever.default_collection = collection
+
+        query_processor = QueryProcessor()
+        self._hybrid_search = create_hybrid_search(
+            settings=settings,
+            query_processor=query_processor,
+            dense_retriever=dense_retriever,
+            sparse_retriever=sparse_retriever,
+        )
+        self._current_collection = collection
+        self._initialized = True
+        logger.info("KnowledgeQueryTool initialized for collection: %s", collection)
+
+    async def execute(self, context: ToolContext, args: KnowledgeQueryArgs) -> ToolResult:
+        try:
+            self._ensure_initialized(args.collection)
+            results = self._hybrid_search.search(
+                query=args.query,
+                top_k=args.top_k,
+                collection=args.collection,
+            )
+
+            if self._reranker:
+                try:
+                    results = self._reranker.rerank(args.query, results, top_k=args.top_k)
+                except Exception:
+                    logger.warning("Reranker failed, using raw results")
+
+            if not results:
+                return ToolResult(
+                    success=True,
+                    result_for_llm="未找到与查询相关的知识库内容。请尝试换一种表述重新提问。",
+                )
+
+            lines: list[str] = [f"检索到 {len(results)} 条相关内容：\n"]
+            for i, r in enumerate(results, 1):
+                source = r.metadata.get("source_path", "未知来源")
+                title = r.metadata.get("title", "")
+                header = f"**[{i}]** {title} — `{source}`" if title else f"**[{i}]** `{source}`"
+                lines.append(f"{header} (相关度: {r.score:.2f})")
+                lines.append(r.text[:800])
+                lines.append("")
+
+            return ToolResult(success=True, result_for_llm="\n".join(lines))
+
+        except Exception as exc:
+            logger.exception("KnowledgeQueryTool failed")
+            return ToolResult(success=False, error=f"知识检索失败: {exc}")

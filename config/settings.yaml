@@ -1,0 +1,144 @@
+# Modular RAG MCP Server - Configuration
+# This is the main configuration file for the MCP Server.
+# Edit this file to configure LLM, Embedding, VectorStore, and other services.
+
+# =============================================================================
+# LLM Configuration
+# =============================================================================
+llm:
+  provider: "zhipu"  # Options: openai, azure, ollama, deepseek, zhipu
+  model: "glm-4-flash"
+  api_key: "8d4c63adb3674b0d8cb6f93e30ee7625.khqdn2kakxI1Vntd"
+  base_url: "https://open.bigmodel.cn/api/paas/v4/"
+  temperature: 0.7
+  max_tokens: 4096
+
+# =============================================================================
+# Embedding Configuration
+# =============================================================================
+embedding:
+  provider: "ollama"  # Options: openai, azure, ollama
+  model: "nomic-embed-text"
+  dimensions: 768  # nomic-embed-text 维度
+  # Azure-specific settings (if provider is azure):
+  # azure_endpoint: ""
+  # deployment_name: "text-embedding-ada-002"
+  # api_version: "2024-02-15-preview"
+  # api_key: ""
+  # OpenAI-specific settings (if provider is openai):
+  # api_key: ${OPENAI_API_KEY}
+
+# =============================================================================
+# Vision LLM Configuration (for Image Captioning)
+# =============================================================================
+vision_llm:
+  enabled: true
+  provider: "zhipu"  # Options: openai, azure, zhipu, ollama
+  model: "glm-4v-flash"  # ZhiPu free vision model
+  api_key: "8d4c63adb3674b0d8cb6f93e30ee7625.khqdn2kakxI1Vntd"
+  base_url: "https://open.bigmodel.cn/api/paas/v4/"
+  max_image_size: 2048
+
+# =============================================================================
+# Vector Store Configuration
+# =============================================================================
+vector_store:
+  provider: "chroma"  # Options: chroma, qdrant, pinecone
+  persist_directory: "./data/db/chroma"
+  collection_name: "knowledge_hub"
+
+# =============================================================================
+# Retrieval Configuration
+# =============================================================================
+retrieval:
+  dense_top_k: 20
+  sparse_top_k: 20
+  fusion_top_k: 10
+  rrf_k: 60  # RRF constant
+
+# =============================================================================
+# Rerank Configuration
+# =============================================================================
+rerank:
+  enabled: false
+  provider: "none"  # Options: none, cross_encoder, llm
+  model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+  top_k: 5
+
+# =============================================================================
+# Evaluation Configuration
+# =============================================================================
+evaluation:
+  enabled: false
+  provider: "custom"  # Options: ragas, deepeval, custom
+  metrics:
+    - "hit_rate"
+    - "mrr"
+    - "faithfulness"
+
+# =============================================================================
+# Observability Configuration
+# =============================================================================
+observability:
+  log_level: "INFO"  # Options: DEBUG, INFO, WARNING, ERROR
+  trace_enabled: true
+  trace_file: "./logs/traces.jsonl"
+  structured_logging: true
+
+# =============================================================================
+# Ingestion Configuration
+# =============================================================================
+ingestion:
+  chunk_size: 1000
+  chunk_overlap: 200
+  splitter: "recursive"  # Options: recursive, semantic, fixed_length
+  batch_size: 100
+  
+  # Chunk Refiner Configuration (C5)
+  chunk_refiner:
+    use_llm: false  # Set to true to enable LLM-based refinement (requires LLM config)
+    # When use_llm is false or LLM call fails, falls back to rule-based refinement
+  
+  # Metadata Enricher Configuration (C6)
+  metadata_enricher:
+    use_llm: false  # Set to true to enable LLM-based enrichment (requires LLM config)
+    # When use_llm is false or LLM call fails, falls back to rule-based enrichment
+
+# =============================================================================
+# Agent Configuration
+# =============================================================================
+agent:
+  max_tool_iterations: 10
+  stream_responses: true
+  tool_timeout: 30
+  max_context_messages: 40
+  max_context_tokens: 8000
+  temperature: 0.7
+  system_prompt_path: "config/prompts/system_prompt.txt"
+  skills_dir: "src/agent/skills/definitions"
+  memory_enabled: true
+  conversation_store_dir: "data/conversations"
+  default_collection: "computer_network"
+  auto_ingest_dir: "docs/computer_internet"  # startup auto-ingest directory
+
+# =============================================================================
+# Server Configuration
+# =============================================================================
+server:
+  host: "0.0.0.0"
+  port: 8000
+  cors_origins: ["*"]
+  max_upload_size_mb: 50
+  upload_dir: "data/uploads"
+
+# =============================================================================
+# Memory Configuration
+# =============================================================================
+memory:
+  enabled: true
+  db_dir: "data/memory"
+  profile_enabled: true
+  error_memory_enabled: true
+  knowledge_map_enabled: true
+  skill_memory_enabled: true
+  decay_interval_hours: 24

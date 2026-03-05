@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>计算机网络课程学习助手</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github-dark.min.css" />
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11"></script>
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>📚 计算机网络课程学习助手</h1>
+      <div class="header-actions">
+        <button id="themeToggle" title="切换主题">🌙</button>
+        <button id="uploadBtn" title="上传课件">📎 上传</button>
+        <button id="helpBtn" title="帮助">❓</button>
+      </div>
+    </header>
+
+    <main>
+      <div id="chatContainer">
+        <div id="messages">
+          <div class="message assistant">
+            <div class="message-content">
+              <p>你好！我是计算机网络课程学习助手。我可以帮你：</p>
+              <ul>
+                <li><strong>知识问答</strong> — 回答计算机网络相关问题（TCP/IP、路由、应用层协议等）</li>
+                <li><strong>考点复习</strong> — 按章节生成结构化考点总结</li>
+                <li><strong>习题练习</strong> — 出题、答题、评判</li>
+                <li><strong>课件管理</strong> — 上传 PDF/PPT 扩展知识库</li>
+              </ul>
+              <p>试试输入 <code>/help</code> 查看所有技能，或直接提问吧！</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="inputArea">
+        <textarea id="messageInput" placeholder="输入你的问题...（Shift+Enter 换行）" rows="1"></textarea>
+        <button id="sendBtn">发送</button>
+      </div>
+    </main>
+
+    <!-- Upload Modal -->
+    <div id="uploadModal" class="modal hidden">
+      <div class="modal-content">
+        <h2>上传课件</h2>
+        <div id="dropZone">
+          <p>拖拽文件到此处，或点击选择</p>
+          <p class="hint">支持 .pdf 和 .pptx 格式，最大 50MB</p>
+          <input type="file" id="fileInput" accept=".pdf,.pptx" hidden />
+        </div>
+        <div id="uploadProgress" class="hidden">
+          <div class="progress-bar"><div class="progress-fill"></div></div>
+          <p id="uploadStatus"></p>
+        </div>
+        <button id="closeModal">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
