@@ -143,91 +143,46 @@ class ListCollectionsTool:
             )
         return self._config
     
-    def _get_chroma_client(self) -> Any:
-        """Get or create ChromaDB client.
-        
-        Returns:
-            ChromaDB PersistentClient instance.
-            
-        Raises:
-            ImportError: If chromadb is not installed.
-            RuntimeError: If client creation fails.
-        """
-        try:
-            import chromadb
-            from chromadb.config import Settings as ChromaSettings
-        except ImportError:
-            raise ImportError(
-                "chromadb package is required for list_collections. "
-                "Install it with: pip install chromadb"
-            )
-        
-        persist_path = Path(self.config.persist_directory).resolve()
-        
-        if not persist_path.exists():
-            logger.warning(f"ChromaDB directory does not exist: {persist_path}")
-            # Return client anyway - it will just have no collections
-            persist_path.mkdir(parents=True, exist_ok=True)
-        
-        try:
-            client = chromadb.PersistentClient(
-                path=str(persist_path),
-                settings=ChromaSettings(
-                    anonymized_telemetry=False,
-                    allow_reset=True,
-                )
-            )
-            return client
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to initialize ChromaDB client at '{persist_path}': {e}"
-            ) from e
-    
+    def _get_store(self) -> Any:
+        """Get vector store via factory (provider-agnostic)."""
+        from src.libs.vector_store import VectorStoreFactory
+        return VectorStoreFactory.create(self.settings)
+
     def list_collections(
         self,
         include_stats: bool = True
     ) -> List[CollectionInfo]:
-        """List all available collections.
-        
-        Args:
-            include_stats: Whether to include document counts.
-            
-        Returns:
-            List of CollectionInfo objects.
-        """
+        """List all available collections."""
         try:
-            client = self._get_chroma_client()
-        except (ImportError, RuntimeError) as e:
-            logger.error(f"Failed to get ChromaDB client: {e}")
+            store = self._get_store()
+        except Exception as e:
+            logger.error(f"Failed to create vector store: {e}")
             return []
-        
+
         collections_info: List[CollectionInfo] = []
-        
         try:
-            # Get all collections from ChromaDB
-            collections = client.list_collections()
-            
-            for collection in collections:
-                info = CollectionInfo(
-                    name=collection.name,
-                    metadata=collection.metadata
-                )
-                
-                if include_stats:
-                    try:
-                        info.count = collection.count()
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to get count for collection '{collection.name}': {e}"
-                        )
-                        info.count = None
-                
-                collections_info.append(info)
-                
+            if hasattr(store, "list_collections"):
+                names = store.list_collections()
+                for name in names:
+                    info = CollectionInfo(name=name)
+                    if include_stats and hasattr(store, "get_or_switch_collection"):
+                        try:
+                            store.get_or_switch_collection(name)
+                            stats = store.get_collection_stats()
+                            info.count = stats.get("count")
+                        except Exception as e:
+                            logger.warning(f"Stats failed for '{name}': {e}")
+                    collections_info.append(info)
+            else:
+                stats = store.get_collection_stats()
+                collections_info.append(CollectionInfo(
+                    name=stats.get("name", "default"),
+                    count=stats.get("count"),
+                ))
         except Exception as e:
             logger.error(f"Failed to list collections: {e}")
             return []
-        
+
         logger.info(f"Found {len(collections_info)} collections")
         return collections_info
     

@@ -323,35 +323,75 @@ class MetadataEnricher(BaseTransform):
         
         return enriched_chunks
     
+    # Patterns for content-type inference
+    _EXERCISE_RE = re.compile(r"例题|练习|习题|思考题|Exercise|Problem|Questions", re.IGNORECASE)
+    _DEFINITION_RE = re.compile(r"定义|Definition", re.IGNORECASE)
+    _THEOREM_RE = re.compile(r"定理|Theorem|引理|Lemma|推论|Corollary", re.IGNORECASE)
+    _EXAMPLE_RE = re.compile(r"[例示]例|Example|示例", re.IGNORECASE)
+    _SUMMARY_RE = re.compile(r"小结|总结|Summary|本章小结|Conclusion", re.IGNORECASE)
+    _CHAPTER_RE = re.compile(
+        r"(?:^|\n)(?:第[一二三四五六七八九十百\d]+[章节]|Chapter\s+\d+|(\d+)(?:\.\d+)*\s)",
+        re.IGNORECASE,
+    )
+    _FORMULA_RE = re.compile(r"\$\$?.+?\$\$?", re.DOTALL)
+
     def _rule_based_enrich(self, text: str) -> Dict[str, Any]:
         """Extract metadata using rule-based heuristics.
-        
-        Args:
-            text: Chunk text content
-            
-        Returns:
-            Dictionary with title, summary, tags
-            
-        Raises:
-            TypeError: If text is None
+
+        Returns title, summary, tags, content_type, has_formula, chapter, difficulty.
         """
         if text is None:
             raise TypeError("Chunk text cannot be None")
-        
-        # Extract title from first heading or first line
+
         title = self._extract_title(text)
-        
-        # Generate summary from first sentences
         summary = self._extract_summary(text)
-        
-        # Extract tags from common patterns
         tags = self._extract_tags(text)
-        
+        content_type = self._infer_content_type(text)
+        has_formula = bool(self._FORMULA_RE.search(text))
+        chapter = self._extract_chapter(text)
+        difficulty = self._infer_difficulty(text)
+
         return {
             'title': title,
             'summary': summary,
-            'tags': tags
+            'tags': tags,
+            'content_type': content_type,
+            'has_formula': has_formula,
+            'chapter': chapter,
+            'difficulty': difficulty,
         }
+
+    def _infer_content_type(self, text: str) -> str:
+        preview = text[:400]
+        if self._EXERCISE_RE.search(preview):
+            return "exercise"
+        if self._DEFINITION_RE.search(preview):
+            return "definition"
+        if self._THEOREM_RE.search(preview):
+            return "theorem"
+        if self._EXAMPLE_RE.search(preview):
+            return "example"
+        if self._SUMMARY_RE.search(preview):
+            return "summary"
+        if self._FORMULA_RE.search(text) and len(text) < 400:
+            return "formula"
+        return "concept"
+
+    def _extract_chapter(self, text: str) -> str:
+        m = self._CHAPTER_RE.search(text[:300])
+        if m:
+            return m.group(0).strip()
+        return ""
+
+    @staticmethod
+    def _infer_difficulty(text: str) -> str:
+        hard_kw = re.compile(r"证明|推导|Prove|Derive|综合|设计|高级", re.IGNORECASE)
+        medium_kw = re.compile(r"计算|分析|比较|Analyze|Compare|应用", re.IGNORECASE)
+        if hard_kw.search(text[:400]):
+            return "hard"
+        if medium_kw.search(text[:400]):
+            return "medium"
+        return "basic"
     
     def _extract_title(self, text: str) -> str:
         """Extract title from text using heuristics.

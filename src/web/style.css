@@ -251,6 +251,11 @@ main {
   color: var(--text);
 }
 
+/* KaTeX formula styling */
+.message-content .katex { font-size: 1.05em; }
+.message-content .katex-display { margin: 12px 0; overflow-x: auto; overflow-y: hidden; }
+[data-theme="dark"] .message-content .katex { color: var(--text); }
+
 @media (max-width: 640px) {
   #app { max-width: 100%; }
   .message-content { max-width: 90%; }

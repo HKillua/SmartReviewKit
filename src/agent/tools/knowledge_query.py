@@ -17,6 +17,8 @@ class KnowledgeQueryArgs(BaseModel):
     query: str = Field(..., description="检索查询文本")
     top_k: int = Field(default=5, ge=1, le=20, description="返回结果数量")
     collection: str = Field(default="computer_network", description="知识库 collection 名称，默认 computer_network，必须使用英文")
+    content_type: Optional[str] = Field(default=None, description="按内容类型过滤: concept/definition/theorem/example/exercise/formula/summary")
+    use_parent: bool = Field(default=False, description="如果匹配的是 child chunk，返回其 parent chunk 以获取更完整的上下文")
 
 
 class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
@@ -92,10 +94,16 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
     async def execute(self, context: ToolContext, args: KnowledgeQueryArgs) -> ToolResult:
         try:
             self._ensure_initialized(args.collection)
+
+            search_kwargs: dict[str, Any] = {}
+            if args.content_type:
+                search_kwargs["filters"] = {"content_type": args.content_type}
+
             results = self._hybrid_search.search(
                 query=args.query,
                 top_k=args.top_k,
                 collection=args.collection,
+                **search_kwargs,
             )
 
             if self._reranker:
@@ -110,11 +118,17 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                     result_for_llm="未找到与查询相关的知识库内容。请尝试换一种表述重新提问。",
                 )
 
+            # Parent chunk retrieval
+            if args.use_parent:
+                results = self._resolve_parents(results, args.collection)
+
             lines: list[str] = [f"检索到 {len(results)} 条相关内容：\n"]
             for i, r in enumerate(results, 1):
                 source = r.metadata.get("source_path", "未知来源")
                 title = r.metadata.get("title", "")
-                header = f"**[{i}]** {title} — `{source}`" if title else f"**[{i}]** `{source}`"
+                ct = r.metadata.get("content_type", "")
+                ct_tag = f" [{ct}]" if ct else ""
+                header = f"**[{i}]** {title}{ct_tag} — `{source}`" if title else f"**[{i}]{ct_tag}** `{source}`"
                 lines.append(f"{header} (相关度: {r.score:.2f})")
                 lines.append(r.text[:800])
                 lines.append("")
@@ -124,3 +138,49 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
         except Exception as exc:
             logger.exception("KnowledgeQueryTool failed")
             return ToolResult(success=False, error=f"知识检索失败: {exc}")
+
+    def _resolve_parents(self, results: list, collection: str) -> list:
+        """Replace child chunks with their parent chunks for richer context."""
+        try:
+            from src.libs.vector_store.vector_store_factory import VectorStoreFactory
+            from src.core.settings import load_settings
+            settings = self._settings or load_settings()
+            store = VectorStoreFactory.create(settings, collection_name=collection)
+
+            parent_ids: list[str] = []
+            result_map: dict[str, Any] = {}
+            for r in results:
+                pid = r.metadata.get("parent_chunk_id")
+                if pid and not r.metadata.get("is_parent"):
+                    parent_ids.append(pid)
+                    result_map[pid] = r
+                else:
+                    result_map[r.chunk_id] = r
+
+            if not parent_ids:
+                return results
+
+            parent_records = store.get_by_ids(parent_ids)
+            from src.core.types import RetrievalResult
+            enriched = []
+            seen: set[str] = set()
+            for r in results:
+                pid = r.metadata.get("parent_chunk_id")
+                if pid and pid not in seen:
+                    seen.add(pid)
+                    pr = next((p for p in parent_records if p.get("id") == pid), None)
+                    if pr and pr.get("text"):
+                        enriched.append(RetrievalResult(
+                            chunk_id=pid,
+                            score=r.score,
+                            text=pr["text"],
+                            metadata={**pr.get("metadata", {}), "resolved_from_child": r.chunk_id},
+                        ))
+                        continue
+                if r.chunk_id not in seen:
+                    seen.add(r.chunk_id)
+                    enriched.append(r)
+            return enriched
+        except Exception as e:
+            logger.warning(f"Parent resolution failed, returning original results: {e}")
+            return results

@@ -78,13 +78,8 @@ class OpenAIVisionLLM(BaseVisionLLM):
             getattr(settings.llm, "max_tokens", 1024), 1024
         )
 
-        client_kwargs: dict[str, Any] = {}
-        if resolved_api_key:
-            client_kwargs["api_key"] = resolved_api_key
-        if resolved_base_url:
-            client_kwargs["base_url"] = resolved_base_url
-
-        self._client = openai.OpenAI(**client_kwargs)
+        self.api_key = resolved_api_key
+        self.base_url = resolved_base_url
 
     # ------------------------------------------------------------------
     # Public API
@@ -131,7 +126,17 @@ class OpenAIVisionLLM(BaseVisionLLM):
         max_tokens = kwargs.get("max_tokens", self.default_max_tokens)
 
         try:
-            resp = self._client.chat.completions.create(
+            # Client creation moved here to use instance config
+            client_kwargs: dict[str, Any] = {}
+            if self.api_key:
+                client_kwargs["api_key"] = self.api_key
+            if self.base_url:
+                client_kwargs["base_url"] = self.base_url
+            
+            import openai
+            client = openai.OpenAI(**client_kwargs)
+            
+            resp = client.chat.completions.create(
                 model=self._model,
                 messages=api_messages,
                 temperature=temperature,
@@ -176,18 +181,23 @@ class OpenAIVisionLLM(BaseVisionLLM):
             return image
 
         img = Image.open(io.BytesIO(image_bytes))
+        
+        # Convert unsupported formats (e.g. GIF, WMF) to RGB for saving as JPEG/PNG
+        if img.format in ('GIF', 'WMF') or img.mode not in ('RGB', 'RGBA'):
+            img = img.convert('RGB')
+            
         w, h = img.size
         max_w, max_h = max_size
-        if w <= max_w and h <= max_h:
-            return image
-
-        ratio = min(max_w / w, max_h / h)
-        new_size = (int(w * ratio), int(h * ratio))
-        resized = img.resize(new_size, Image.Resampling.LANCZOS)
+        
+        # If resizing is needed
+        if w > max_w or h > max_h:
+            ratio = min(max_w / w, max_h / h)
+            new_size = (int(w * ratio), int(h * ratio))
+            img = img.resize(new_size, Image.Resampling.LANCZOS)
 
         buf = io.BytesIO()
-        resized.save(buf, format=img.format or "PNG")
-        return ImageInput(data=buf.getvalue(), mime_type=image.mime_type)
+        img.save(buf, format="JPEG")
+        return ImageInput(data=buf.getvalue(), mime_type="image/jpeg")
 
     # ------------------------------------------------------------------
     # Helpers

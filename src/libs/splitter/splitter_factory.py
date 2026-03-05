@@ -16,17 +16,24 @@ if TYPE_CHECKING:
 
 
 def _register_builtin_providers() -> None:
-    """Register built-in splitter providers.
-    
-    This function is called automatically when the module is imported.
-    It registers all available splitter implementations with the factory.
-    """
-    # Import here to avoid circular imports and handle missing dependencies gracefully
+    """Register built-in splitter providers."""
     try:
         from src.libs.splitter.recursive_splitter import RecursiveSplitter
         SplitterFactory.register_provider("recursive", RecursiveSplitter)
     except ImportError:
-        pass  # RecursiveSplitter not available (missing langchain dependency)
+        pass
+
+    try:
+        from src.libs.splitter.semantic_splitter import SemanticSplitter
+        SplitterFactory.register_provider("semantic", SemanticSplitter)
+    except ImportError:
+        pass
+
+    try:
+        from src.libs.splitter.structure_splitter import StructureAwareSplitter
+        SplitterFactory.register_provider("structure", StructureAwareSplitter)
+    except ImportError:
+        pass
 
 
 class SplitterFactory:

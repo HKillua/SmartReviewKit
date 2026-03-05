@@ -1,9 +1,10 @@
 # Developer Specification (DEV_SPEC)
 
-# Database Course Agent — 数据库课程智能学习助手
+# Course Learning Agent — 课程智能学习助手
 
 > 基于 RAG + Memory + Skill 的 ReAct Agent，参考 Vanna.ai v2.0 架构  
-> 系统设计详见：[docs/SYSTEM_DESIGN.md](docs/SYSTEM_DESIGN.md)
+> 系统设计详见：[docs/SYSTEM_DESIGN.md](docs/SYSTEM_DESIGN.md)  
+> 当前默认课程：计算机网络（通用架构，支持多课程切换）
 
 ---
 
@@ -11,7 +12,7 @@
 
 ### 1.1 项目定位
 
-本项目在现有 MODULAR-RAG-MCP-SERVER 的 RAG 基础设施之上，构建一个面向数据库课程的智能学习 Agent。Agent 具备考点复习、习题生成与评判、智能问答、动态知识库管理四大核心能力，并通过 Memory 记忆系统和 Skill 技能系统实现个性化学习体验。
+本项目在现有 MODULAR-RAG-MCP-SERVER 的 RAG 基础设施之上，构建一个面向课程学习的智能 Agent。Agent 具备考点复习、习题生成与评判、智能问答、动态知识库管理四大核心能力，并通过 Memory 记忆系统和 Skill 技能系统实现个性化学习体验。RAG 层采用结构化解析、多策略分块、Parent-Child 层级索引、双向量数据库（ChromaDB + Milvus）等面试级深度设计。
 
 ### 1.2 设计理念
 
@@ -32,8 +33,12 @@
 | 语言 | Python | >= 3.10 |
 | Web 框架 | FastAPI + Uvicorn | latest |
 | LLM SDK | openai (兼容多家 API) | >= 1.0 |
-| 向量存储 | ChromaDB (复用) | >= 0.4.0 |
+| 向量存储 | ChromaDB + Milvus Lite（双 Provider） | >= 0.4.0 / >= 2.4.0 |
 | PPT 解析 | python-pptx | latest |
+| PDF 解析 | MarkItDown + PyMuPDF | latest |
+| Word 解析 | python-docx | latest |
+| 数学公式 | lxml (OMML→LaTeX) | latest |
+| 前端公式渲染 | KaTeX | >= 0.16 |
 | 数据校验 | Pydantic | >= 2.0 |
 | SSE | sse-starlette | latest |
 | 测试 | pytest + pytest-asyncio | latest |
@@ -136,12 +141,24 @@ MODULAR-RAG-MCP-SERVER/
 │   │   └── app.js                     # [H3] SSE 客户端
 │   │
 │   ├── libs/loader/
-│   │   └── pptx_loader.py            # [E2] 新增：PPT Loader
+│   │   ├── pptx_loader.py            # [E2] PPT Loader → [J2] OMML 公式增强
+│   │   ├── pdf_loader.py             # 复用 → [J3] 公式后处理 + 结构检测
+│   │   ├── docx_loader.py            # [J4] 新增：Word Loader
+│   │   └── math_utils.py             # [J1] 新增：公式工具模块
 │   │
-│   ├── core/                          # 复用现有
-│   ├── ingestion/                     # 复用现有
+│   ├── libs/vector_store/
+│   │   ├── milvus_store.py            # [J11] 新增：Milvus Lite 存储
+│   │   └── ...                        # 其他复用现有
+│   │
+│   ├── ingestion/chunking/
+│   │   ├── semantic_splitter.py       # [J5] 新增：语义分块
+│   │   ├── structure_splitter.py      # [J6] 新增：结构感知分块
+│   │   └── ...                        # 其他复用现有
+│   │
+│   ├── core/                          # 复用现有 → [J1] types.py 增加 DocumentSection
+│   ├── ingestion/                     # 复用现有 → [J17] Pipeline 更新
 │   ├── libs/                          # 复用现有
-│   ├── mcp_server/                    # 复用现有
+│   ├── mcp_server/                    # 复用现有 → [J13] 工具解耦
 │   └── observability/                 # 复用现有
 │
 ├── tests/
@@ -164,7 +181,14 @@ MODULAR-RAG-MCP-SERVER/
 │   │   ├── test_memory_stores.py      # [F2]
 │   │   ├── test_memory_enhancer.py    # [F3]
 │   │   ├── test_skill_registry.py     # [G1]
-│   │   └── test_skill_workflow.py     # [G2]
+│   │   ├── test_skill_workflow.py     # [G2]
+│   │   ├── test_math_utils.py         # [J1]
+│   │   ├── test_docx_loader.py        # [J4]
+│   │   ├── test_semantic_splitter.py   # [J5]
+│   │   ├── test_structure_splitter.py  # [J6]
+│   │   ├── test_parent_child.py        # [J8]
+│   │   ├── test_milvus_store.py        # [J11]
+│   │   └── test_metadata_enricher.py   # [J14]
 │   │
 │   ├── integration/
 │   │   ├── test_agent_tool_loop.py    # [D3] Agent + Tools 集成
@@ -304,6 +328,7 @@ markers = [
 | G | Skill 技能系统 | 3 | 1.5 天 | D, E, F |
 | H | Server 与前端 | 3 | 1.5 天 | D |
 | I | 稳定性与可观测 | 3 | 1 天 | D |
+| J | RAG 深度优化 | 19 | 4 天 | A-I |
 
 ### 4.2 进度跟踪
 
@@ -381,6 +406,30 @@ markers = [
 | I2 | 审计日志 | [ ] | - | |
 | I3 | 可观测性（Metrics + Trace） | [ ] | - | |
 
+#### 阶段 J：RAG 深度优化
+
+| 任务编号 | 任务名称 | 状态 | 完成日期 | 备注 |
+|---------|---------|------|---------|------|
+| J1 | DocumentSection 数据类 + 公式工具模块 | [ ] | - | |
+| J2 | PptxLoader 增强：OMML 公式提取 + 结构化 sections | [ ] | - | |
+| J3 | PdfLoader 增强：公式后处理 + 章节检测 + 习题区域识别 | [ ] | - | |
+| J4 | DocxLoader 新建：Word 文档解析 + OMML 公式提取 | [ ] | - | |
+| J5 | SemanticSplitter：基于 embedding 余弦相似度检测语义断点 | [ ] | - | |
+| J6 | StructureAwareSplitter：按文档结构优先切分 + 内部语义细分 | [ ] | - | |
+| J7 | SplitterFactory 注册 semantic 和 structure provider | [ ] | - | |
+| J8 | DocumentChunker 生成 parent-child 层级 chunk | [ ] | - | |
+| J9 | ChromaStore HNSW 参数调优（M/ef_construction/search_ef） | [ ] | - | |
+| J10 | ChromaStore 多 collection 管理 + score_threshold + 复杂 metadata filter | [ ] | - | |
+| J11 | MilvusStore 实现（Milvus Lite 嵌入式模式） | [ ] | - | |
+| J12 | MilvusStore 注册 + settings.yaml 配置 | [ ] | - | |
+| J13 | MCP 工具解耦（消除 chromadb 直接依赖） | [ ] | - | |
+| J14 | MetadataEnricher 增强：content_type/has_formula/chapter/difficulty 标注 | [ ] | - | |
+| J15 | 前端 KaTeX 集成：数学公式渲染 + dark mode 适配 | [ ] | - | |
+| J16 | knowledge_query 工具支持 parent 回溯检索 + metadata filter | [ ] | - | |
+| J17 | pipeline 和 settings.yaml 更新支持新分块策略和 .docx | [ ] | - | |
+| J18 | 重新入库课件并端到端测试检索效果 | [ ] | - | |
+| J19 | 系统设计文档补充向量存储设计决策说明 | [ ] | - | |
+
 #### 总体进度
 
 | 阶段 | 总任务 | 已完成 | 进度 |
@@ -394,7 +443,8 @@ markers = [
 | G Skill | 3 | 0 | 0% |
 | H Server | 3 | 0 | 0% |
 | I 稳定性 | 3 | 0 | 0% |
-| **总计** | **29** | **0** | **0%** |
+| J RAG 深度优化 | 19 | 0 | 0% |
+| **总计** | **48** | **0** | **0%** |
 
 ---
 
@@ -1270,6 +1320,512 @@ markers = [
 
 ---
 
+### 阶段 J：RAG 深度优化
+
+> **设计动机**：面试中 RAG 系统常被认为"做得浅"，主要体现在：文档解析丢失公式/结构信息、分块策略单一、向量存储无参数调优、不支持生产级数据库、前端无法渲染数学公式。本阶段系统性解决这些问题。
+
+---
+
+### J1：DocumentSection 数据类 + 公式工具模块
+
+- **目标**：(1) 在 `core/types.py` 新增 `DocumentSection` 数据类，为结构化解析提供统一表示。(2) 新建 `math_utils.py` 提供 OMML→LaTeX 转换和 Unicode 数学符号标准化。
+- **修改文件**：
+  - `src/core/types.py`
+  - `src/libs/loader/math_utils.py`（新建）
+- **实现类/函数**：
+  - `DocumentSection(BaseModel)`：
+    - `title: str` — 章节标题
+    - `level: int` — 标题层级（1=章, 2=节, 3=小节）
+    - `content: str` — 正文内容（Markdown 格式，公式用 `$...$` 包裹）
+    - `content_type: str` — "concept" / "exercise" / "definition" / "example" / "formula"
+    - `page_or_slide: int` — 来源页码或 slide 编号
+    - `has_formula: bool` — 是否包含数学公式
+    - `images: list[dict]` — 关联图片元数据
+  - `omml_to_latex(element: etree.Element) -> str`：
+    - 解析 OMML XML 节点，将常见标签映射为 LaTeX
+    - 支持分数 `oMath/f` → `\frac{}{}`、上下标 `sSup/sSub` → `^{}_{}`、根号 `rad` → `\sqrt{}`、希腊字母、矩阵等
+    - 未识别标签提取纯文本 fallback
+  - `unicode_math_to_latex(text: str) -> str`：
+    - 将 Unicode 数学符号映射为 LaTeX 命令
+    - 覆盖：希腊字母（α→`\alpha`）、运算符（≤→`\leq`）、上下标（²→`^{2}`）、特殊符号（∞→`\infty`）
+  - `normalize_latex(text: str) -> str`：
+    - 统一公式定界符：`\(...\)` → `$...$`，`\[...\]` → `$$...$$`
+    - 清理冗余空白
+- **验收标准**：
+  - `DocumentSection` 可正常实例化和序列化
+  - `omml_to_latex` 可将标准 OMML 分数/上下标/根号节点转为正确 LaTeX
+  - `unicode_math_to_latex` 正确映射常见数学符号（α, β, ≤, ∑, ∫ 等）
+  - `normalize_latex` 统一不同来源的公式定界符
+- **测试方法**：`pytest -q tests/unit/test_math_utils.py`
+  - 构造 OMML XML 片段测试 `omml_to_latex`
+  - 测试 Unicode 字符串映射
+  - 测试定界符归一化
+
+---
+
+### J2：PptxLoader 增强 — OMML 公式提取 + 结构化解析
+
+- **目标**：增强 PptxLoader，使其能 (1) 从 shape XML 中提取 OMML 公式并转为 LaTeX，(2) 输出结构化的 `DocumentSection` 列表。
+- **修改文件**：
+  - `src/libs/loader/pptx_loader.py`
+- **实现要点**：
+  - **OMML 提取**：遍历 `shape._element` 的 XML，查找 `{http://schemas.openxmlformats.org/officeDocument/2006/math}oMath` 节点，调用 `omml_to_latex()` 转换
+  - **结构化 sections**：每个 slide 生成一个 `DocumentSection`：
+    - `title`：slide 标题（从 title placeholder 获取）
+    - `level`：根据字体大小或占位符类型推断层级（标题 slide → level 1，内容 slide → level 2）
+    - `content`：文本 + 表格 + 公式（LaTeX）+ 图片占位符 + 备注
+    - `content_type`：根据关键词规则标注（含"例题/练习" → exercise，含"定义/定理" → definition）
+    - `has_formula`：检测是否包含 `$...$` 或 `$$...$$`
+  - Document.metadata 中新增 `sections: list[dict]`（序列化的 DocumentSection 列表）
+- **验收标准**：
+  - 包含公式的 PPT slide 中公式被正确转为 LaTeX（如 `$E = mc^2$`）
+  - 无公式的 slide 不受影响
+  - 每个 slide 生成对应的 DocumentSection
+  - content_type 标注合理
+- **测试方法**：`pytest -q tests/unit/test_pptx_loader.py`
+  - 使用包含公式的测试 PPTX（可通过 python-pptx 构造）
+  - 验证公式提取结果
+  - 验证结构化 sections 输出
+
+---
+
+### J3：PdfLoader 增强 — 公式后处理 + 章节检测 + 习题识别
+
+- **目标**：增强 PdfLoader，对 MarkItDown 的输出做后处理，修复公式乱码、检测章节结构、识别习题区域。
+- **修改文件**：
+  - `src/libs/loader/pdf_loader.py`
+- **实现要点**：
+  - **MathFormulaPostProcessor**（新增内部类或方法）：
+    - 调用 `unicode_math_to_latex()` 修复常见乱码
+    - 正则检测已有 LaTeX 片段并调用 `normalize_latex()` 标准化
+    - 可选 fallback：对检测到公式密集但无法解析的页面，用 Vision LLM 做公式 OCR（`config.vision_llm.enabled` 控制开关）
+  - **章节检测**：
+    - 正则匹配 `^#{1,3} ` 提取 Markdown 标题
+    - 匹配 `^第[一二三四五六七八九十\d]+章` 或 `^\d+\.\d+` 等中文/英文章节模式
+    - 输出 `DocumentSection` 列表
+  - **习题区域识别**：
+    - 关键词检测：`习题`、`练习`、`思考题`、`Exercise`、`Problem`
+    - 每道习题拆为独立 section，`content_type = "exercise"`
+    - 如果检测到答案区域（`答案`、`解答`、`Solution`），与对应习题关联
+  - Document.metadata 中新增 `sections: list[dict]`
+- **验收标准**：
+  - Unicode 数学符号被正确映射为 LaTeX
+  - 章节结构被正确提取
+  - 习题区域被识别并标注为 "exercise"
+  - 非习题 PDF 不受影响
+- **测试方法**：`pytest -q tests/unit/test_pdf_loader.py`
+  - 使用 `tests/fixtures/generate_complex_pdf.py` 生成包含公式和习题的测试 PDF
+  - 验证公式后处理、章节检测、习题识别
+
+---
+
+### J4：DocxLoader — Word 文档解析
+
+- **目标**：新建 DocxLoader，支持 .docx 格式文档解析，包含 OMML 公式提取。
+- **修改文件**：
+  - `src/libs/loader/docx_loader.py`（新建）
+- **实现类/函数**：
+  - `DocxLoader(BaseLoader)`：
+    - `load(file_path) -> Document`
+    - 使用 `python-docx` 解析段落、表格、标题样式
+    - 遍历段落的 XML（`paragraph._element`），查找 OMML 公式节点，调用 `omml_to_latex()` 转换
+    - 标题层级：从 `paragraph.style.name`（Heading 1 → level 1, Heading 2 → level 2）获取
+    - 输出结构化 `DocumentSection` 列表
+    - 图片提取：使用 `docx.opc.part` 获取嵌入图片
+    - 元数据：`source_path`, `doc_type="docx"`, `title`, `page_count`, `sections`, `images`
+- **验收标准**：
+  - 正确解析包含标题、段落、表格、公式的 Word 文档
+  - OMML 公式转换为 LaTeX
+  - 标题层级正确识别
+  - 图片正确提取
+- **测试方法**：`pytest -q tests/unit/test_docx_loader.py`
+  - 使用 `python-docx` 构造包含公式的测试 .docx
+  - 验证解析结果
+
+---
+
+### J5：SemanticSplitter — 基于 Embedding 的语义分块
+
+- **目标**：新建 SemanticSplitter，通过 embedding 余弦相似度检测语义断点，实现语义感知的文本分块。
+- **修改文件**：
+  - `src/ingestion/chunking/semantic_splitter.py`（新建）
+- **实现类/函数**：
+  - `SemanticSplitter(BaseSplitter)`：
+    - 构造参数：`embedding_client`, `similarity_threshold: float = 0.5`, `min_chunk_size: int = 100`, `max_chunk_size: int = 1500`
+    - `split(document: Document) -> list[Chunk]` 流程：
+      1. 按句子/段落预切分（正则 `[。！？\n\n]`）
+      2. 对每个预切分片段做 embedding
+      3. 计算相邻片段的余弦相似度
+      4. 在相似度低于 `similarity_threshold` 的位置切分（语义断点）
+      5. 合并过小的 chunk，拆分过大的 chunk
+    - 性能优化：embedding 批量调用，缓存避免重复计算
+- **验收标准**：
+  - 语义相近的段落被合并为一个 chunk
+  - 语义不同的段落被切分到不同 chunk
+  - chunk 大小在 `[min_chunk_size, max_chunk_size]` 范围内
+  - embedding 调用次数合理（批量而非逐句）
+- **测试方法**：`pytest -q tests/unit/test_semantic_splitter.py`
+  - Mock embedding client 返回可控向量
+  - 构造语义变化明显的文本验证切分结果
+  - 验证 chunk 大小约束
+
+---
+
+### J6：StructureAwareSplitter — 结构感知分块
+
+- **目标**：新建 StructureAwareSplitter，优先按文档结构切分，内部再做语义细分。
+- **修改文件**：
+  - `src/ingestion/chunking/structure_splitter.py`（新建）
+- **实现类/函数**：
+  - `StructureAwareSplitter(BaseSplitter)`：
+    - 构造参数：`max_chunk_size: int = 1500`, `fallback_splitter: BaseSplitter`（用于内部细分）
+    - `split(document: Document) -> list[Chunk]` 流程：
+      1. 如果 Document.metadata 包含 `sections`：按 sections 切分
+      2. 否则 fallback 到 Markdown 标题切分（`^#{1,3} `）
+      3. 每个 section 如果超过 `max_chunk_size`：调用 `fallback_splitter` 做内部细分
+      4. 每个 chunk 继承 section 的元数据（title, level, content_type, has_formula）
+    - 特殊处理：
+      - 习题（content_type="exercise"）保持题目 + 答案在同一 chunk
+      - 公式（has_formula=True）的 chunk 不在公式中间切断
+- **验收标准**：
+  - 有结构化 sections 的文档按 section 切分
+  - 无结构化信息的文档按 Markdown 标题 fallback
+  - 过大 section 被内部细分
+  - 习题的题目和答案不被拆开
+  - 公式不被从中间切断
+- **测试方法**：`pytest -q tests/unit/test_structure_splitter.py`
+  - 构造包含 sections 的 Document 对象
+  - 验证结构化切分、fallback 切分、大 section 细分
+  - 验证习题和公式保护
+
+---
+
+### J7：SplitterFactory 注册新 Provider
+
+- **目标**：在 SplitterFactory 中注册 `semantic` 和 `structure` 两种新的分块策略 provider。
+- **修改文件**：
+  - `src/ingestion/chunking/splitter_factory.py`
+- **实现要点**：
+  - 注册 `"semantic"` → `SemanticSplitter`
+  - 注册 `"structure"` → `StructureAwareSplitter`
+  - `settings.yaml` 中 `ingestion.splitter` 支持新值
+- **验收标准**：
+  - `SplitterFactory.create("semantic", settings)` 返回 SemanticSplitter
+  - `SplitterFactory.create("structure", settings)` 返回 StructureAwareSplitter
+  - 未知 provider 抛出明确错误
+- **测试方法**：`pytest -q tests/unit/test_splitter_factory.py`
+
+---
+
+### J8：Parent-Child 层级 Chunk
+
+- **目标**：修改 DocumentChunker，在细粒度 chunk 之上生成粗粒度 parent chunk，形成 parent-child 层级索引。检索时命中 child chunk 可回溯到 parent 获取完整上下文。
+- **修改文件**：
+  - `src/ingestion/chunking/document_chunker.py`
+  - `src/core/types.py`（Chunk 类增加 `parent_id` 字段）
+- **实现要点**：
+  - `Chunk.parent_id: Optional[str]` — 指向 parent chunk 的 ID（None 表示 parent 自身）
+  - 两层索引策略：
+    - **Parent chunk**（粗粒度）：由整个 section 或相邻 sections 合并生成，`chunk_size ≈ 2000-3000`
+    - **Child chunk**（细粒度）：在 parent 内部切分，`chunk_size ≈ 500-1000`
+  - 两层 chunk 都入库到向量数据库，child 的 metadata 包含 `parent_id`
+  - 检索时搜 child，拿到 parent_id 后回溯 parent 获取完整上下文
+- **验收标准**：
+  - 每个 child chunk 有正确的 `parent_id`
+  - parent chunk 覆盖所有 child 内容
+  - 通过 `parent_id` 可查到对应的 parent chunk
+- **测试方法**：`pytest -q tests/unit/test_parent_child_chunking.py`
+  - 构造多 section 文档，验证 parent-child 关系
+  - 验证 parent_id 链路
+
+---
+
+### J9：ChromaStore HNSW 参数调优
+
+- **目标**：将 ChromaDB 的 HNSW 参数从默认值调优为经过考量的值，并暴露到 `settings.yaml`。
+- **修改文件**：
+  - `src/libs/vector_store/chroma_store.py`
+  - `config/settings.yaml`
+- **实现要点**：
+  - 从 `settings.yaml` 读取 HNSW 参数，传入 collection metadata：
+    ```python
+    metadata={
+        "hnsw:space": hnsw_cfg.space,           # "cosine"
+        "hnsw:construction_ef": hnsw_cfg.construction_ef,  # 200（默认100）
+        "hnsw:M": hnsw_cfg.M,                   # 32（默认16）
+        "hnsw:search_ef": hnsw_cfg.search_ef,   # 100（默认10）
+    }
+    ```
+  - settings.yaml 新增：
+    ```yaml
+    vector_store:
+      hnsw:
+        space: "cosine"
+        M: 32
+        construction_ef: 200
+        search_ef: 100
+    ```
+- **面试要点**：
+  - `M=32` vs 默认 `16`：增加图的连通性，提高召回率，代价是内存和构建时间
+  - `construction_ef=200` vs 默认 `100`：构建时探索更多候选，索引质量更高
+  - `search_ef=100` vs 默认 `10`：搜索时考察更多节点，召回更准，延迟略增
+  - 教育场景（< 50 万 chunks）下这些参数充分够用
+- **验收标准**：
+  - 参数从配置读取，非硬编码
+  - collection 创建时参数生效
+  - 参数不合法时有校验
+- **测试方法**：`pytest -q tests/unit/test_chroma_store.py`
+
+---
+
+### J10：ChromaStore 多 Collection + 高级查询
+
+- **目标**：增强 ChromaStore 支持动态 collection 切换、score_threshold 过滤、复杂 metadata filter。
+- **修改文件**：
+  - `src/libs/vector_store/chroma_store.py`
+- **实现要点**：
+  - `switch_collection(name: str)` — 动态切换当前 collection
+  - `query()` 增加 `score_threshold: Optional[float]` 参数，过滤低于阈值的结果
+  - `_build_where_clause()` 增强：支持 `$and`/`$or` 组合过滤
+  - `list_collections() -> list[dict]` — 列出所有 collection 及其统计信息
+- **验收标准**：
+  - 可在运行时切换 collection
+  - score_threshold 正确过滤低相关性结果
+  - 复杂 metadata filter（`$and`/`$or`）正确执行
+- **测试方法**：`pytest -q tests/unit/test_chroma_store.py`
+
+---
+
+### J11：MilvusStore 实现 — Milvus Lite 嵌入式
+
+- **目标**：新建 MilvusStore，使用 Milvus Lite 嵌入式模式（无需 Docker），实现 BaseVectorStore 全部接口。
+- **修改文件**：
+  - `src/libs/vector_store/milvus_store.py`（新建）
+- **实现类/函数**：
+  - `MilvusStore(BaseVectorStore)`：
+    - 构造函数：从 settings 读取 `uri`（Milvus Lite 使用本地文件路径，如 `./data/db/milvus.db`）、`dim`（向量维度）
+    - **Collection Schema**（显式定义）：
+      - `id`: VARCHAR(256), primary key
+      - `vector`: FLOAT_VECTOR(dim)
+      - `text`: VARCHAR(65535)
+      - `content_type`: VARCHAR(64)
+      - `source_path`: VARCHAR(1024)
+      - `metadata_json`: VARCHAR(65535)（其余 metadata 序列化为 JSON）
+    - **索引**：HNSW, metric_type="COSINE", M=32, efConstruction=200
+    - `upsert(records)` — 使用 `client.upsert()`
+    - `query(vector, top_k, filters)` — 使用 `client.search()`, 支持标量过滤表达式
+    - `delete(ids)` — 使用 `client.delete()`
+    - `clear()` — 删除并重建 collection
+    - `get_by_ids(ids)` — 使用 `client.get()`
+    - `delete_by_metadata(filter_dict)` — 使用标量过滤表达式删除
+  - Milvus 标量过滤表达式构建：`_build_filter_expr(filters) -> str`
+    - 等值：`field == "value"`
+    - 组合：`field1 == "v1" and field2 == "v2"`
+- **面试要点**：
+  - 显式 Schema vs ChromaDB schemaless：生产中强类型约束更安全
+  - Milvus Lite vs Standalone vs Cluster：不同部署形态的取舍
+  - 标量索引：Milvus 对 metadata 字段建索引，filter 性能远优于 ChromaDB 的暴力扫描
+  - 为什么两个都支持：插件化设计，一行配置切换，上层零修改
+- **验收标准**：
+  - `MilvusStore` 实现 BaseVectorStore 全部 6 个方法
+  - upsert + query 的结果与 ChromaStore 语义一致（同向量检索返回相同排序）
+  - 标量过滤正确执行
+  - Milvus Lite 模式无需外部服务
+- **测试方法**：`pytest -q tests/unit/test_milvus_store.py`
+  - 测试 CRUD 全流程
+  - 测试标量过滤
+  - 测试与 ChromaStore 结果一致性
+- **依赖**：`pip install "pymilvus>=2.4.0"`
+
+---
+
+### J12：MilvusStore 注册 + 配置
+
+- **目标**：在 VectorStoreFactory 注册 Milvus provider，在 settings.yaml 中增加 Milvus 配置段。
+- **修改文件**：
+  - `src/libs/vector_store/__init__.py`
+  - `config/settings.yaml`
+- **实现要点**：
+  - `__init__.py` 增加：
+    ```python
+    try:
+        from src.libs.vector_store.milvus_store import MilvusStore
+        VectorStoreFactory.register_provider('milvus', MilvusStore)
+    except ImportError:
+        pass
+    ```
+  - `settings.yaml` 增加：
+    ```yaml
+    vector_store:
+      provider: "chroma"  # Options: chroma, milvus
+      milvus:
+        uri: "./data/db/milvus.db"
+        dim: 768
+    ```
+  - 切换只需改 `provider: "milvus"`
+- **验收标准**：
+  - `VectorStoreFactory.list_providers()` 包含 `["chroma", "milvus"]`
+  - `provider: "milvus"` 时正确创建 MilvusStore
+  - `provider: "chroma"` 时行为不变
+- **测试方法**：`pytest -q tests/unit/test_vector_store_factory.py`
+
+---
+
+### J13：MCP 工具解耦
+
+- **目标**：重构 `list_collections` 和 `get_document_summary` MCP 工具，消除对 chromadb 的直接 `import` 依赖，改为通过 VectorStoreFactory 获取实例。
+- **修改文件**：
+  - `src/mcp_server/tools/list_collections.py`
+  - `src/mcp_server/tools/get_document_summary.py`
+- **实现要点**：
+  - 将 `import chromadb; chromadb.PersistentClient(...)` 替换为 `VectorStoreFactory.create(settings)`
+  - 在 BaseVectorStore 上增加 `list_collections()` 和 `get_collection_stats()` 方法（ChromaStore 和 MilvusStore 各自实现）
+- **验收标准**：
+  - 两个 MCP 工具不再直接 `import chromadb`
+  - 使用 Milvus provider 时两个工具仍正常工作
+- **测试方法**：手动验证 MCP 工具在两种 provider 下可用
+
+---
+
+### J14：MetadataEnricher 增强 — 内容类型标注规则引擎
+
+- **目标**：增强 MetadataEnricher 的规则引擎，对每个 chunk 做细粒度内容类型标注。
+- **修改文件**：
+  - `src/ingestion/transform/metadata_enricher.py`
+- **实现要点**：
+  - 新增标注字段：
+    - `content_type`："concept" / "exercise" / "definition" / "theorem" / "example" / "formula" / "summary"
+    - `has_formula`: bool — 检测 `$...$` 或 `$$...$$`
+    - `chapter`: str — 从上下文推断章节编号
+    - `difficulty`: int (1-5) — 基于关键词的难度估算（"简单/基础" → 1-2, "复杂/高级/证明" → 4-5）
+  - 规则优先级：section 元数据 > 关键词匹配 > 默认值 "concept"
+  - 习题结构化：检测并解析 "题号 + 题干 + 选项 + 答案" 模式
+- **验收标准**：
+  - 定义/定理类内容标注为 "definition"/"theorem"
+  - 习题标注为 "exercise"
+  - 含公式的 chunk `has_formula=True`
+  - 章节信息从 section 元数据继承
+- **测试方法**：`pytest -q tests/unit/test_metadata_enricher.py`
+  - 构造不同类型文本的 Chunk，验证标注结果
+
+---
+
+### J15：前端 KaTeX 集成
+
+- **目标**：在前端引入 KaTeX，使 LLM 输出的 LaTeX 公式能正确渲染为数学公式。
+- **修改文件**：
+  - `src/web/index.html`
+  - `src/web/app.js`
+  - `src/web/style.css`
+- **实现要点**：
+  - **index.html**：引入 KaTeX CDN（CSS + JS + auto-render 扩展）
+  - **app.js**：修改 `renderMarkdown()` 函数：
+    1. 先用 `marked.parse()` 渲染 Markdown
+    2. 创建临时 DOM 元素
+    3. 调用 `renderMathInElement()` 渲染数学公式
+    4. 支持定界符：`$$...$$`（块级）、`$...$`（行内）、`\[...\]`、`\(...\)`
+    5. `throwOnError: false` 避免无效 LaTeX 导致整段内容消失
+  - **style.css**：
+    - `.katex` 颜色继承 `var(--text)` 以适配 dark mode
+    - 块级公式（`.katex-display`）居中、上下 margin
+    - 行内公式垂直对齐调整
+- **验收标准**：
+  - `$E=mc^2$` 渲染为行内公式
+  - `$$\frac{a}{b}$$` 渲染为块级居中公式
+  - dark mode 下公式清晰可读
+  - 无效 LaTeX 显示原文不报错
+  - 流式输出时公式逐步渲染
+- **测试方法**：手动测试
+  - 在聊天框输入包含公式的问题，验证 LLM 回复中公式正确渲染
+  - 验证 dark/light 主题切换
+
+---
+
+### J16：knowledge_query 支持 Parent 回溯 + Metadata Filter
+
+- **目标**：增强 KnowledgeQueryTool，支持 parent chunk 回溯检索和 metadata 过滤。
+- **修改文件**：
+  - `src/agent/tools/knowledge_query.py`
+- **实现要点**：
+  - 检索到 child chunk 后，如果 `parent_id` 存在：
+    1. 通过 `vector_store.get_by_ids([parent_id])` 获取 parent chunk
+    2. 用 parent chunk 的完整上下文替代或补充 child chunk
+  - 新增 metadata filter 参数：
+    - `content_type: Optional[str]` — 过滤特定类型（如 "exercise"）
+    - `chapter: Optional[str]` — 过滤特定章节
+  - `result_for_llm` 中标注内容类型和来源章节
+- **验收标准**：
+  - 检索 child chunk 后能正确回溯到 parent
+  - metadata filter 正确过滤
+  - 无 parent_id 的 chunk 正常返回
+- **测试方法**：`pytest -q tests/unit/test_knowledge_query.py`
+  - Mock 包含 parent_id 的检索结果
+  - 验证回溯逻辑
+  - 验证 metadata filter
+
+---
+
+### J17：Pipeline 和 Settings 更新
+
+- **目标**：更新 IngestionPipeline 支持新的分块策略、.docx 格式、HNSW 配置。
+- **修改文件**：
+  - `src/ingestion/pipeline.py`
+  - `config/settings.yaml`
+- **实现要点**：
+  - Pipeline 中增加 DocxLoader 的文件扩展名映射（`.docx` → `DocxLoader`）
+  - `settings.yaml` 中 `ingestion.splitter` 支持 `"structure"` 和 `"semantic"` 值
+  - 新增 `ingestion.parent_child_enabled: true` 开关
+  - 新增 `ingestion.semantic_splitter` 配置段（`similarity_threshold`, `min_chunk_size`, `max_chunk_size`）
+- **验收标准**：
+  - `.docx` 文件可通过 Pipeline 入库
+  - `splitter: "structure"` 使用 StructureAwareSplitter
+  - `splitter: "semantic"` 使用 SemanticSplitter
+  - parent_child 开关可控
+- **测试方法**：集成测试，上传 .docx/.pdf/.pptx 文件验证全流程
+
+---
+
+### J18：重新入库 + 端到端测试
+
+- **目标**：清空现有知识库，使用新的解析和分块策略重新入库所有课件，端到端验证效果。
+- **步骤**：
+  1. 清空 ChromaDB 数据目录
+  2. 使用 `splitter: "structure"` + `parent_child_enabled: true` 重新入库 `docs/computer_internet/` 下所有 PPT
+  3. 验证检索效果：
+     - 查询包含公式的知识点，确认公式正确返回
+     - 查询习题，确认 content_type 过滤有效
+     - 查询概念，确认 parent chunk 回溯有效
+  4. 验证前端：公式正确渲染、各类内容显示正常
+  5. 切换 `provider: "milvus"` 重复验证
+- **验收标准**：
+  - 所有课件成功入库
+  - 公式内容在检索结果中正确保留
+  - 前端数学公式正确渲染
+  - ChromaDB 和 Milvus 两种 provider 都能正常工作
+- **测试方法**：手动端到端测试 + 自动化烟测脚本
+
+---
+
+### J19：系统设计文档补充
+
+- **目标**：在 `docs/SYSTEM_DESIGN.md` 中补充 RAG 深度优化的设计决策说明，为面试准备。
+- **修改文件**：
+  - `docs/SYSTEM_DESIGN.md`
+- **补充内容**：
+  - **文档解析设计**：为什么需要结构化解析、OMML→LaTeX 的技术选型
+  - **分块策略对比**：Recursive vs Semantic vs Structure-Aware 的优劣势和适用场景
+  - **Parent-Child 索引**：设计原理、检索回溯流程、与 Late Chunking 的对比
+  - **向量数据库设计决策**：
+    - 为什么同时支持 ChromaDB 和 Milvus（开发效率 vs 生产能力）
+    - HNSW 参数选择依据
+    - 数据量增长时的迁移方案
+    - 标量过滤索引的价值
+  - **内容类型标注**：规则引擎 vs LLM 标注的 trade-off
+- **验收标准**：文档清晰、面试可直接引用
+- **测试方法**：人工审查
+
+---
+
 ## 6. 配置文件变更
 
 ### settings.yaml 新增段
@@ -1313,6 +1869,33 @@ memory:
   decay_interval_hours: 24
 ```
 
+### settings.yaml 新增段（阶段 J）
+
+```yaml
+# --- Vector Store 扩展 ---
+vector_store:
+  provider: "chroma"  # Options: chroma, milvus
+  persist_directory: "./data/db/chroma"
+  collection_name: "knowledge_hub"
+  hnsw:
+    space: "cosine"
+    M: 32
+    construction_ef: 200
+    search_ef: 100
+  milvus:
+    uri: "./data/db/milvus.db"
+    dim: 768
+
+# --- Ingestion 扩展 ---
+ingestion:
+  splitter: "structure"  # Options: recursive, semantic, structure
+  parent_child_enabled: true
+  semantic_splitter:
+    similarity_threshold: 0.5
+    min_chunk_size: 100
+    max_chunk_size: 1500
+```
+
 ### pyproject.toml 新增依赖
 
 ```toml
@@ -1322,7 +1905,7 @@ dependencies = [
     "langchain-text-splitters>=0.3.0",
     "chromadb>=0.4.0",
     "mcp>=1.0.0",
-    # 新增依赖
+    # 阶段 A-I 新增
     "fastapi>=0.100.0",
     "uvicorn>=0.20.0",
     "sse-starlette>=1.0.0",
@@ -1331,6 +1914,10 @@ dependencies = [
     "pydantic>=2.0.0",
     "openai>=1.0.0",
     "httpx>=0.24.0",
+    # 阶段 J 新增
+    "python-docx>=1.0.0",
+    "pymilvus>=2.4.0",
+    "lxml>=4.9.0",
 ]
 ```
 
@@ -1345,6 +1932,8 @@ dependencies = [
 | **新 Skill** | 在 `skills/definitions/` 下创建 SKILL.md |
 | **新 Memory** | 实现新 Memory Store，注入 Enhancer |
 | **新 Loader** | 实现 `BaseLoader` 子类，添加到 Pipeline |
+| **新分块策略** | 实现 `BaseSplitter` 子类，注册到 SplitterFactory |
+| **新向量数据库** | 实现 `BaseVectorStore` 子类，注册到 VectorStoreFactory |
 | **新前端** | 调用 `/api/chat` SSE 端点即可 |
 | **多课程** | 通过 collection 隔离不同课程的知识库 |
-| **集群部署** | 将 ConversationStore 和 Memory 迁移到 Redis/PostgreSQL |
+| **集群部署** | 将 VectorStore 切换到 Milvus Cluster，ConversationStore 和 Memory 迁移到 Redis/PostgreSQL |

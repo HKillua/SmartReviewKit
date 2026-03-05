@@ -17,16 +17,14 @@ llm:
 # Embedding Configuration
 # =============================================================================
 embedding:
-  provider: "ollama"  # Options: openai, azure, ollama
-  model: "nomic-embed-text"
-  dimensions: 768  # nomic-embed-text 维度
-  # Azure-specific settings (if provider is azure):
-  # azure_endpoint: ""
-  # deployment_name: "text-embedding-ada-002"
-  # api_version: "2024-02-15-preview"
-  # api_key: ""
-  # OpenAI-specific settings (if provider is openai):
-  # api_key: ${OPENAI_API_KEY}
+  provider: "zhipu"  # Options: openai, azure, ollama, zhipu
+  model: "embedding-3"
+  dimensions: 2048  # embedding-3 supports 256/512/1024/2048, default 2048
+  api_key: "8d4c63adb3674b0d8cb6f93e30ee7625.khqdn2kakxI1Vntd"
+  base_url: "https://open.bigmodel.cn/api/paas/v4/"
+  # Ollama settings (if provider is ollama):
+  # model: "nomic-embed-text"
+  # dimensions: 768
 
 # =============================================================================
 # Vision LLM Configuration (for Image Captioning)
@@ -43,9 +41,17 @@ vision_llm:
 # Vector Store Configuration
 # =============================================================================
 vector_store:
-  provider: "chroma"  # Options: chroma, qdrant, pinecone
+  provider: "chroma"  # Options: chroma, milvus
   persist_directory: "./data/db/chroma"
   collection_name: "knowledge_hub"
+  hnsw:
+    space: "cosine"
+    M: 32
+    construction_ef: 200
+    search_ef: 100
+  milvus:
+    uri: "./data/db/milvus.db"
+    dim: 768
 
 # =============================================================================
 # Retrieval Configuration
@@ -91,18 +97,21 @@ observability:
 ingestion:
   chunk_size: 1000
   chunk_overlap: 200
-  splitter: "recursive"  # Options: recursive, semantic, fixed_length
-  batch_size: 100
-  
-  # Chunk Refiner Configuration (C5)
+  splitter: "structure"  # Options: recursive, semantic, structure
+  batch_size: 20
+
   chunk_refiner:
-    use_llm: false  # Set to true to enable LLM-based refinement (requires LLM config)
-    # When use_llm is false or LLM call fails, falls back to rule-based refinement
-  
-  # Metadata Enricher Configuration (C6)
+    use_llm: false
+    parent_child_enabled: true
+    parent_chunk_size: 2400
+    parent_chunk_overlap: 200
+    semantic_splitter:
+      similarity_threshold: 0.5
+      min_chunk_size: 100
+      max_chunk_size: 1500
+
   metadata_enricher:
-    use_llm: false  # Set to true to enable LLM-based enrichment (requires LLM config)
-    # When use_llm is false or LLM call fails, falls back to rule-based enrichment
+    use_llm: false
 
 # =============================================================================
 # Agent Configuration

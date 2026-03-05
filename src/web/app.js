@@ -47,6 +47,23 @@ function renderMarkdown(text) {
   return marked.parse(text);
 }
 
+function renderMathInElement(el) {
+  if (typeof renderMathInElement_ === 'undefined' && typeof window.renderMathInElement === 'undefined') return;
+  const fn = window.renderMathInElement;
+  if (!fn) return;
+  try {
+    fn(el, {
+      delimiters: [
+        { left: '$$', right: '$$', display: true },
+        { left: '$', right: '$', display: false },
+        { left: '\\[', right: '\\]', display: true },
+        { left: '\\(', right: '\\)', display: false },
+      ],
+      throwOnError: false,
+    });
+  } catch (e) { /* ignore KaTeX errors */ }
+}
+
 // --- Messages ---
 function addMessage(role, content) {
   const div = document.createElement('div');
@@ -54,6 +71,7 @@ function addMessage(role, content) {
   const inner = document.createElement('div');
   inner.className = 'message-content';
   inner.innerHTML = role === 'user' ? `<p>${escapeHtml(content)}</p>` : renderMarkdown(content);
+  if (role !== 'user') renderMathInElement(inner);
   div.appendChild(inner);
   messagesEl.appendChild(div);
   scrollToBottom();
@@ -131,6 +149,7 @@ async function sendMessage() {
               if (!assistantEl) { assistantEl = addMessage('assistant', ''); fullContent = ''; }
               fullContent += event.content || '';
               assistantEl.innerHTML = renderMarkdown(fullContent);
+              renderMathInElement(assistantEl);
               scrollToBottom();
               break;
             case 'tool_start':

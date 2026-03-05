@@ -29,6 +29,11 @@ from src.observability.logger import get_logger
 from src.libs.loader.file_integrity import SQLiteIntegrityChecker
 from src.libs.loader.pdf_loader import PdfLoader
 from src.libs.loader.pptx_loader import PptxLoader
+try:
+    from src.libs.loader.docx_loader import DocxLoader
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
 from src.libs.embedding.embedding_factory import EmbeddingFactory
 from src.libs.vector_store.vector_store_factory import VectorStoreFactory
 
@@ -70,7 +75,8 @@ class PipelineResult:
         image_count: int = 0,
         vector_ids: Optional[List[str]] = None,
         error: Optional[str] = None,
-        stages: Optional[Dict[str, Any]] = None
+        stages: Optional[Dict[str, Any]] = None,
+        failed_chunk_count: int = 0,
     ):
         self.success = success
         self.file_path = file_path
@@ -80,6 +86,7 @@ class PipelineResult:
         self.vector_ids = vector_ids or []
         self.error = error
         self.stages = stages or {}
+        self.failed_chunk_count = failed_chunk_count
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
@@ -91,7 +98,8 @@ class PipelineResult:
             "image_count": self.image_count,
             "vector_ids_count": len(self.vector_ids),
             "error": self.error,
-            "stages": self.stages
+            "stages": self.stages,
+            "failed_chunk_count": self.failed_chunk_count,
         }
 
 
@@ -152,7 +160,11 @@ class IngestionPipeline:
             extract_images=True,
             image_storage_dir=self._image_storage_dir,
         )
-        logger.info("  ✓ PdfLoader + PptxLoader initialized")
+        self.docx_loader = DocxLoader(
+            extract_images=True,
+            image_storage_dir=self._image_storage_dir,
+        ) if DOCX_AVAILABLE else None
+        logger.info("  ✓ PdfLoader + PptxLoader + DocxLoader initialized")
         
         # Stage 3: Chunker
         self.chunker = DocumentChunker(settings)
@@ -264,6 +276,8 @@ class IngestionPipeline:
             suffix = file_path.suffix.lower()
             if suffix == ".pptx":
                 document = self.pptx_loader.load(str(file_path))
+            elif suffix == ".docx" and self.docx_loader:
+                document = self.docx_loader.load(str(file_path))
             else:
                 document = self.pdf_loader.load(str(file_path))
             _elapsed = (time.monotonic() - _t0) * 1000.0
@@ -397,14 +411,47 @@ class IngestionPipeline:
             
             dense_vectors = batch_result.dense_vectors
             sparse_stats = batch_result.sparse_stats
+            failed_chunk_count = batch_result.failed_chunks
+            
+            # --- Handle encoding failures ---
+            if not dense_vectors:
+                # All batches failed → one full retry
+                logger.warning(
+                    "All %d chunks failed encoding, retrying once...", len(chunks)
+                )
+                _t0_retry = time.monotonic()
+                batch_result = self.batch_processor.process(chunks, trace)
+                _elapsed += (time.monotonic() - _t0_retry) * 1000.0
+                dense_vectors = batch_result.dense_vectors
+                sparse_stats = batch_result.sparse_stats
+                failed_chunk_count = batch_result.failed_chunks
+                if not dense_vectors:
+                    raise RuntimeError(
+                        f"Encoding failed for all {len(chunks)} chunks after retry"
+                    )
+            
+            if len(dense_vectors) < len(chunks):
+                # Partial failure → trim chunks to match dense_vectors
+                logger.warning(
+                    "Partial encoding failure: %d/%d chunks succeeded. "
+                    "Trimming chunks to match dense vectors.",
+                    len(dense_vectors), len(chunks),
+                )
+                ok_indices = batch_result.successful_chunk_indices
+                chunks = [chunks[i] for i in ok_indices]
+                # sparse_stats is already aligned by BatchProcessor
+                failed_chunk_count = batch_result.failed_chunks
             
             logger.info(f"  Dense vectors: {len(dense_vectors)} (dim={len(dense_vectors[0]) if dense_vectors else 0})")
             logger.info(f"  Sparse stats: {len(sparse_stats)} documents")
+            if failed_chunk_count > 0:
+                logger.warning(f"  ⚠️  Failed chunks: {failed_chunk_count}")
             
             stages["encoding"] = {
                 "dense_vector_count": len(dense_vectors),
                 "dense_dimension": len(dense_vectors[0]) if dense_vectors else 0,
-                "sparse_doc_count": len(sparse_stats)
+                "sparse_doc_count": len(sparse_stats),
+                "failed_chunk_count": failed_chunk_count,
             }
             if trace is not None:
                 # Build per-chunk encoding details (both dense & sparse)
@@ -433,6 +480,7 @@ class IngestionPipeline:
                     "dense_vector_count": len(dense_vectors),
                     "dense_dimension": len(dense_vectors[0]) if dense_vectors else 0,
                     "sparse_doc_count": len(sparse_stats),
+                    "failed_chunk_count": failed_chunk_count,
                     "chunks": chunk_details,
                 }, elapsed_ms=_elapsed)
             
@@ -536,7 +584,8 @@ class IngestionPipeline:
                 chunk_count=len(chunks),
                 image_count=len(images),
                 vector_ids=vector_ids,
-                stages=stages
+                stages=stages,
+                failed_chunk_count=failed_chunk_count,
             )
             
         except Exception as e:

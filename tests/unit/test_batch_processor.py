@@ -385,7 +385,7 @@ def test_process_records_batch_errors_to_trace():
     
     # Verify errors were recorded
     assert result.failed_chunks == 3
-    batch_0_error = trace.get_stage_data("batch_0_error")
+    batch_0_error = trace.get_stage_data("batch_0_dense_error")
     assert batch_0_error is not None
     assert "Dense encoder failed" in batch_0_error["error"]
 

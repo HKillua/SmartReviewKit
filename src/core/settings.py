@@ -323,4 +323,5 @@ def load_settings(path: str | Path | None = None) -> Settings:
 
     settings = Settings.from_dict(data or {})
     validate_settings(settings)
+    object.__setattr__(settings, "_raw", data or {})
     return settings

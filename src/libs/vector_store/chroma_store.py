@@ -121,11 +121,14 @@ class ChromaStore(BaseVectorStore):
                 f"Failed to initialize ChromaDB client at '{self.persist_directory}': {e}"
             ) from e
         
+        # Build HNSW metadata from config
+        self._hnsw_metadata = self._build_hnsw_metadata(settings)
+
         # Get or create collection
         try:
             self.collection = self.client.get_or_create_collection(
                 name=self.collection_name,
-                metadata={"hnsw:space": "cosine"}  # Use cosine similarity
+                metadata=self._hnsw_metadata,
             )
         except Exception as e:
             raise RuntimeError(
@@ -321,11 +324,10 @@ class ChromaStore(BaseVectorStore):
         try:
             target_collection = collection_name or self.collection_name
             
-            # Delete and recreate collection (most efficient way to clear in Chroma)
             self.client.delete_collection(name=target_collection)
             self.collection = self.client.get_or_create_collection(
                 name=target_collection,
-                metadata={"hnsw:space": "cosine"}
+                metadata=self._hnsw_metadata,
             )
             logger.info(f"Successfully cleared collection '{target_collection}'")
         except Exception as e:
@@ -404,34 +406,68 @@ class ChromaStore(BaseVectorStore):
         
         return sanitized
     
-    def _build_where_clause(self, filters: Dict[str, Any]) -> Dict[str, Any]:
-        """Build ChromaDB where clause from filters.
-        
-        Converts standard filter dict to ChromaDB's query format.
-        
-        Args:
-            filters: Standard filter dict (e.g., {'source': 'doc1.pdf'}).
-        
-        Returns:
-            ChromaDB where clause dict.
-        
-        Note:
-            ChromaDB supports operators like $eq, $ne, $gt, $lt, $in, etc.
-            For simplicity, we currently support only exact equality matches.
-            Future enhancement: support complex filters.
+    def _build_where_clause(self, filters: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Build ChromaDB where clause supporting ``$and`` / ``$or`` / operator dicts.
+
+        Accepts:
+          - Simple equality: ``{"source": "file.pdf"}``
+          - Operator dicts: ``{"score": {"$gt": 0.5}}``
+          - Logical combos: ``{"$and": [{"a": 1}, {"b": {"$ne": 2}}]}``
         """
-        # Simple implementation: exact equality matches only
-        # For complex filters (e.g., {'score': {'$gt': 0.5}}), extend this method
-        where = {}
+        if not filters:
+            return None
+
+        if "$and" in filters or "$or" in filters:
+            return filters
+
+        clauses = []
         for key, value in filters.items():
             if isinstance(value, dict):
-                # Already in ChromaDB operator format (e.g., {'$eq': 'value'})
-                where[key] = value
+                clauses.append({key: value})
             else:
-                # Simple equality
-                where[key] = value
-        
-        return where
+                clauses.append({key: value})
+
+        if len(clauses) == 1:
+            return clauses[0]
+        return {"$and": clauses}
+
+    @staticmethod
+    def _build_hnsw_metadata(settings: Any) -> Dict[str, Any]:
+        """Read HNSW tuning params from ``settings.vector_store`` raw dict."""
+        meta: Dict[str, Any] = {"hnsw:space": "cosine"}
+        try:
+            raw = getattr(settings, "_raw", None) or {}
+            vs = raw.get("vector_store", {}) if isinstance(raw, dict) else {}
+            hnsw = vs.get("hnsw", {}) if isinstance(vs, dict) else {}
+        except Exception:
+            hnsw = {}
+
+        if isinstance(hnsw, dict):
+            if "M" in hnsw:
+                meta["hnsw:M"] = int(hnsw["M"])
+            if "construction_ef" in hnsw:
+                meta["hnsw:construction_ef"] = int(hnsw["construction_ef"])
+            if "search_ef" in hnsw:
+                meta["hnsw:search_ef"] = int(hnsw["search_ef"])
+            if "space" in hnsw:
+                meta["hnsw:space"] = str(hnsw["space"])
+        return meta
+
+    def get_or_switch_collection(self, collection_name: str) -> None:
+        """Switch to a different collection (create if needed)."""
+        try:
+            self.collection = self.client.get_or_create_collection(
+                name=collection_name,
+                metadata=self._hnsw_metadata,
+            )
+            self.collection_name = collection_name
+            logger.info(f"Switched to collection '{collection_name}' (count={self.collection.count()})")
+        except Exception as e:
+            raise RuntimeError(f"Failed to switch to collection '{collection_name}': {e}") from e
+
+    def list_collections(self) -> List[str]:
+        """Return names of all collections in this ChromaDB instance."""
+        return [c.name for c in self.client.list_collections()]
     
     def get_collection_stats(self) -> Dict[str, Any]:
         """Get statistics about the current collection.

@@ -79,6 +79,48 @@ class Document:
 
 
 @dataclass
+class DocumentSection:
+    """Represents a structural section extracted from a document.
+
+    Used by enhanced loaders (PptxLoader, PdfLoader, DocxLoader) to express
+    the logical structure of a document before it is handed to a splitter.
+
+    Attributes:
+        title: Section heading text.
+        level: Heading depth (1 = chapter, 2 = section, 3 = subsection).
+        content: Body text in Markdown with LaTeX formulas wrapped in ``$...$``.
+        content_type: Semantic tag for the section.
+        page_or_slide: Originating page number or slide index.
+        has_formula: Whether the section contains mathematical formulas.
+        images: Image metadata dicts associated with this section.
+    """
+
+    title: str = ""
+    level: int = 2
+    content: str = ""
+    content_type: str = "concept"
+    page_or_slide: int = 0
+    has_formula: bool = False
+    images: List[Dict[str, Any]] = field(default_factory=list)
+
+    VALID_CONTENT_TYPES = frozenset({
+        "concept", "definition", "theorem", "example",
+        "exercise", "formula", "summary",
+    })
+
+    def __post_init__(self):
+        if self.content_type not in self.VALID_CONTENT_TYPES:
+            self.content_type = "concept"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "DocumentSection":
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
 class Chunk:
     """Represents a text chunk after splitting a Document.
     
@@ -124,6 +166,7 @@ class Chunk:
     start_offset: Optional[int] = None
     end_offset: Optional[int] = None
     source_ref: Optional[str] = None
+    parent_id: Optional[str] = None
     
     def __post_init__(self):
         """Validate required metadata fields."""

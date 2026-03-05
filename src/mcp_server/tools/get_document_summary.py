@@ -183,134 +183,46 @@ class GetDocumentSummaryTool:
             )
         return self._config
     
-    def _get_chroma_client(self) -> Any:
-        """Get or create ChromaDB client.
-        
-        Returns:
-            ChromaDB PersistentClient instance.
-            
-        Raises:
-            ImportError: If chromadb is not installed.
-            RuntimeError: If client creation fails.
-        """
+    def _get_store(self) -> Any:
+        """Get vector store via factory (provider-agnostic)."""
         if self._chroma_client is not None:
             return self._chroma_client
-        
-        try:
-            import chromadb
-            from chromadb.config import Settings as ChromaSettings
-        except ImportError:
-            raise ImportError(
-                "chromadb package is required for get_document_summary. "
-                "Install it with: pip install chromadb"
-            )
-        
-        persist_path = Path(self.config.persist_directory).resolve()
-        
-        if not persist_path.exists():
-            logger.warning(f"ChromaDB directory does not exist: {persist_path}")
-            persist_path.mkdir(parents=True, exist_ok=True)
-        
-        try:
-            self._chroma_client = chromadb.PersistentClient(
-                path=str(persist_path),
-                settings=ChromaSettings(
-                    anonymized_telemetry=False,
-                    allow_reset=True,
-                )
-            )
-            return self._chroma_client
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to initialize ChromaDB client at '{persist_path}': {e}"
-            ) from e
-    
-    def _get_collection(self, collection_name: Optional[str] = None) -> Any:
-        """Get ChromaDB collection.
-        
-        Args:
-            collection_name: Collection name. Uses default if not specified.
-            
-        Returns:
-            ChromaDB collection instance.
-            
-        Raises:
-            ValueError: If collection does not exist.
-        """
-        client = self._get_chroma_client()
-        name = collection_name or self.config.default_collection
-        
-        try:
-            # Try to get existing collection
-            collection = client.get_collection(name=name)
-            return collection
-        except Exception as e:
-            raise ValueError(
-                f"Collection '{name}' does not exist: {e}"
-            ) from e
-    
+        from src.libs.vector_store import VectorStoreFactory
+        self._chroma_client = VectorStoreFactory.create(self.settings)
+        return self._chroma_client
+
     def _find_document_chunks(
         self,
         doc_id: str,
         collection_name: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Find all chunks belonging to a document.
-        
-        Searches for chunks where source_ref matches the doc_id.
-        Falls back to partial matching on chunk IDs if source_ref is not available.
-        
-        Args:
-            doc_id: Document ID to search for.
-            collection_name: Collection to search in.
-            
-        Returns:
-            List of chunk data with metadata.
-        """
-        collection = self._get_collection(collection_name)
-        
-        # Strategy 1: Search by source_ref metadata
-        # Chunks should have source_ref pointing to parent document
+        """Find all chunks belonging to a document (provider-agnostic)."""
+        store = self._get_store()
+
+        if collection_name and hasattr(store, "get_or_switch_collection"):
+            store.get_or_switch_collection(collection_name)
+
+        # Strategy 1: metadata filter (source_ref == doc_id)
         try:
-            results = collection.get(
-                where={"source_ref": doc_id},
-                include=["metadatas", "documents"]
-            )
-            
-            if results and results.get('ids'):
-                chunks = []
-                for i, chunk_id in enumerate(results['ids']):
-                    chunks.append({
-                        'id': chunk_id,
-                        'text': results['documents'][i] if results.get('documents') else '',
-                        'metadata': results['metadatas'][i] if results.get('metadatas') else {}
-                    })
-                if chunks:
-                    return chunks
+            if hasattr(store, "delete_by_metadata"):
+                # Use the underlying collection directly if ChromaStore
+                if hasattr(store, "collection"):
+                    results = store.collection.get(
+                        where={"source_ref": doc_id},
+                        include=["metadatas", "documents"],
+                    )
+                    if results and results.get("ids"):
+                        return [
+                            {
+                                "id": results["ids"][i],
+                                "text": (results.get("documents") or [""])[i] or "",
+                                "metadata": (results.get("metadatas") or [{}])[i] or {},
+                            }
+                            for i in range(len(results["ids"]))
+                        ]
         except Exception as e:
             logger.debug(f"source_ref search failed: {e}")
-        
-        # Strategy 2: Search by doc_id in chunk ID prefix
-        # Chunk IDs follow format: {doc_id}_{index:04d}_{hash}
-        try:
-            # Get all chunks and filter by ID prefix
-            all_results = collection.get(include=["metadatas", "documents"])
-            
-            if all_results and all_results.get('ids'):
-                chunks = []
-                for i, chunk_id in enumerate(all_results['ids']):
-                    # Check if chunk_id starts with doc_id
-                    if chunk_id.startswith(doc_id) or doc_id in chunk_id:
-                        chunks.append({
-                            'id': chunk_id,
-                            'text': all_results['documents'][i] if all_results.get('documents') else '',
-                            'metadata': all_results['metadatas'][i] if all_results.get('metadatas') else {}
-                        })
-                if chunks:
-                    return chunks
-        except Exception as e:
-            logger.debug(f"ID prefix search failed: {e}")
-        
-        # No chunks found
+
         return []
     
     def get_document_summary(
