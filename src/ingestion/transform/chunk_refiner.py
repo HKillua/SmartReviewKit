@@ -1,6 +1,7 @@
 """Chunk refinement transform: rule-based cleaning + optional LLM enhancement."""
 
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -52,6 +53,7 @@ class ChunkRefiner(BaseTransform):
         """
         self.settings = settings
         self._llm = llm
+        self._llm_lock = threading.Lock()
         self._prompt_template: Optional[str] = None
         self._prompt_path = prompt_path or str(resolve_path("config/prompts/chunk_refinement.txt"))
         
@@ -64,14 +66,16 @@ class ChunkRefiner(BaseTransform):
         
     @property
     def llm(self) -> Optional[BaseLLM]:
-        """Lazy-load LLM instance."""
+        """Lazy-load LLM instance (thread-safe)."""
         if self.use_llm and self._llm is None:
-            try:
-                self._llm = LLMFactory.create(self.settings)
-                logger.info("LLM initialized for chunk refinement")
-            except Exception as e:
-                logger.warning(f"Failed to initialize LLM: {e}. Falling back to rule-based only.")
-                self.use_llm = False
+            with self._llm_lock:
+                if self._llm is None:
+                    try:
+                        self._llm = LLMFactory.create(self.settings)
+                        logger.info("LLM initialized for chunk refinement")
+                    except Exception as e:
+                        logger.warning(f"Failed to initialize LLM: {e}. Falling back to rule-based only.")
+                        self.use_llm = False
         return self._llm
     
     def transform(

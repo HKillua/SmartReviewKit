@@ -13,6 +13,7 @@ Design Principles:
 """
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Optional, Tuple
 import time
 from dataclasses import dataclass
@@ -156,9 +157,20 @@ class BatchProcessor:
             batch_sparse: List[Dict[str, Any]] = []
             dense_ok = False
 
-            # --- Dense encoding (independent) ---
+            # --- Parallel dense + sparse encoding ---
+            # Dense = network I/O, Sparse = CPU — no dependency between them.
+            def _run_dense():
+                return self.dense_encoder.encode(batch, trace=trace)
+
+            def _run_sparse():
+                return self.sparse_encoder.encode(batch, trace=trace)
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                dense_future = pool.submit(_run_dense)
+                sparse_future = pool.submit(_run_sparse)
+
             try:
-                batch_dense = self.dense_encoder.encode(batch, trace=trace)
+                batch_dense = dense_future.result()
                 dense_ok = True
             except Exception as e:
                 logger.error(
@@ -172,9 +184,8 @@ class BatchProcessor:
                         {"error": str(e), "batch_size": len(batch)}
                     )
 
-            # --- Sparse encoding (independent) ---
             try:
-                batch_sparse = self.sparse_encoder.encode(batch, trace=trace)
+                batch_sparse = sparse_future.result()
             except Exception as e:
                 logger.error(
                     "Batch %d/%d sparse encoding failed (%d chunks): %s",

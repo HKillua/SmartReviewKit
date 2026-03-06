@@ -202,51 +202,60 @@ class PdfLoader(BaseLoader):
         try:
             image_dir = self.image_storage_dir / doc_hash
             image_dir.mkdir(parents=True, exist_ok=True)
-            doc = fitz.open(pdf_path)
 
-            for page_num in range(len(doc)):
-                page = doc[page_num]
-                for img_index, img_info in enumerate(page.get_images(full=True)):
-                    try:
-                        xref = img_info[0]
-                        base_image = doc.extract_image(xref)
-                        image_bytes = base_image["image"]
-                        image_ext = base_image["ext"]
+            # Split text by page markers so we can insert placeholders near
+            # the pages where the images actually appear.
+            page_marker_re = re.compile(r"(\n---\s*Page\s+\d+\s*---\n)", re.IGNORECASE)
+            text_segments = page_marker_re.split(modified_text)
 
-                        image_id = f"{doc_hash[:8]}_{page_num + 1}_{img_index + 1}"
-                        image_path = image_dir / f"{image_id}.{image_ext}"
-                        image_path.write_bytes(image_bytes)
-
-                        placeholder = f"[IMAGE: {image_id}]"
-                        insert_position = len(modified_text)
-                        modified_text += f"\n{placeholder}\n"
-
+            with fitz.open(pdf_path) as doc:
+                for page_num in range(len(doc)):
+                    page = doc[page_num]
+                    page_placeholders: list[str] = []
+                    for img_index, img_info in enumerate(page.get_images(full=True)):
                         try:
-                            img = Image.open(io.BytesIO(image_bytes))
-                            width, height = img.size
-                        except Exception:
-                            width, height = 0, 0
+                            xref = img_info[0]
+                            base_image = doc.extract_image(xref)
+                            image_bytes = base_image["image"]
+                            image_ext = base_image["ext"]
 
-                        try:
-                            relative_path = image_path.relative_to(Path.cwd())
-                        except ValueError:
-                            relative_path = image_path.absolute()
+                            image_id = f"{doc_hash[:8]}_{page_num + 1}_{img_index + 1}"
+                            image_path = image_dir / f"{image_id}.{image_ext}"
+                            image_path.write_bytes(image_bytes)
 
-                        images_metadata.append({
-                            "id": image_id,
-                            "path": str(relative_path),
-                            "page": page_num + 1,
-                            "text_offset": insert_position + 1,
-                            "text_length": len(placeholder),
-                            "position": {
-                                "width": width, "height": height,
-                                "page": page_num + 1, "index": img_index,
-                            },
-                        })
-                    except Exception as e:
-                        logger.warning(f"Failed to extract image {img_index} from page {page_num + 1}: {e}")
+                            placeholder = f"[IMAGE: {image_id}]"
+                            page_placeholders.append(placeholder)
 
-            doc.close()
+                            try:
+                                img = Image.open(io.BytesIO(image_bytes))
+                                width, height = img.size
+                            except Exception:
+                                width, height = 0, 0
+
+                            try:
+                                relative_path = image_path.relative_to(Path.cwd())
+                            except ValueError:
+                                relative_path = image_path.absolute()
+
+                            images_metadata.append({
+                                "id": image_id,
+                                "path": str(relative_path),
+                                "page": page_num + 1,
+                                "text_offset": 0,
+                                "text_length": len(placeholder),
+                                "position": {
+                                    "width": width, "height": height,
+                                    "page": page_num + 1, "index": img_index,
+                                },
+                            })
+                        except Exception as e:
+                            logger.warning(f"Failed to extract image {img_index} from page {page_num + 1}: {e}")
+
+                    # Append page-level placeholders to end of text
+                    if page_placeholders:
+                        suffix = "\n" + "\n".join(page_placeholders) + "\n"
+                        modified_text += suffix
+
             if images_metadata:
                 logger.info(f"Extracted {len(images_metadata)} images from {pdf_path}")
             return modified_text, images_metadata

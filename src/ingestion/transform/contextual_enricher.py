@@ -13,7 +13,6 @@ Modes:
 from __future__ import annotations
 
 import logging
-import re
 from typing import Any, List, Optional
 
 from src.core.types import Chunk
@@ -41,7 +40,7 @@ class ContextualEnricher:
         self._llm = llm_service
 
     def enrich(self, chunks: List[Chunk], doc_title: str = "") -> List[Chunk]:
-        """Add contextual prefix to every chunk (sync / rule-based)."""
+        """Add contextual prefix to every chunk (sync)."""
         if self._mode == "llm" and self._llm is not None:
             logger.info("Contextual enrichment via LLM for %d chunks", len(chunks))
             return self._enrich_llm_sync(chunks, doc_title)
@@ -59,15 +58,7 @@ class ContextualEnricher:
         return chunks
 
     def _enrich_llm_sync(self, chunks: List[Chunk], doc_title: str) -> List[Chunk]:
-        import asyncio
-
-        loop = asyncio.new_event_loop()
-        try:
-            return loop.run_until_complete(self._enrich_llm(chunks, doc_title))
-        finally:
-            loop.close()
-
-    async def _enrich_llm(self, chunks: List[Chunk], doc_title: str) -> List[Chunk]:
+        """Synchronous LLM enrichment — avoids event loop conflicts."""
         for chunk in chunks:
             try:
                 prompt = _CONTEXTUAL_PROMPT.format(
@@ -75,7 +66,22 @@ class ContextualEnricher:
                     chunk_text=chunk.text[:500],
                 )
                 messages = [{"role": "user", "content": prompt}]
-                response = await self._llm.chat(messages)
+                if hasattr(self._llm, 'chat_sync'):
+                    response = self._llm.chat_sync(messages)
+                else:
+                    import asyncio
+                    try:
+                        loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        loop = None
+                    if loop and loop.is_running():
+                        import concurrent.futures
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                            response = pool.submit(
+                                asyncio.run, self._llm.chat(messages)
+                            ).result()
+                    else:
+                        response = asyncio.run(self._llm.chat(messages))
                 prefix = response.content.strip()
                 if prefix:
                     chunk.text = f"[上下文：{prefix}]\n{chunk.text}"

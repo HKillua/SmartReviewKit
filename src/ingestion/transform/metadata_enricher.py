@@ -1,6 +1,7 @@
 """Metadata enrichment transform: rule-based + optional LLM enhancement."""
 
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional, Dict, Any, Tuple
 from pathlib import Path
@@ -58,6 +59,7 @@ class MetadataEnricher(BaseTransform):
         """
         self.settings = settings
         self._llm = llm
+        self._llm_lock = threading.Lock()
         self._prompt_template: Optional[str] = None
         self._prompt_path = prompt_path or str(resolve_path("config/prompts/metadata_enrichment.txt"))
         
@@ -75,14 +77,17 @@ class MetadataEnricher(BaseTransform):
         
     @property
     def llm(self) -> Optional[BaseLLM]:
-        """Lazy-load LLM instance."""
+        """Lazy-load LLM instance (thread-safe)."""
         if self.use_llm and self._llm is None:
-            try:
-                self._llm = LLMFactory.create(self.settings)
-                logger.info("LLM initialized for metadata enrichment")
-            except Exception as e:
-                logger.warning(f"Failed to initialize LLM: {e}. Falling back to rule-based only.")
-                self.use_llm = False
+            with self._llm_lock:
+                if self._llm is not None:
+                    return self._llm
+                try:
+                    self._llm = LLMFactory.create(self.settings)
+                    logger.info("LLM initialized for metadata enrichment")
+                except Exception as e:
+                    logger.warning(f"Failed to initialize LLM: {e}. Falling back to rule-based only.")
+                    self.use_llm = False
         return self._llm
     
     def transform(

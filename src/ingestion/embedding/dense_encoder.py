@@ -12,9 +12,14 @@ Design Principles:
 - Deterministic: Same inputs produce same outputs
 """
 
+import time
 from typing import List, Optional, Any
 from src.core.types import Chunk
 from src.libs.embedding.base_embedding import BaseEmbedding
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class DenseEncoder:
@@ -47,12 +52,14 @@ class DenseEncoder:
         self,
         embedding: BaseEmbedding,
         batch_size: int = 100,
+        max_retries: int = 2,
     ):
         """Initialize DenseEncoder.
         
         Args:
             embedding: Embedding provider instance (from EmbeddingFactory)
             batch_size: Number of chunks to process per API call (default: 100)
+            max_retries: Max retries per batch on transient failures (default: 2)
         
         Raises:
             ValueError: If batch_size <= 0
@@ -62,6 +69,7 @@ class DenseEncoder:
         
         self.embedding = embedding
         self.batch_size = batch_size
+        self.max_retries = max_retries
     
     def encode(
         self,
@@ -116,27 +124,37 @@ class DenseEncoder:
             batch_end = min(batch_start + self.batch_size, len(texts))
             batch_texts = texts[batch_start:batch_end]
             
-            try:
-                # Call embedding provider
-                batch_vectors = self.embedding.embed(
-                    texts=batch_texts,
-                    trace=trace,
-                )
-                
-                # Validate output shape
-                if len(batch_vectors) != len(batch_texts):
-                    raise RuntimeError(
-                        f"Embedding provider returned {len(batch_vectors)} vectors "
-                        f"for {len(batch_texts)} texts in batch {batch_start}-{batch_end}"
+            last_error: Optional[Exception] = None
+            for attempt in range(1 + self.max_retries):
+                try:
+                    batch_vectors = self.embedding.embed(
+                        texts=batch_texts,
+                        trace=trace,
                     )
-                
-                all_vectors.extend(batch_vectors)
-                
-            except Exception as e:
-                # Re-raise with context about which batch failed
+                    if len(batch_vectors) != len(batch_texts):
+                        raise RuntimeError(
+                            f"Embedding provider returned {len(batch_vectors)} vectors "
+                            f"for {len(batch_texts)} texts in batch {batch_start}-{batch_end}"
+                        )
+                    all_vectors.extend(batch_vectors)
+                    last_error = None
+                    break
+                except Exception as e:
+                    last_error = e
+                    if attempt < self.max_retries:
+                        wait = 0.5 * (2 ** attempt)
+                        logger.warning(
+                            "Batch %d-%d failed (attempt %d/%d), retrying in %.1fs: %s",
+                            batch_start, batch_end, attempt + 1,
+                            1 + self.max_retries, wait, e,
+                        )
+                        time.sleep(wait)
+
+            if last_error is not None:
                 raise RuntimeError(
-                    f"Failed to encode batch {batch_start}-{batch_end}: {str(e)}"
-                ) from e
+                    f"Failed to encode batch {batch_start}-{batch_end} "
+                    f"after {1 + self.max_retries} attempts: {last_error}"
+                ) from last_error
         
         # Final validation
         if len(all_vectors) != len(chunks):

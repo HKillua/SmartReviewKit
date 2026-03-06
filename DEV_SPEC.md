@@ -2800,3 +2800,154 @@ rerank:
   - KnowledgeQueryTool 完整管线
 
 详细复习文档: `docs/RAG_RECALL_OPTIMIZATION.md`
+
+---
+
+## Phase R: Ingestion Pipeline 深度优化
+
+> 目标: 修复 ingestion 模块中 5 个关键 bug、6 个架构级薄弱点、4 个性能问题和若干代码质量问题，使其经得住面试官的深度拷打。
+
+### 总览表
+
+| ID | 类型 | 问题描述 | 优先级 |
+|----|------|----------|--------|
+| R1 | Bug | BM25 IDF 公式 `math.log` 对 `df≥N` 时产生零/负数崩溃 | P0 |
+| R2 | Bug | `remove_document` 中 `total_length` 同一 chunk 在多个 term posting 中重复累加 | P0 |
+| R3 | Bug | Pipeline `except` 块中 `file_hash` 可能未定义导致 `NameError` | P0 |
+| R4 | Bug | `DocumentChunker` 和 `VectorUpserter` 双重生成不同 Chunk ID，数据关联断裂 | P0 |
+| R5 | Bug | Parent-Child 索引 `p_idx*1000+c_idx` 碰撞风险 | P0 |
+| R6 | 架构 | BM25 索引无增量更新，每次全量重建 | P1 |
+| R7 | 架构 | `force=True` 重新 ingest 时旧 chunk 残留在存储中 | P1 |
+| R8 | 架构 | BatchProcessor 中 Dense/Sparse 编码串行执行，可并行 | P1 |
+| R9 | 架构 | ChunkRefiner/MetadataEnricher LLM 懒加载非线程安全 | P1 |
+| R10 | 架构 | ContextualEnricher 创建新 event loop 与已有 loop 冲突 | P1 |
+| R11 | 架构 | PdfLoader `fitz.open()` 无 context manager，异常路径资源泄漏 | P1 |
+| R12 | 性能 | SimHash 去重 O(n²) 复杂度，引入分桶优化 | P2 |
+| R13 | 性能 | Trace 记录全量 chunk 文本导致内存膨胀 | P2 |
+| R14 | 性能 | BM25 索引 JSON 存储无压缩 | P2 |
+| R15 | 性能 | DenseEncoder 单 batch 失败即全部失败，无重试 | P2 |
+| R16 | 质量 | `chunk_dedup.py` `_tokenize` 重复定义 | P3 |
+| R17 | 质量 | `sparse_encoder.get_corpus_stats()` 与 BM25Indexer 逻辑重复 | P3 |
+| R18 | 质量 | `VectorUpserter.upsert_batch` 未被调用，死代码 | P3 |
+| R19 | 质量 | PDF 图片占位符追加到文末而非对应页面位置 | P3 |
+
+### R1: BM25 IDF 数学错误修复
+
+变更文件: `src/ingestion/storage/bm25_indexer.py`
+
+原始公式 `log((N-df+0.5)/(df+0.5))` 在 `df≥N` 时产生零或负数导致 `math.log` 崩溃。改用 Lucene/Elasticsearch 标准变体 `log(1 + (N-df+0.5)/(df+0.5))`，确保 IDF 始终非负。
+
+### R2: total_length 重复累加修复
+
+变更文件: `src/ingestion/storage/bm25_indexer.py`
+
+`remove_document()` 中遍历所有 term 的 postings 累加 `doc_length`，同一 chunk 出现在多个 term 中被重复计数。修复为先按 `chunk_id` 收集唯一文档长度再求和。
+
+### R3: Pipeline except NameError 修复
+
+变更文件: `src/ingestion/pipeline.py`
+
+在 `except` 块中 `mark_failed()` 调用前检查 `file_hash` 是否已定义，未定义时跳过。
+
+### R4: 统一 Chunk ID 生成
+
+变更文件: `src/ingestion/storage/vector_upserter.py`
+
+移除 `VectorUpserter._generate_chunk_id()` 的重新生成逻辑，直接使用 `chunk.id`（由 `DocumentChunker` 已生成的确定性 ID）。
+
+### R5: Parent-Child 索引碰撞修复
+
+变更文件: `src/ingestion/chunking/document_chunker.py`
+
+将 `p_idx * 1000 + c_idx` 改为二级索引格式 `f"{p_idx}_{c_idx}"`，消除碰撞风险。
+
+### R6: BM25 增量更新
+
+变更文件: `src/ingestion/storage/bm25_indexer.py`
+
+新增 `add_document(term_stats, collection)` 方法，在已有索引基础上增量插入新文档的 posting，并重新计算受影响 term 的 IDF。避免每次全量重建。
+
+### R7: 文档更新时清理旧 chunk
+
+变更文件: `src/ingestion/pipeline.py`
+
+在 `force=True` 的重处理路径中，先调用 `DocumentManager` 级联清理旧版本 chunk（ChromaDB + BM25 + ImageStorage + IntegrityRecord），再执行新的 ingest 流程。
+
+### R8: Dense/Sparse 并行编码
+
+变更文件: `src/ingestion/embedding/batch_processor.py`
+
+使用 `concurrent.futures.ThreadPoolExecutor` 让 Dense（网络 I/O）和 Sparse（CPU 计算）在每个 batch 内并行执行，利用 I/O 等待时间。
+
+### R9: LLM 懒加载线程安全
+
+变更文件: `src/ingestion/transform/chunk_refiner.py`, `src/ingestion/transform/metadata_enricher.py`
+
+在 `llm` property 中使用 `threading.Lock` 保护懒加载初始化，防止多线程重复创建。
+
+### R10: ContextualEnricher event loop 兼容
+
+变更文件: `src/ingestion/transform/contextual_enricher.py`
+
+移除 `asyncio.new_event_loop()` 的不兼容用法，改为同步 LLM 调用，避免 event loop 嵌套问题。
+
+### R11: PdfLoader 资源管理
+
+变更文件: `src/libs/loader/pdf_loader.py`
+
+将 `fitz.open()` 改为 `with` 上下文管理器，确保异常路径下资源正确释放。同时移除未使用的 `re` 导入。
+
+### R12: SimHash 去重分桶优化
+
+变更文件: `src/ingestion/transform/chunk_dedup.py`
+
+引入 bit-sampling 分桶策略（将 64-bit SimHash 分成若干 band），先在同桶内做 Hamming 距离比较，将平均复杂度从 O(n²) 降至接近 O(n)。同时修复重复定义的 `_tokenize` 函数。
+
+### R13: Trace 文本裁剪
+
+变更文件: `src/ingestion/pipeline.py`
+
+Trace 中 chunk 文本改为只记录 `text[:200]` 的 preview + `char_len`，避免大文档 trace 膨胀到数 MB。
+
+### R14: BM25 索引 gzip 压缩
+
+变更文件: `src/ingestion/storage/bm25_indexer.py`
+
+存盘时使用 `gzip.open()` 压缩 JSON，加载时自动检测格式。文件扩展名改为 `.json.gz`，同时保持向后兼容（可读取旧 `.json`）。
+
+### R15: DenseEncoder 单 batch 重试
+
+变更文件: `src/ingestion/embedding/dense_encoder.py`
+
+增加指数退避重试逻辑（最多 2 次重试），单 batch 失败后不立即 raise，而是返回空 list 让 BatchProcessor 按部分失败处理。
+
+### R16-R19: 代码质量修复
+
+- R16: `chunk_dedup.py` 删除重复的 `_tokenize` 定义
+- R17: `sparse_encoder.py` 标注 `get_corpus_stats()` 为预留工具方法
+- R18: `vector_upserter.py` 删除未使用的 `upsert_batch()` 死代码
+- R19: `pdf_loader.py` 改进图片占位符插入位置（按页面分段插入）
+
+### 测试统计: 42 项全部通过 ✅
+
+- 单元测试 (`tests/unit/test_phase_r.py`): 37 项
+  - R1 BM25 IDF 公式: 6 项
+  - R2 total_length 去重: 2 项
+  - R3 Pipeline except 保护: 1 项
+  - R4 统一 Chunk ID: 3 项
+  - R5 Parent-Child 碰撞: 2 项
+  - R6 BM25 增量更新: 3 项
+  - R7 旧 chunk 清理: 2 项
+  - R8 并行编码: 2 项
+  - R9 线程安全 LLM: 2 项
+  - R10 Event Loop 安全: 2 项
+  - R12 SimHash LSH: 5 项
+  - R13 Trace 裁剪: 1 项
+  - R14 BM25 gzip: 3 项
+  - R15 DenseEncoder 重试: 3 项
+- 端到端测试 (`tests/e2e/test_phase_r_e2e.py`): 5 项
+  - BM25 全生命周期 (build → add → remove → query)
+  - Parent-Child 大文档 ID 唯一性
+  - SimHash 1000 chunk 性能基准 (< 5s)
+  - DenseEncoder 重试集成 (通过 BatchProcessor)
+  - Chunk ID 端到端一致性 (Chunker → Upserter)

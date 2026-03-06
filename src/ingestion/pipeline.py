@@ -271,6 +271,11 @@ class IngestionPipeline:
                     stages={"integrity": {"skipped": True, "reason": "already_processed"}}
                 )
             
+            # When force-reprocessing, clean up stale data from previous run
+            if self.force and self.integrity_checker.should_skip(file_hash):
+                logger.info("  🧹 Force mode: cleaning stale data from previous ingestion")
+                self._cleanup_stale_data(file_hash, str(file_path))
+            
             stages["integrity"] = {"file_hash": file_hash, "skipped": False}
             logger.info("  ✓ File needs processing")
             
@@ -309,7 +314,7 @@ class IngestionPipeline:
                     "doc_id": document.id,
                     "text_length": len(document.text),
                     "image_count": image_count,
-                    "text_preview": document.text,
+                    "text_preview": document.text[:300],
                 }, elapsed_ms=_elapsed)
             
             # ─────────────────────────────────────────────────────────────
@@ -339,7 +344,7 @@ class IngestionPipeline:
                     "chunks": [
                         {
                             "chunk_id": c.id,
-                            "text": c.text,
+                            "text_preview": c.text[:200],
                             "char_len": len(c.text),
                             "chunk_index": c.metadata.get("chunk_index", i),
                         }
@@ -410,14 +415,12 @@ class IngestionPipeline:
                     "chunks": [
                         {
                             "chunk_id": c.id,
-                            "text_before": _pre_refine_texts.get(c.id, ""),
-                            "text_after": c.text,
+                            "text_preview": c.text[:200],
                             "char_len": len(c.text),
                             "refined_by": c.metadata.get("refined_by", ""),
                             "enriched_by": c.metadata.get("enriched_by", ""),
                             "title": c.metadata.get("title", ""),
                             "tags": c.metadata.get("tags", []),
-                            "summary": c.metadata.get("summary", ""),
                         }
                         for c in chunks
                     ],
@@ -615,16 +618,45 @@ class IngestionPipeline:
             
         except Exception as e:
             logger.error(f"❌ Pipeline failed: {e}", exc_info=True)
-            self.integrity_checker.mark_failed(file_hash, str(file_path), str(e))
+            resolved_hash = file_hash if 'file_hash' in locals() else None
+            if resolved_hash is not None:
+                try:
+                    self.integrity_checker.mark_failed(resolved_hash, str(file_path), str(e))
+                except Exception:
+                    logger.warning("Failed to record ingestion failure in integrity DB")
             
             return PipelineResult(
                 success=False,
                 file_path=str(file_path),
-                doc_id=file_hash if 'file_hash' in locals() else None,
+                doc_id=resolved_hash,
                 error=str(e),
                 stages=stages
             )
     
+    def _cleanup_stale_data(self, file_hash: str, file_path: str) -> None:
+        """Remove data from a previous ingestion before re-processing.
+
+        Cascades deletion across vector store, BM25, image index, and
+        integrity records so that a ``force=True`` re-ingest starts clean.
+        """
+        try:
+            self.vector_upserter.vector_store.delete_by_metadata({"doc_hash": file_hash})
+            logger.info("    Cleaned stale vectors")
+        except Exception as e:
+            logger.warning("    Failed to clean stale vectors: %s", e)
+
+        try:
+            self.bm25_indexer.remove_document(file_hash, self.collection)
+            logger.info("    Cleaned stale BM25 postings")
+        except Exception as e:
+            logger.warning("    Failed to clean stale BM25 data: %s", e)
+
+        try:
+            self.integrity_checker.remove_record(file_hash)
+            logger.info("    Cleaned stale integrity record")
+        except Exception as e:
+            logger.warning("    Failed to clean stale integrity record: %s", e)
+
     def close(self) -> None:
         """Clean up resources."""
         self.image_storage.close()

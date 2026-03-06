@@ -13,6 +13,7 @@ Design Principles:
 - Deterministic: Same corpus produces same IDF scores
 """
 
+import gzip
 import json
 import math
 import os
@@ -202,13 +203,18 @@ class BM25Indexer:
             ValueError: If index file is corrupted
         """
         index_path = self._get_index_path(collection)
-        
-        if not index_path.exists():
+        legacy_path = self._get_legacy_index_path(collection)
+
+        if not index_path.exists() and not legacy_path.exists():
             return False
-        
+
         try:
-            with open(index_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+            if index_path.exists():
+                with gzip.open(index_path, 'rt', encoding='utf-8') as f:
+                    data = json.load(f)
+            else:
+                with open(legacy_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
             
             # Validate structure
             if "metadata" not in data or "index" not in data:
@@ -287,6 +293,77 @@ class BM25Indexer:
         
         return sorted_results[:top_k]
     
+    def add_document(
+        self,
+        term_stats: List[Dict[str, Any]],
+        collection: str = "default",
+        trace: Optional[Any] = None,
+    ) -> None:
+        """Incrementally add a document's chunks to an existing index.
+
+        If no index is loaded, falls back to a full ``build()``.
+        Otherwise merges new postings into the existing inverted index
+        and recalculates IDF values for affected terms only.
+
+        Args:
+            term_stats: Term statistics for the new document's chunks.
+            collection: Collection name.
+            trace: Optional TraceContext.
+        """
+        if not term_stats:
+            return
+
+        self._validate_term_stats(term_stats)
+
+        if not self._index:
+            if not self.load(collection):
+                self.build(term_stats, collection, trace)
+                return
+
+        # Merge new postings
+        for stat in term_stats:
+            chunk_id = stat["chunk_id"]
+            doc_length = stat["doc_length"]
+            for term, tf in stat["term_frequencies"].items():
+                if term not in self._index:
+                    self._index[term] = {"idf": 0.0, "df": 0, "postings": []}
+                entry = self._index[term]
+                entry["postings"].append({
+                    "chunk_id": chunk_id,
+                    "tf": tf,
+                    "doc_length": doc_length,
+                })
+                entry["df"] = len(entry["postings"])
+
+        # Recalculate metadata
+        chunk_lengths: dict[str, int] = {}
+        for td in self._index.values():
+            for p in td["postings"]:
+                chunk_lengths[p["chunk_id"]] = p["doc_length"]
+
+        num_docs = len(chunk_lengths)
+        total_length = sum(chunk_lengths.values())
+        avg_doc_length = total_length / num_docs if num_docs else 0.0
+
+        # Only recalculate IDF for terms that were affected
+        affected_terms = set()
+        for stat in term_stats:
+            affected_terms.update(stat["term_frequencies"].keys())
+
+        for term in affected_terms:
+            if term in self._index:
+                self._index[term]["idf"] = self._calculate_idf(
+                    num_docs, self._index[term]["df"]
+                )
+
+        self._metadata = {
+            "num_docs": num_docs,
+            "avg_doc_length": avg_doc_length,
+            "total_terms": len(self._index),
+            "collection": collection,
+        }
+        self._save(collection)
+
     def rebuild(
         self,
         term_stats: List[Dict[str, Any]],
@@ -350,15 +427,16 @@ class BM25Indexer:
             del self._index[term]
 
         if removed_any:
-            # Recalculate global metadata
-            all_chunk_ids: set[str] = set()
-            total_length = 0
+            # Recalculate global metadata — deduplicate by chunk_id first
+            # to avoid counting the same document length multiple times
+            # (a chunk appears in one posting per term it contains).
+            chunk_lengths: dict[str, int] = {}
             for td in self._index.values():
                 for p in td["postings"]:
-                    all_chunk_ids.add(p["chunk_id"])
-                    total_length += p["doc_length"]
+                    chunk_lengths[p["chunk_id"]] = p["doc_length"]
 
-            num_docs = len(all_chunk_ids)
+            num_docs = len(chunk_lengths)
+            total_length = sum(chunk_lengths.values())
             avg_doc_length = total_length / num_docs if num_docs else 0.0
 
             # Recalculate IDF values
@@ -378,18 +456,22 @@ class BM25Indexer:
     # ===== Private Helper Methods =====
     
     def _calculate_idf(self, num_docs: int, df: int) -> float:
-        """Calculate IDF using BM25 formula.
+        """Calculate IDF using Lucene/Elasticsearch BM25 variant.
         
-        Formula: IDF(term) = log((N - df + 0.5) / (df + 0.5))
+        Formula: IDF(term) = log(1 + (N - df + 0.5) / (df + 0.5))
+        
+        Uses the ``log(1 + ...)`` variant to guarantee non-negative IDF
+        even when ``df >= N`` (the classic formula can produce zero or
+        negative values which break ``math.log``).
         
         Args:
             num_docs: Total number of documents in corpus
             df: Document frequency (number of docs containing term)
         
         Returns:
-            IDF score (can be negative for very common terms)
+            IDF score (always >= 0)
         """
-        return math.log((num_docs - df + 0.5) / (df + 0.5))
+        return math.log(1 + (num_docs - df + 0.5) / (df + 0.5))
     
     def _calculate_bm25_score(
         self,
@@ -449,44 +531,32 @@ class BM25Indexer:
                 )
     
     def _get_index_path(self, collection: str) -> Path:
-        """Get file path for index file.
-        
-        Args:
-            collection: Collection name
-        
-        Returns:
-            Path to index file
-        """
+        """Get file path for index file (gzip-compressed)."""
+        return self.index_dir / f"{collection}_bm25.json.gz"
+
+    def _get_legacy_index_path(self, collection: str) -> Path:
+        """Legacy uncompressed path for backward compatibility."""
         return self.index_dir / f"{collection}_bm25.json"
-    
+
     def _save(self, collection: str) -> None:
-        """Save index to disk.
-        
-        Args:
-            collection: Collection name
+        """Save index to disk with gzip compression.
+
+        Uses atomic write (temp file + rename) to prevent corruption.
         """
-        # Ensure directory exists
         self.index_dir.mkdir(parents=True, exist_ok=True)
         
         index_path = self._get_index_path(collection)
-        
-        # Prepare data
         data = {
             "metadata": self._metadata,
             "index": self._index
         }
         
-        # Write atomically (write to temp file, then rename)
         temp_path = index_path.with_suffix('.tmp')
         try:
-            with open(temp_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            
-            # Atomic rename
+            with gzip.open(temp_path, 'wt', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False)
             temp_path.replace(index_path)
-            
-        except Exception as e:
-            # Clean up temp file if write failed
+        except Exception:
             if temp_path.exists():
                 temp_path.unlink()
             raise

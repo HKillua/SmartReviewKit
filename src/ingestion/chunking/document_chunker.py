@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Union
 
 from src.core.types import Chunk, Document
 from src.libs.splitter.splitter_factory import SplitterFactory
@@ -82,9 +82,9 @@ class DocumentChunker:
             child_fragments = self._splitter.split_text(parent_text)
             for c_idx, child_text in enumerate(child_fragments):
                 child_id = self._generate_chunk_id(
-                    document.id, p_idx * 1000 + c_idx, child_text, prefix="child"
+                    document.id, f"{p_idx}_{c_idx}", child_text, prefix="child"
                 )
-                child_meta = self._inherit_metadata(document, p_idx * 1000 + c_idx, child_text)
+                child_meta = self._inherit_metadata(document, c_idx, child_text)
                 child_meta["is_parent"] = False
                 child_meta["parent_chunk_id"] = parent_id
                 child_chunk = Chunk(
@@ -114,11 +114,12 @@ class DocumentChunker:
     # ------------------------------------------------------------------
 
     def _generate_chunk_id(
-        self, doc_id: str, index: int, text: str, prefix: str = ""
+        self, doc_id: str, index: Union[int, str], text: str, prefix: str = ""
     ) -> str:
         content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
         tag = f"{prefix}_" if prefix else ""
-        return f"{doc_id}_{tag}{index:04d}_{content_hash}"
+        idx_str = f"{index:04d}" if isinstance(index, int) else index
+        return f"{doc_id}_{tag}{idx_str}_{content_hash}"
 
     def _inherit_metadata(self, document: Document, chunk_index: int, chunk_text: str = "") -> dict:
         chunk_metadata = document.metadata.copy()

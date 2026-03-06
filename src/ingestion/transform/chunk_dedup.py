@@ -1,18 +1,22 @@
-"""Chunk-level semantic deduplication using SimHash.
+"""Chunk-level semantic deduplication using SimHash with LSH bucketing.
 
 SimHash produces a fixed-width fingerprint per chunk such that
 similar texts yield similar hashes.  Two hashes are considered
 duplicates if their Hamming distance is below a configurable
 threshold (default: 3 bits out of 64).
+
+Performance: Uses Locality-Sensitive Hashing (band partitioning)
+to avoid the naive O(n^2) pairwise comparison.  The 64-bit hash
+is split into ``num_bands`` bands; candidates that share at least
+one band are compared exactly.  Average complexity is near O(n).
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
-import re
-from collections import Counter
-from typing import List, Set
+from collections import Counter, defaultdict
+from typing import List
 
 from src.core.types import Chunk
 
@@ -23,6 +27,8 @@ try:
     _JIEBA = True
 except ImportError:
     _JIEBA = False
+
+import re
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 _WORD_RE = re.compile(r"[\w\u4e00-\u9fff]+", re.UNICODE)
@@ -64,33 +70,73 @@ def hamming_distance(a: int, b: int) -> int:
     return bin(a ^ b).count("1")
 
 
-def dedup_chunks(chunks: List[Chunk], threshold: int = 3) -> List[Chunk]:
+def _band_keys(fingerprint: int, num_bands: int = 4) -> List[int]:
+    """Split a 64-bit fingerprint into ``num_bands`` sub-hashes for LSH."""
+    band_width = HASH_BITS // num_bands
+    keys: List[int] = []
+    for b in range(num_bands):
+        shift = b * band_width
+        mask = (1 << band_width) - 1
+        keys.append((fingerprint >> shift) & mask)
+    return keys
+
+
+def dedup_chunks(
+    chunks: List[Chunk],
+    threshold: int = 3,
+    num_bands: int = 4,
+) -> List[Chunk]:
     """Remove near-duplicate chunks based on SimHash Hamming distance.
+
+    Uses LSH band partitioning to reduce average complexity from O(n^2)
+    to approximately O(n).  Chunks that share at least one band key
+    are compared exactly via Hamming distance.
 
     Args:
         chunks: Input list of chunks.
         threshold: Maximum Hamming distance to consider as duplicate.
+        num_bands: Number of LSH bands (more bands = higher recall,
+            slightly more comparisons).
 
     Returns:
         De-duplicated list (order preserved, first occurrence kept).
     """
-    seen_hashes: List[int] = []
-    kept: List[Chunk] = []
+    if threshold < 0 or threshold > HASH_BITS:
+        threshold = max(0, min(threshold, HASH_BITS))
+
+    # band_index -> list of (fingerprint, chunk_position)
+    buckets: List[dict[int, List[int]]] = [
+        defaultdict(list) for _ in range(num_bands)
+    ]
+    fingerprints: List[int] = []
+    kept_indices: List[int] = []
     removed = 0
 
-    for chunk in chunks:
+    for idx, chunk in enumerate(chunks):
         fp = simhash(chunk.text)
+        fingerprints.append(fp)
+        band_keys = _band_keys(fp, num_bands)
+
+        # Collect candidate set from all bands
+        candidate_set: set[int] = set()
+        for band_idx, key in enumerate(band_keys):
+            for prev_idx in buckets[band_idx][key]:
+                candidate_set.add(prev_idx)
+
+        # Check exact Hamming distance against candidates only
         is_dup = False
-        for existing in seen_hashes:
-            if hamming_distance(fp, existing) <= threshold:
+        for cand_idx in candidate_set:
+            if hamming_distance(fp, fingerprints[cand_idx]) <= threshold:
                 is_dup = True
                 break
+
         if not is_dup:
-            seen_hashes.append(fp)
-            kept.append(chunk)
+            kept_indices.append(idx)
+            for band_idx, key in enumerate(band_keys):
+                buckets[band_idx][key].append(idx)
         else:
             removed += 1
 
     if removed:
         logger.info("SimHash dedup removed %d / %d chunks", removed, len(chunks))
-    return kept
+    return [chunks[i] for i in kept_indices]

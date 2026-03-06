@@ -161,22 +161,17 @@ class SparseEncoder:
         encoded_chunks: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
         """Calculate corpus-level statistics from encoded chunks.
-        
-        Utility method for BM25Indexer to compute:
-        - Average document length
-        - Document frequency (how many docs contain each term)
-        - Total number of documents
-        
+
+        .. note::
+            BM25Indexer.build() computes these statistics internally.
+            This method is provided as a standalone utility for debugging,
+            evaluation scripts, or custom pipelines that bypass BM25Indexer.
+
         Args:
             encoded_chunks: List of statistics dicts from encode()
-        
+
         Returns:
-            Dictionary with corpus-level statistics:
-            {
-                "num_docs": int,
-                "avg_doc_length": float,
-                "document_frequency": Dict[str, int]  # term -> # docs containing it
-            }
+            Dictionary with corpus-level statistics.
         """
         if not encoded_chunks:
             return {
