@@ -74,6 +74,8 @@ class HybridSearchConfig:
     rerank_top_k: int = 5
     mmr_enabled: bool = False
     mmr_lambda: float = 0.7
+    min_score: float = 0.0
+    post_dedup_enabled: bool = True
 
 
 @dataclass
@@ -142,6 +144,7 @@ class HybridSearch:
         fusion: Optional[RRFFusion] = None,
         config: Optional[HybridSearchConfig] = None,
         reranker: Optional[BaseReranker] = None,
+        **kwargs: Any,
     ) -> None:
         """Initialize HybridSearch with components.
         
@@ -163,6 +166,7 @@ class HybridSearch:
         self.sparse_retriever = sparse_retriever
         self.fusion = fusion
         self.reranker = reranker
+        self.embedding_client = kwargs.get("embedding_client")
         
         # Extract config from settings or use provided/default
         self.config = config or self._extract_config(settings)
@@ -203,6 +207,8 @@ class HybridSearch:
             rerank_top_k=getattr(retrieval_config, 'rerank_top_k', 5),
             mmr_enabled=getattr(retrieval_config, 'mmr_enabled', False),
             mmr_lambda=getattr(retrieval_config, 'mmr_lambda', 0.7),
+            min_score=getattr(retrieval_config, 'min_score', 0.0),
+            post_dedup_enabled=getattr(retrieval_config, 'post_dedup_enabled', True),
         )
     
     def search(
@@ -212,6 +218,7 @@ class HybridSearch:
         filters: Optional[Dict[str, Any]] = None,
         trace: Optional[Any] = None,
         return_details: bool = False,
+        query_vector: Optional[List[float]] = None,
     ) -> List[RetrievalResult] | HybridSearchResult:
         """Perform hybrid search combining Dense and Sparse retrieval.
         
@@ -257,11 +264,12 @@ class HybridSearch:
         # Merge explicit filters with query-extracted filters
         merged_filters = self._merge_filters(processed_query.filters, filters)
         
-        # Step 2: Run retrievals
+        # Step 2: Run retrievals (pass query_vector for HyDE support)
         dense_results, sparse_results, dense_error, sparse_error = self._run_retrievals(
             processed_query=processed_query,
             filters=merged_filters,
             trace=trace,
+            query_vector=query_vector,
         )
         
         # Step 3: Handle fallback scenarios
@@ -302,7 +310,19 @@ class HybridSearch:
         if self.config.rerank_enabled and self.reranker is not None:
             fused_results = self._apply_reranker(query, fused_results, trace)
         
-        # Step 7: Limit to top_k
+        # Step 7: MMR diversity (if enabled)
+        if self.config.mmr_enabled and self.embedding_client is not None and fused_results:
+            fused_results = self._apply_mmr(query, fused_results, effective_top_k, trace)
+        
+        # Step 8: Min score filtering
+        if self.config.min_score > 0:
+            fused_results = [r for r in fused_results if r.score >= self.config.min_score]
+        
+        # Step 9: Post-retrieval semantic dedup
+        if self.config.post_dedup_enabled and len(fused_results) > 1:
+            fused_results = self._apply_post_dedup(fused_results)
+        
+        # Step 10: Limit to top_k
         final_results = fused_results[:effective_top_k]
         
         logger.debug(f"HybridSearch: returning {len(final_results)} results")
@@ -367,6 +387,7 @@ class HybridSearch:
         processed_query: ProcessedQuery,
         filters: Optional[Dict[str, Any]],
         trace: Optional[Any],
+        query_vector: Optional[List[float]] = None,
     ) -> Tuple[
         Optional[List[RetrievalResult]],
         Optional[List[RetrievalResult]],
@@ -409,15 +430,13 @@ class HybridSearch:
             return dense_results, sparse_results, dense_error, sparse_error
         
         if self.config.parallel_retrieval and run_dense and run_sparse:
-            # Run in parallel
             dense_results, sparse_results, dense_error, sparse_error = (
-                self._run_parallel_retrievals(processed_query, filters, trace)
+                self._run_parallel_retrievals(processed_query, filters, trace, query_vector)
             )
         else:
-            # Run sequentially
             if run_dense:
                 dense_results, dense_error = self._run_dense_retrieval(
-                    processed_query.original_query, filters, trace
+                    processed_query.original_query, filters, trace, query_vector
                 )
             
             if run_sparse:
@@ -432,6 +451,7 @@ class HybridSearch:
         processed_query: ProcessedQuery,
         filters: Optional[Dict[str, Any]],
         trace: Optional[Any],
+        query_vector: Optional[List[float]] = None,
     ) -> Tuple[
         Optional[List[RetrievalResult]],
         Optional[List[RetrievalResult]],
@@ -456,12 +476,12 @@ class HybridSearch:
         with ThreadPoolExecutor(max_workers=2) as executor:
             futures = {}
             
-            # Submit dense retrieval
             futures['dense'] = executor.submit(
                 self._run_dense_retrieval,
                 processed_query.original_query,
                 filters,
                 trace,
+                query_vector,
             )
             
             # Submit sparse retrieval
@@ -497,6 +517,7 @@ class HybridSearch:
         query: str,
         filters: Optional[Dict[str, Any]],
         trace: Optional[Any],
+        query_vector: Optional[List[float]] = None,
     ) -> Tuple[Optional[List[RetrievalResult]], Optional[str]]:
         """Run dense retrieval with error handling.
         
@@ -518,6 +539,7 @@ class HybridSearch:
                 top_k=self.config.dense_top_k,
                 filters=filters,
                 trace=trace,
+                query_vector=query_vector,
             )
             _elapsed = (time.monotonic() - _t0) * 1000.0
             if trace is not None:
@@ -713,6 +735,67 @@ class HybridSearch:
         
         return filtered
     
+    def _apply_mmr(
+        self,
+        query: str,
+        results: List[RetrievalResult],
+        top_k: int,
+        trace: Optional[Any],
+    ) -> List[RetrievalResult]:
+        """Apply MMR diversity reranking."""
+        if not results or self.embedding_client is None:
+            return results
+        try:
+            from src.core.query_engine.mmr import mmr_rerank
+            _t0 = time.monotonic()
+            q_vecs = self.embedding_client.embed([query])
+            c_texts = [r.text for r in results]
+            c_vecs = self.embedding_client.embed(c_texts) if c_texts else []
+            mmr_results = mmr_rerank(
+                query_embedding=q_vecs[0],
+                candidates=results,
+                candidate_embeddings=c_vecs,
+                top_k=top_k,
+                lambda_param=self.config.mmr_lambda,
+            )
+            _elapsed = (time.monotonic() - _t0) * 1000.0
+            if trace is not None:
+                trace.record_stage("mmr", {
+                    "lambda": self.config.mmr_lambda,
+                    "input_count": len(results),
+                    "output_count": len(mmr_results),
+                }, elapsed_ms=_elapsed)
+            logger.debug("MMR: %d -> %d results", len(results), len(mmr_results))
+            return mmr_results
+        except Exception as exc:
+            logger.warning("MMR failed, returning original order: %s", exc)
+            return results
+
+    def _apply_post_dedup(
+        self,
+        results: List[RetrievalResult],
+        threshold: int = 8,
+    ) -> List[RetrievalResult]:
+        """Remove near-duplicate results using SimHash after retrieval."""
+        if len(results) <= 1:
+            return results
+        try:
+            from src.ingestion.transform.chunk_dedup import simhash, hamming_distance
+            kept: List[RetrievalResult] = []
+            seen_hashes: List[int] = []
+            for r in results:
+                fp = simhash(r.text)
+                is_dup = any(hamming_distance(fp, h) <= threshold for h in seen_hashes)
+                if not is_dup:
+                    seen_hashes.append(fp)
+                    kept.append(r)
+            if len(kept) < len(results):
+                logger.debug("Post-dedup: %d -> %d results", len(results), len(kept))
+            return kept
+        except Exception as exc:
+            logger.warning("Post-dedup failed: %s", exc)
+            return results
+
     def _apply_reranker(
         self,
         query: str,

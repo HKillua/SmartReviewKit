@@ -63,17 +63,19 @@ retrieval:
   rrf_k: 60
   dense_weight: 1.0
   sparse_weight: 1.0
-  rerank_enabled: false
+  rerank_enabled: true         # N13: 启用 reranker 提升精排质量
   rerank_top_k: 5
-  mmr_enabled: false
+  mmr_enabled: true            # N13: 启用 MMR 多样性控制
   mmr_lambda: 0.7
-  query_rewrite_enabled: false
-  hyde_enabled: false
-  multi_query_enabled: false
-  contextual_enrichment: "rule"  # rule / llm / off
+  query_rewrite_enabled: true  # N13: 启用 query rewrite
+  hyde_enabled: false           # HyDE 需要额外 LLM 调用，按需开启
+  multi_query_enabled: false    # Multi-query 需要额外 LLM 调用，按需开启
+  contextual_enrichment: "rule" # rule / llm / off
   embedding_cache_size: 4096
-  dedup_enabled: true
+  dedup_enabled: true           # 入库阶段 SimHash 去重
   dedup_threshold: 3
+  min_score: 0.15              # N13: 最低相关度阈值，过滤低质量结果
+  post_dedup_enabled: true     # N13: 检索后语义去重
 
 # =============================================================================
 # Rerank Configuration

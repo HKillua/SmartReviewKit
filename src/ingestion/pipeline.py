@@ -48,6 +48,8 @@ from src.ingestion.embedding.batch_processor import BatchProcessor
 from src.ingestion.storage.bm25_indexer import BM25Indexer
 from src.ingestion.storage.vector_upserter import VectorUpserter
 from src.ingestion.storage.image_storage import ImageStorage
+from src.ingestion.transform.contextual_enricher import ContextualEnricher
+from src.ingestion.transform.chunk_dedup import dedup_chunks
 
 logger = get_logger(__name__)
 
@@ -180,6 +182,12 @@ class IngestionPipeline:
         self.image_captioner = ImageCaptioner(settings)
         has_vision = self.image_captioner.llm is not None
         logger.info(f"  ✓ ImageCaptioner initialized (vision_enabled={has_vision})")
+        
+        ctx_mode = getattr(getattr(settings, 'retrieval', None), 'contextual_enrichment', 'rule') or 'rule'
+        self.contextual_enricher = ContextualEnricher(mode=ctx_mode)
+        self.dedup_enabled = getattr(getattr(settings, 'retrieval', None), 'dedup_enabled', True)
+        logger.info(f"  ✓ ContextualEnricher initialized (mode={ctx_mode})")
+        logger.info(f"  ✓ Chunk dedup enabled={self.dedup_enabled}")
         
         # Stage 5: Encoders
         embedding = EmbeddingFactory.create(settings)
@@ -362,16 +370,33 @@ class IngestionPipeline:
             enriched_by_rule = sum(1 for c in chunks if c.metadata.get("enriched_by") == "rule")
             logger.info(f"      LLM enriched: {enriched_by_llm}, Rule enriched: {enriched_by_rule}")
             
+            # 4b2: Contextual Enrichment
+            logger.info("  4b2. Contextual Enrichment...")
+            doc_title = document.metadata.get("title", file_path.stem)
+            pre_ctx_count = len(chunks)
+            chunks = self.contextual_enricher.enrich(chunks, doc_title=doc_title)
+            ctx_enriched = sum(1 for c in chunks if c.metadata.get("contextual_prefix"))
+            logger.info(f"      Contextually enriched: {ctx_enriched}/{pre_ctx_count}")
+            
             # 4c: Image Captioning
             logger.info("  4c. Image Captioning...")
             chunks = self.image_captioner.transform(chunks, trace)
             captioned = sum(1 for c in chunks if c.metadata.get("image_captions"))
             logger.info(f"      Chunks with captions: {captioned}")
             
+            # 4d: SimHash Dedup
+            pre_dedup_count = len(chunks)
+            if self.dedup_enabled:
+                logger.info("  4d. SimHash Dedup...")
+                chunks = dedup_chunks(chunks, threshold=3)
+                logger.info(f"      Dedup: {pre_dedup_count} -> {len(chunks)} chunks")
+            
             stages["transform"] = {
                 "chunk_refiner": {"llm": refined_by_llm, "rule": refined_by_rule},
                 "metadata_enricher": {"llm": enriched_by_llm, "rule": enriched_by_rule},
-                "image_captioner": {"captioned_chunks": captioned}
+                "contextual_enricher": {"enriched": ctx_enriched},
+                "image_captioner": {"captioned_chunks": captioned},
+                "dedup": {"before": pre_dedup_count, "after": len(chunks)},
             }
             _elapsed_transform = (time.monotonic() - _t0_transform) * 1000.0
             if trace is not None:

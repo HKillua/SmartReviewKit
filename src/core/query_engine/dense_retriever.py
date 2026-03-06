@@ -103,6 +103,7 @@ class DenseRetriever:
         top_k: Optional[int] = None,
         filters: Optional[Dict[str, Any]] = None,
         trace: Optional[Any] = None,
+        query_vector: Optional[List[float]] = None,
     ) -> List[RetrievalResult]:
         """Retrieve semantically similar chunks for a query.
         
@@ -135,15 +136,16 @@ class DenseRetriever:
         
         logger.debug(f"Retrieving for query='{query[:50]}...', top_k={effective_top_k}")
         
-        # Step 1: Embed the query
-        try:
-            query_vectors = self.embedding_client.embed([query], trace=trace)
-            query_vector = query_vectors[0]
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to embed query: {e}. "
-                "Check embedding client configuration and connectivity."
-            ) from e
+        # Step 1: Embed the query (skip if pre-computed vector provided, e.g. HyDE)
+        if query_vector is None:
+            try:
+                query_vectors = self.embedding_client.embed([query], trace=trace)
+                query_vector = query_vectors[0]
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to embed query: {e}. "
+                    "Check embedding client configuration and connectivity."
+                ) from e
         
         # Step 2: Query the vector store
         try:

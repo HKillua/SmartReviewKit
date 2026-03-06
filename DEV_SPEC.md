@@ -2487,3 +2487,110 @@ retrieval:
   dedup_enabled: true
   dedup_threshold: 3          # SimHash Hamming 距离阈值
 ```
+
+---
+
+## 阶段 N：RAG 全链路修复计划
+
+> 目标：对照 RAG 优化 Checklist 逐项修复，将 Phase M 已实现但未接线的组件全部激活，并补齐缺失环节。
+
+| 编号 | 任务 | 状态 |
+|------|------|------|
+| N1 | QueryEnhancer 接入 KnowledgeQueryTool (rewrite + HyDE + multi-query) | ✅ 完成 |
+| N2 | MMR 接入 HybridSearch._apply_mmr() | ✅ 完成 |
+| N3 | SimHash 去重接入 Ingestion Pipeline Stage 4d | ✅ 完成 |
+| N4 | ContextualEnricher 接入 Pipeline Stage 4b2 | ✅ 完成 |
+| N5 | CachedEmbedding 包装 EmbeddingFactory 输出 | ✅ 完成 |
+| N6 | System Prompt 补充 grounding 指令 + 无法回答机制 | ✅ 完成 |
+| N7 | Min Score 阈值过滤 | ✅ 完成 |
+| N8 | KnowledgeQueryTool 输出中追加 chunk_id | ✅ 完成 |
+| N9 | System Prompt 中增加 Query Routing few-shot 指引 | ✅ 完成 |
+| N10 | 检索后 Context 语义去重 (post-retrieval SimHash) | ✅ 完成 |
+| N11 | 在线反馈 API (POST /api/feedback + FeedbackStore) | ✅ 完成 |
+| N12 | Embedding/Rerank 成本追踪计数器 | ✅ 完成 |
+| N13 | settings.yaml 默认值调优 + DEV_SPEC + 复习文档 | ✅ 完成 |
+
+### N1: QueryEnhancer 接入 KnowledgeQueryTool
+
+**变更文件**:
+- `src/agent/tools/knowledge_query.py` — 注入 `query_enhancer`，在 `execute()` 中依次调用 `rewrite()`、`hyde_embed()`、`decompose()`
+- `src/core/query_engine/dense_retriever.py` — `retrieve()` 新增 `query_vector` 参数（HyDE 预计算向量直通）
+- `src/core/query_engine/hybrid_search.py` — `search()` 透传 `query_vector` 到 dense path
+- `src/server/app.py` — 创建 `QueryEnhancer` 实例并注入到 `KnowledgeQueryTool`
+
+**数据流**:
+```
+用户 query
+  ↓ rewrite() → 改写后 query
+  ↓ hyde_embed() → 假设文档向量 (optional)
+  ↓ decompose() → 子查询列表
+  ↓ 对每个子查询调用 HybridSearch.search()
+  ↓ 去重合并 → top_k 结果
+```
+
+### N2: MMR 接入 HybridSearch
+
+**变更文件**: `src/core/query_engine/hybrid_search.py`
+- 新增 `_apply_mmr()` 方法，在 reranker 之后、top_k 截断之前调用
+- 注入 `embedding_client` 用于计算 query 和 candidate 向量
+- 调用 `src/core/query_engine/mmr.py::mmr_rerank()`
+
+### N3 + N4: Pipeline Stage 4 扩展
+
+**变更文件**: `src/ingestion/pipeline.py`
+- Stage 4b2: 在 metadata enrichment 之后调用 `ContextualEnricher.enrich()`
+- Stage 4d: 在 image captioning 之后调用 `dedup_chunks()`
+- 两个组件通过 settings 控制是否启用
+
+### N5: CachedEmbedding
+
+**变更文件**: `src/server/app.py`
+- `_build_hybrid_search()` 中将 `EmbeddingFactory.create()` 输出包装为 `CachedEmbedding`
+- 返回 `(hybrid, cached_embedding, query_enhancer)` 三元组
+
+### N6 + N9: System Prompt 补充
+
+**变更文件**: `config/prompts/system_prompt.txt`
+- 新增 "Grounding 规则" 段：禁止编造、未检索到时明确告知
+- 新增 "工具选择指引" 段：按用户意图选择 knowledge_query / review_summary / quiz_generator 的 few-shot 示例
+
+### N7: Min Score 阈值过滤
+
+**变更文件**: `src/core/query_engine/hybrid_search.py`
+- `HybridSearchConfig` 新增 `min_score: float = 0.0`
+- `search()` 在 post-dedup 之前过滤 `score < min_score` 的结果
+
+### N8: chunk_id 引用
+
+**变更文件**: `src/agent/tools/knowledge_query.py`
+- 输出格式中追加 `(chunk: {chunk_id[:12]})` 以便 LLM 引用
+
+### N10: 检索后语义去重
+
+**变更文件**: `src/core/query_engine/hybrid_search.py`
+- 新增 `_apply_post_dedup()` 方法，复用 `chunk_dedup.simhash/hamming_distance`
+- 在 min_score 过滤之后、top_k 截断之前调用
+
+### N11: 在线反馈 API
+
+**新增文件**: `src/agent/memory/feedback_store.py` — SQLite-backed 反馈存储
+**变更文件**:
+- `src/server/routes.py` — 新增 `POST /api/feedback` 和 `GET /api/feedback/stats`
+- `src/server/app.py` — 初始化 `FeedbackStore` 并传入 `configure_routes()`
+
+### N12: 成本追踪
+
+**变更文件**:
+- `src/libs/embedding/cached_embedding.py` — 新增 `_total_api_calls`、`_total_texts_embedded` 计数器，扩展 `cache_stats`
+- `src/libs/reranker/cross_encoder_reranker.py` — 新增 `_rerank_call_count`、`_rerank_pair_count` 计数器和 `rerank_stats` 属性
+
+### N13: settings.yaml 默认值调优
+
+```yaml
+retrieval:
+  rerank_enabled: true      # 启用精排
+  mmr_enabled: true          # 启用多样性控制
+  query_rewrite_enabled: true # 启用查询改写
+  min_score: 0.15            # 最低相关度阈值
+  post_dedup_enabled: true   # 检索后语义去重
+```

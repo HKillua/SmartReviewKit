@@ -50,19 +50,28 @@ def _load_settings(path: str = "config/settings.yaml") -> dict:
         return yaml.safe_load(f) or {}
 
 
-def _build_hybrid_search(collection: str = "computer_network") -> Any:
-    """Build a shared HybridSearch instance for the given collection."""
+def _build_hybrid_search(collection: str = "computer_network") -> tuple:
+    """Build a shared HybridSearch instance and return (hybrid, embedding, query_enhancer)."""
     from src.core.settings import load_settings as load_core_settings, resolve_path
     from src.core.query_engine.query_processor import QueryProcessor
     from src.core.query_engine.hybrid_search import create_hybrid_search
     from src.core.query_engine.dense_retriever import create_dense_retriever
     from src.core.query_engine.sparse_retriever import create_sparse_retriever
+    from src.core.query_engine.query_enhancer import QueryEnhancer
     from src.ingestion.storage.bm25_indexer import BM25Indexer
     from src.libs.embedding.embedding_factory import EmbeddingFactory
+    from src.libs.embedding.cached_embedding import CachedEmbedding
     from src.libs.vector_store.vector_store_factory import VectorStoreFactory
 
     core_settings = load_core_settings()
-    embedding = EmbeddingFactory.create(core_settings)
+    raw_embedding = EmbeddingFactory.create(core_settings)
+
+    cache_size = 4096
+    retrieval_cfg = getattr(core_settings, 'retrieval', None)
+    if retrieval_cfg:
+        cache_size = getattr(retrieval_cfg, 'embedding_cache_size', 4096)
+    embedding = CachedEmbedding(raw_embedding, max_size=cache_size)
+
     vector_store = VectorStoreFactory.create(core_settings, collection_name=collection)
     dense = create_dense_retriever(
         settings=core_settings,
@@ -83,8 +92,14 @@ def _build_hybrid_search(collection: str = "computer_network") -> Any:
         dense_retriever=dense,
         sparse_retriever=sparse,
     )
-    logger.info("Shared HybridSearch built for collection: %s", collection)
-    return hybrid
+    hybrid.embedding_client = embedding
+
+    query_enhancer = QueryEnhancer(
+        embedding_fn=lambda texts: embedding.embed(texts),
+    )
+
+    logger.info("Shared HybridSearch built for collection: %s (embedding cache=%d)", collection, cache_size)
+    return hybrid, embedding, query_enhancer
 
 
 def _auto_ingest(ingest_dir: str, collection: str) -> None:
@@ -179,11 +194,16 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
 
     # --- Shared HybridSearch ---
     collection = agent_cfg.default_collection
-    hybrid_search = _build_hybrid_search(collection)
+    hybrid_search, cached_embedding, query_enhancer = _build_hybrid_search(collection)
+    query_enhancer.llm_service = llm
 
     # --- Tools ---
     tool_registry = ToolRegistry()
-    tool_registry.register(KnowledgeQueryTool(settings=settings, hybrid_search=hybrid_search))
+    tool_registry.register(KnowledgeQueryTool(
+        settings=settings,
+        hybrid_search=hybrid_search,
+        query_enhancer=query_enhancer,
+    ))
     tool_registry.register(DocumentIngestTool(settings=settings))
     tool_registry.register(ReviewSummaryTool(
         hybrid_search=hybrid_search,
@@ -241,7 +261,13 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         allow_headers=["*"],
     )
 
-    configure_routes(chat_handler, agent, server_cfg.upload_dir, server_cfg.max_upload_size_mb)
+    from src.agent.memory.feedback_store import FeedbackStore
+    feedback_store = FeedbackStore()
+    configure_routes(
+        chat_handler, agent,
+        server_cfg.upload_dir, server_cfg.max_upload_size_mb,
+        feedback_store=feedback_store,
+    )
     app.include_router(router)
 
     web_dir = Path("src/web")

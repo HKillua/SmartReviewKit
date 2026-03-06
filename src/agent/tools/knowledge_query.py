@@ -24,10 +24,17 @@ class KnowledgeQueryArgs(BaseModel):
 class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
     """Retrieves relevant knowledge chunks using HybridSearch (Dense + Sparse + RRF)."""
 
-    def __init__(self, settings: Any = None, hybrid_search: Any = None, reranker: Any = None) -> None:
+    def __init__(
+        self,
+        settings: Any = None,
+        hybrid_search: Any = None,
+        reranker: Any = None,
+        query_enhancer: Any = None,
+    ) -> None:
         self._settings = settings
         self._hybrid_search = hybrid_search
         self._reranker = reranker
+        self._query_enhancer = query_enhancer
         self._initialized = hybrid_search is not None
         self._current_collection: Optional[str] = None
         self._embedding_client: Any = None
@@ -95,22 +102,51 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
         try:
             self._ensure_initialized(args.collection)
 
+            effective_query = args.query
+            hyde_vector = None
+
+            if self._query_enhancer is not None:
+                try:
+                    effective_query = await self._query_enhancer.rewrite(args.query)
+                except Exception:
+                    logger.warning("Query rewrite failed, using original")
+                try:
+                    hyde_vector = await self._query_enhancer.hyde_embed(args.query)
+                except Exception:
+                    logger.warning("HyDE failed, using standard embedding")
+
             search_kwargs: dict[str, Any] = {}
             if args.content_type:
                 search_kwargs["filters"] = {"content_type": args.content_type}
+            if hyde_vector is not None:
+                search_kwargs["query_vector"] = hyde_vector
 
-            results = self._hybrid_search.search(
-                query=args.query,
-                top_k=args.top_k,
-                collection=args.collection,
-                **search_kwargs,
-            )
-
-            if self._reranker:
+            # Multi-query: decompose and merge
+            all_results = []
+            queries = [effective_query]
+            if self._query_enhancer is not None:
                 try:
-                    results = self._reranker.rerank(args.query, results, top_k=args.top_k)
+                    sub_queries = await self._query_enhancer.decompose(args.query)
+                    if len(sub_queries) > 1:
+                        queries = sub_queries
                 except Exception:
-                    logger.warning("Reranker failed, using raw results")
+                    logger.warning("Multi-query decompose failed")
+
+            for q in queries:
+                results = self._hybrid_search.search(
+                    query=q,
+                    top_k=args.top_k,
+                    **search_kwargs,
+                )
+                if isinstance(results, list):
+                    all_results.extend(results)
+
+            # Deduplicate by chunk_id, keep highest score
+            seen: dict[str, Any] = {}
+            for r in all_results:
+                if r.chunk_id not in seen or r.score > seen[r.chunk_id].score:
+                    seen[r.chunk_id] = r
+            results = sorted(seen.values(), key=lambda x: x.score, reverse=True)[:args.top_k]
 
             if not results:
                 return ToolResult(
@@ -118,7 +154,6 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                     result_for_llm="未找到与查询相关的知识库内容。请尝试换一种表述重新提问。",
                 )
 
-            # Parent chunk retrieval
             if args.use_parent:
                 results = self._resolve_parents(results, args.collection)
 
@@ -128,7 +163,8 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                 title = r.metadata.get("title", "")
                 ct = r.metadata.get("content_type", "")
                 ct_tag = f" [{ct}]" if ct else ""
-                header = f"**[{i}]** {title}{ct_tag} — `{source}`" if title else f"**[{i}]{ct_tag}** `{source}`"
+                chunk_ref = r.chunk_id[:12]
+                header = f"**[{i}]** {title}{ct_tag} — `{source}` (chunk: {chunk_ref})" if title else f"**[{i}]{ct_tag}** `{source}` (chunk: {chunk_ref})"
                 lines.append(f"{header} (相关度: {r.score:.2f})")
                 lines.append(r.text[:800])
                 lines.append("")

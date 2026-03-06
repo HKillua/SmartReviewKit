@@ -31,6 +31,8 @@ class CachedEmbedding(BaseEmbedding):
         self._cache: OrderedDict[str, List[float]] = OrderedDict()
         self._hits = 0
         self._misses = 0
+        self._total_api_calls = 0
+        self._total_texts_embedded = 0
 
     @staticmethod
     def _hash(text: str) -> str:
@@ -60,6 +62,8 @@ class CachedEmbedding(BaseEmbedding):
                 self._misses += 1
 
         if uncached_texts:
+            self._total_api_calls += 1
+            self._total_texts_embedded += len(uncached_texts)
             new_vectors = self._delegate.embed(uncached_texts, trace=trace, **kwargs)
             for idx, vec in zip(uncached_indices, new_vectors):
                 key = self._hash(texts[idx])
@@ -82,9 +86,13 @@ class CachedEmbedding(BaseEmbedding):
 
     @property
     def cache_stats(self) -> dict:
+        total = self._hits + self._misses
         return {
             "hits": self._hits,
             "misses": self._misses,
+            "hit_rate": round(self._hits / total, 3) if total > 0 else 0.0,
             "size": len(self._cache),
             "max_size": self._max_size,
+            "api_calls": self._total_api_calls,
+            "texts_embedded": self._total_texts_embedded,
         }

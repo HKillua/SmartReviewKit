@@ -74,6 +74,14 @@ class QueryEnhancer:
         self._hyde_prompt = _load_prompt(hyde_prompt_path, _DEFAULT_HYDE_PROMPT)
         self._multi_query_prompt = _load_prompt(multi_query_prompt_path, _DEFAULT_MULTI_QUERY_PROMPT)
 
+    @property
+    def llm_service(self) -> Any:
+        return self._llm
+
+    @llm_service.setter
+    def llm_service(self, val: Any) -> None:
+        self._llm = val
+
     # ------------------------------------------------------------------
     # Query Rewriting
     # ------------------------------------------------------------------

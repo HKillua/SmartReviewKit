@@ -22,14 +22,22 @@ _chat_handler = None
 _agent = None
 _upload_dir = "data/uploads"
 _max_upload_mb = 50
+_feedback_store = None
 
 
-def configure_routes(chat_handler: Any, agent: Any, upload_dir: str = "data/uploads", max_upload_mb: int = 50) -> None:
-    global _chat_handler, _agent, _upload_dir, _max_upload_mb
+def configure_routes(
+    chat_handler: Any,
+    agent: Any,
+    upload_dir: str = "data/uploads",
+    max_upload_mb: int = 50,
+    feedback_store: Any = None,
+) -> None:
+    global _chat_handler, _agent, _upload_dir, _max_upload_mb, _feedback_store
     _chat_handler = chat_handler
     _agent = agent
     _upload_dir = upload_dir
     _max_upload_mb = max_upload_mb
+    _feedback_store = feedback_store
 
 
 @router.post("/api/chat")
@@ -122,6 +130,41 @@ async def upload_file(file: UploadFile = File(...), user_id: str = "default_user
             image_count=result.metadata.get("image_count", 0),
         )
     return UploadResponse(success=False, filename=file.filename, error=result.error)
+
+
+@router.post("/api/feedback")
+async def submit_feedback(
+    user_id: str = "default_user",
+    conversation_id: str = "",
+    rating: str = "up",
+    message_index: int = -1,
+    comment: str = "",
+    query: str = "",
+    response_preview: str = "",
+):
+    """Submit user feedback (thumbs up/down) on a response."""
+    if _feedback_store is None:
+        raise HTTPException(status_code=503, detail="Feedback store not configured")
+    if rating not in ("up", "down"):
+        raise HTTPException(status_code=400, detail="rating must be 'up' or 'down'")
+    fb_id = _feedback_store.add(
+        user_id=user_id,
+        conversation_id=conversation_id,
+        rating=rating,
+        message_index=message_index,
+        comment=comment,
+        query=query,
+        response_preview=response_preview[:200],
+    )
+    return {"success": True, "feedback_id": fb_id}
+
+
+@router.get("/api/feedback/stats")
+async def feedback_stats():
+    """Get aggregate feedback statistics."""
+    if _feedback_store is None:
+        raise HTTPException(status_code=503, detail="Feedback store not configured")
+    return _feedback_store.stats()
 
 
 @router.get("/api/health", response_model=HealthResponse)

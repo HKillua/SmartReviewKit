@@ -55,6 +55,8 @@ class CrossEncoderReranker(BaseReranker):
         self.settings = settings
         self.timeout = timeout
         self.kwargs = kwargs
+        self._rerank_call_count = 0
+        self._rerank_pair_count = 0
         
         # Initialize or inject model
         if model is not None:
@@ -146,7 +148,9 @@ class CrossEncoderReranker(BaseReranker):
             ValueError: If query or candidates are invalid.
             CrossEncoderRerankError: If scoring fails or times out.
         """
-        # Validate inputs
+        self._rerank_call_count += 1
+        self._rerank_pair_count += len(candidates)
+        
         self.validate_query(query)
         self.validate_candidates(candidates)
         
@@ -292,3 +296,10 @@ class CrossEncoderReranker(BaseReranker):
             f"Cross-Encoder rerank: query='{query[:50]}...', "
             f"input={input_count}, output={output_count}"
         )
+
+    @property
+    def rerank_stats(self) -> dict:
+        return {
+            "rerank_calls": self._rerank_call_count,
+            "rerank_pairs_scored": self._rerank_pair_count,
+        }
