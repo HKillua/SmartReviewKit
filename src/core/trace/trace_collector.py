@@ -8,6 +8,7 @@ predictable and testable.
 
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -31,6 +32,7 @@ class TraceCollector:
     def __init__(self, traces_path: str | Path = _DEFAULT_TRACES_PATH) -> None:
         self._path = Path(traces_path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_lock = threading.Lock()
 
     def collect(self, trace: TraceContext) -> None:
         """Persist a single trace as one JSON line.
@@ -46,8 +48,9 @@ class TraceCollector:
 
         line = json.dumps(trace.to_dict(), ensure_ascii=False)
         try:
-            with self._path.open("a", encoding="utf-8") as fh:
-                fh.write(line + "\n")
+            with self._write_lock:
+                with self._path.open("a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
         except OSError:
             logger.exception("Failed to write trace %s", trace.trace_id)
 

@@ -53,9 +53,11 @@ class SessionMemory:
     """
 
     def __init__(self, db_dir: str = "data/memory") -> None:
+        import asyncio
         Path(db_dir).mkdir(parents=True, exist_ok=True)
         self._db_path = str(Path(db_dir) / "sessions.db")
         self._conn: Optional[aiosqlite.Connection] = None
+        self._conn_lock = asyncio.Lock()
         self._init_db_sync()
 
     def _init_db_sync(self) -> None:
@@ -69,9 +71,10 @@ class SessionMemory:
             )
 
     async def _get_conn(self) -> aiosqlite.Connection:
-        if self._conn is None:
-            self._conn = await aiosqlite.connect(self._db_path)
-        return self._conn
+        async with self._conn_lock:
+            if self._conn is None:
+                self._conn = await aiosqlite.connect(self._db_path)
+            return self._conn
 
     async def save_session(self, user_id: str, summary: SessionSummary) -> None:
         summary.user_id = user_id

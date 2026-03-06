@@ -172,3 +172,14 @@ memory:
   decay_on_session_start: true   # 新会话开始时触发 Ebbinghaus 衰减
   compaction_enabled: true       # 启用上下文压缩 (CoPaw-style Compaction)
   compaction_threshold_messages: 30  # 超过此消息数时触发压缩
+
+# =============================================================================
+# Conflict Detection Configuration
+# =============================================================================
+conflict_detection:
+  enabled: true
+  rule_based: true          # 零 LLM 调用的规则策略 (数值/定义/来源)
+  embedding_sim: true       # 嵌入相似度策略
+  llm_nli: false            # LLM NLI 策略 (消耗额外 token, 按需启用)
+  sim_threshold: 0.90       # embedding 策略的余弦相似度阈值
+  nli_max_pairs: 5          # NLI 策略最多比较的片段对数

@@ -50,6 +50,7 @@ class FileConversationStore(ConversationStore):
         self._base_dir = Path(base_dir)
         self._base_dir.mkdir(parents=True, exist_ok=True)
         self._write_locks: dict[str, asyncio.Lock] = {}
+        self._locks_guard = asyncio.Lock()
 
     def _user_dir(self, user_id: str) -> Path:
         hashed = hashlib.sha256(user_id.encode()).hexdigest()[:12]
@@ -98,13 +99,14 @@ class FileConversationStore(ConversationStore):
             data.setdefault("title", "")
         return data
 
-    def _get_write_lock(self, conversation_id: str) -> asyncio.Lock:
-        if conversation_id not in self._write_locks:
-            self._write_locks[conversation_id] = asyncio.Lock()
-        return self._write_locks[conversation_id]
+    async def _get_write_lock(self, conversation_id: str) -> asyncio.Lock:
+        async with self._locks_guard:
+            if conversation_id not in self._write_locks:
+                self._write_locks[conversation_id] = asyncio.Lock()
+            return self._write_locks[conversation_id]
 
     async def update(self, conversation: Conversation) -> None:
-        lock = self._get_write_lock(conversation.id)
+        lock = await self._get_write_lock(conversation.id)
         async with lock:
             conversation.updated_at = datetime.now(timezone.utc)
             path = self._conv_path(conversation.user_id, conversation.id)
@@ -151,6 +153,7 @@ class MemoryConversationStore(ConversationStore):
 
     def __init__(self) -> None:
         self._store: dict[str, Conversation] = {}
+        self._store_lock = asyncio.Lock()
 
     async def create(self, user_id: str) -> Conversation:
         now = datetime.now(timezone.utc)
@@ -161,29 +164,35 @@ class MemoryConversationStore(ConversationStore):
             created_at=now,
             updated_at=now,
         )
-        self._store[conv.id] = conv
+        async with self._store_lock:
+            self._store[conv.id] = conv
         return conv
 
     async def get(self, conversation_id: str, user_id: str) -> Optional[Conversation]:
-        conv = self._store.get(conversation_id)
+        async with self._store_lock:
+            conv = self._store.get(conversation_id)
         if conv and conv.user_id == user_id:
             return conv
         return None
 
     async def update(self, conversation: Conversation) -> None:
         conversation.updated_at = datetime.now(timezone.utc)
-        self._store[conversation.id] = conversation
+        async with self._store_lock:
+            self._store[conversation.id] = conversation
 
     async def list_conversations(self, user_id: str, limit: int = 20) -> list[Conversation]:
+        async with self._store_lock:
+            items = list(self._store.values())
         return sorted(
-            [c for c in self._store.values() if c.user_id == user_id],
+            [c for c in items if c.user_id == user_id],
             key=lambda c: c.updated_at,
             reverse=True,
         )[:limit]
 
     async def delete(self, conversation_id: str, user_id: str) -> bool:
-        conv = self._store.get(conversation_id)
-        if conv and conv.user_id == user_id:
-            del self._store[conversation_id]
-            return True
+        async with self._store_lock:
+            conv = self._store.get(conversation_id)
+            if conv and conv.user_id == user_id:
+                del self._store[conversation_id]
+                return True
         return False

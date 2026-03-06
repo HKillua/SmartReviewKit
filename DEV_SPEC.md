@@ -3065,3 +3065,124 @@ Agent.flush()  ← graceful shutdown
   - FeedbackStore async 完整流程
   - 并发对话写入安全
   - 工具同步调用 asyncio.to_thread 集成
+
+---
+
+## Phase T: Agent-RAG 冲突检测 + 并发安全修复
+
+### T-1: Agent-RAG 冲突检测模块
+
+#### 目标
+
+当 RAG 检索返回多份文档片段时，自动识别片段之间的事实矛盾、数值冲突、定义不一致、时间性矛盾，并为 LLM 提供冲突裁决依据。
+
+#### 架构
+
+```
+RetrievalResults → ConflictDetector
+  → Strategy 1 (RuleBased): 数值/定义/来源 矛盾检测 (零 LLM 调用)
+  → Strategy 2 (Embedding): 高语义相似 + 事实分歧 (利用已有 embedding)
+  → Strategy 3 (LLM NLI):  自然语言推理判断矛盾 (精度最高)
+  → ConflictMerger → ConflictReport
+      → conflicts: List[Conflict]
+      → trusted_chunk_ids: List[str]
+      → resolution_summary: str
+```
+
+#### 文件清单
+
+```
+src/core/conflict/
+  __init__.py
+  types.py              — Conflict, ConflictReport, ConflictType
+  detector.py           — ConflictDetector 主类
+  strategies/
+    __init__.py
+    base.py             — ConflictStrategy 抽象基类
+    rule_based.py       — 规则策略
+    embedding_sim.py    — 嵌入策略
+    llm_nli.py          — LLM NLI 策略
+  resolver.py           — 冲突裁决
+```
+
+#### 集成点
+
+在 `KnowledgeQueryTool.execute()` 中，检索结果格式化之前插入冲突检测：
+
+```python
+if self._conflict_detector and len(results) > 1:
+    report = await self._conflict_detector.detect(query, results)
+    if report.has_conflicts:
+        lines.append("⚠️ 知识冲突检测报告：")
+        for c in report.conflicts:
+            lines.append(f"- [{c.type}] {c.description} (置信度: {c.confidence:.0%})")
+        lines.append(f"建议: {report.resolution_summary}")
+```
+
+### T-2: 并发安全修复 (18 项)
+
+#### P0 (3 项)
+- C1: 所有 memory 模块 `_get_conn()` 加 `asyncio.Lock`
+- C2: `SparseRetriever._ensure_index_loaded` + `BM25Indexer` 加 `threading.Lock`
+- C3: `SkillMemory` 迁移到 aiosqlite
+
+#### P1 (7 项)
+- C4: JSONL 文件追加写加 `threading.Lock` — observability/audit/trace_collector
+- C5: `RateLimitHook._buckets` 字典加锁
+- C6: `CircuitBreaker` 状态加 `threading.Lock`
+- C7: `FileConversationStore._get_write_lock()` 字典本身加保护
+- C8: `MemoryConversationStore._store` 加 `asyncio.Lock`
+- C9: `MetricsCollector._counters/_spans` 加锁
+- C10: `AuditHook._start_times` 加锁
+
+#### P2 (8 项)
+- C11-C12: `update_mastery/update_profile` 读-改-写事务保护
+- C13: `_offload_to_file` 原子写入
+- C14: `_bg_tasks` 文档化并发模型
+- C15: `SparseRetriever._index_cache` 初始化移至 `__init__`
+- C16: `TTLCache` 加 `threading.Lock`
+- C17: `CachedEmbedding._cache` 加 `threading.Lock`
+- C18: `PromptBuilder._cached_template` 已在 Phase S 使用 safe_substitute 优化
+
+### 测试统计
+
+- 单元测试 (`tests/unit/test_phase_t.py`): **41 项** — 覆盖冲突检测 (T1: 18项) + 并发修复 (T2: 23项)
+- 端到端测试 (`tests/e2e/test_phase_t_e2e.py`): **7 项** — 完整检索→冲突检测→格式化流程、并发安全集成
+
+累计通过: Q(15) + R(19) + S(45) + T(48) = **127 项测试全部通过**
+
+### 修改文件清单
+
+**新增:**
+- `src/core/conflict/__init__.py` — 模块入口
+- `src/core/conflict/types.py` — ConflictType, Conflict, ConflictReport 数据模型
+- `src/core/conflict/detector.py` — ConflictDetector 编排器
+- `src/core/conflict/resolver.py` — ConflictResolver 冲突裁决
+- `src/core/conflict/strategies/__init__.py`
+- `src/core/conflict/strategies/base.py` — ConflictStrategy 抽象基类
+- `src/core/conflict/strategies/rule_based.py` — 规则策略 (数值/定义冲突)
+- `src/core/conflict/strategies/embedding_sim.py` — 嵌入相似度策略
+- `src/core/conflict/strategies/llm_nli.py` — LLM NLI 策略
+- `tests/unit/test_phase_t.py`
+- `tests/e2e/test_phase_t_e2e.py`
+
+**修改 (并发安全):**
+- `src/agent/memory/knowledge_map.py` — _conn_lock + update_mastery 事务保护
+- `src/agent/memory/error_memory.py` — _conn_lock
+- `src/agent/memory/session_memory.py` — _conn_lock
+- `src/agent/memory/student_profile.py` — _conn_lock + update_profile 事务保护
+- `src/agent/memory/skill_memory.py` — 迁移 aiosqlite + _conn_lock
+- `src/agent/memory/context_filter.py` — _offload_to_file 原子写入
+- `src/ingestion/storage/bm25_indexer.py` — threading.Lock on query/load
+- `src/core/query_engine/sparse_retriever.py` — _index_cache 移至 __init__
+- `src/agent/hooks/observability.py` — MetricsCollector threading.Lock
+- `src/agent/hooks/rate_limit.py` — RateLimitHook + CircuitBreaker threading.Lock
+- `src/agent/hooks/audit.py` — FileAuditLogger + AuditHook threading.Lock
+- `src/agent/conversation.py` — FileConversationStore._locks_guard + MemoryConversationStore._store_lock
+- `src/agent/utils/ttl_cache.py` — RLock 线程安全
+- `src/libs/embedding/cached_embedding.py` — threading.Lock
+- `src/core/trace/trace_collector.py` — threading.Lock
+
+**修改 (集成):**
+- `src/agent/tools/knowledge_query.py` — 集成 ConflictDetector
+- `config/settings.yaml` — 新增 conflict_detection 配置段

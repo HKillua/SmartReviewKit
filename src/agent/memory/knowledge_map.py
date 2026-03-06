@@ -42,9 +42,11 @@ class KnowledgeMapMemory:
     """
 
     def __init__(self, db_dir: str = "data/memory") -> None:
+        import asyncio
         Path(db_dir).mkdir(parents=True, exist_ok=True)
         self._db_path = str(Path(db_dir) / "knowledge_map.db")
         self._conn: Optional[aiosqlite.Connection] = None
+        self._conn_lock = asyncio.Lock()
         self._init_db_sync()
 
     def _init_db_sync(self) -> None:
@@ -52,9 +54,10 @@ class KnowledgeMapMemory:
             conn.execute(_CREATE_SQL)
 
     async def _get_conn(self) -> aiosqlite.Connection:
-        if self._conn is None:
-            self._conn = await aiosqlite.connect(self._db_path)
-        return self._conn
+        async with self._conn_lock:
+            if self._conn is None:
+                self._conn = await aiosqlite.connect(self._db_path)
+            return self._conn
 
     async def get_node(self, user_id: str, concept: str) -> Optional[KnowledgeNode]:
         db = await self._get_conn()
@@ -71,8 +74,19 @@ class KnowledgeMapMemory:
         return None
 
     async def update_mastery(self, user_id: str, concept: str, correct: bool) -> None:
-        node = await self.get_node(user_id, concept)
-        if node is None:
+        db = await self._get_conn()
+        async with db.execute(
+            "SELECT data FROM knowledge_nodes WHERE user_id = ? AND concept = ?",
+            (user_id, concept),
+        ) as cursor:
+            row = await cursor.fetchone()
+
+        if row:
+            try:
+                node = KnowledgeNode.model_validate_json(row[0])
+            except Exception:
+                node = KnowledgeNode(concept=concept)
+        else:
             node = KnowledgeNode(concept=concept)
 
         node.quiz_count += 1
@@ -86,7 +100,6 @@ class KnowledgeMapMemory:
 
         node.last_reviewed = datetime.now(timezone.utc)
 
-        db = await self._get_conn()
         await db.execute(
             "INSERT OR REPLACE INTO knowledge_nodes (user_id, concept, data) VALUES (?, ?, ?)",
             (user_id, concept, node.model_dump_json()),

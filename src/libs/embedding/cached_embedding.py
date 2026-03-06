@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading
 from collections import OrderedDict
 from typing import Any, List, Optional
 
@@ -29,6 +30,7 @@ class CachedEmbedding(BaseEmbedding):
         self._delegate = delegate
         self._max_size = max_size
         self._cache: OrderedDict[str, List[float]] = OrderedDict()
+        self._lock = threading.Lock()
         self._hits = 0
         self._misses = 0
         self._total_api_calls = 0
@@ -50,27 +52,29 @@ class CachedEmbedding(BaseEmbedding):
         uncached_indices: List[int] = []
         uncached_texts: List[str] = []
 
-        for i, text in enumerate(texts):
-            key = self._hash(text)
-            if key in self._cache:
-                self._cache.move_to_end(key)
-                results[i] = self._cache[key]
-                self._hits += 1
-            else:
-                uncached_indices.append(i)
-                uncached_texts.append(text)
-                self._misses += 1
+        with self._lock:
+            for i, text in enumerate(texts):
+                key = self._hash(text)
+                if key in self._cache:
+                    self._cache.move_to_end(key)
+                    results[i] = self._cache[key]
+                    self._hits += 1
+                else:
+                    uncached_indices.append(i)
+                    uncached_texts.append(text)
+                    self._misses += 1
 
         if uncached_texts:
             self._total_api_calls += 1
             self._total_texts_embedded += len(uncached_texts)
             new_vectors = self._delegate.embed(uncached_texts, trace=trace, **kwargs)
-            for idx, vec in zip(uncached_indices, new_vectors):
-                key = self._hash(texts[idx])
-                self._cache[key] = vec
-                results[idx] = vec
-                if len(self._cache) > self._max_size:
-                    self._cache.popitem(last=False)
+            with self._lock:
+                for idx, vec in zip(uncached_indices, new_vectors):
+                    key = self._hash(texts[idx])
+                    self._cache[key] = vec
+                    results[idx] = vec
+                    if len(self._cache) > self._max_size:
+                        self._cache.popitem(last=False)
 
         if (self._hits + self._misses) % 200 == 0 and self._hits > 0:
             total = self._hits + self._misses

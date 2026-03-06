@@ -85,6 +85,7 @@ class SparseRetriever:
         self.bm25_indexer = bm25_indexer
         self.vector_store = vector_store
         self.default_collection = default_collection
+        self._index_cache: dict[str, float] = {}
         
         # Extract default_top_k from settings if available
         self.default_top_k = default_top_k
@@ -225,9 +226,6 @@ class SparseRetriever:
         Reloads only when the underlying JSON file has been modified since the
         last successful load.
         """
-        if not hasattr(self, "_index_cache"):
-            self._index_cache: dict[str, float] = {}
-
         try:
             idx_path = self.bm25_indexer._get_index_path(collection)
             if idx_path.exists():

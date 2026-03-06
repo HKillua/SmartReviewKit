@@ -205,10 +205,24 @@ class ContextEngineeringFilter(ConversationFilter):
         return result
 
     def _offload_to_file(self, content: str) -> str:
+        import os
+        import tempfile
         ref_id = hashlib.sha256(content.encode()).hexdigest()[:12]
         path = self._offload_dir / f"{ref_id}.txt"
         if not path.exists():
-            path.write_text(content, encoding="utf-8")
+            fd, tmp = tempfile.mkstemp(dir=str(self._offload_dir), suffix=".tmp")
+            fd_closed = False
+            try:
+                os.write(fd, content.encode("utf-8"))
+                os.close(fd)
+                fd_closed = True
+                os.replace(tmp, str(path))
+            except Exception:
+                if not fd_closed:
+                    os.close(fd)
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+                raise
         return ref_id
 
     def load_offloaded(self, ref_id: str) -> Optional[str]:

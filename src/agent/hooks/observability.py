@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -36,12 +37,14 @@ class MetricsCollector:
     def __init__(self, metrics_path: str = "logs/metrics.jsonl") -> None:
         self._path = Path(metrics_path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
         self._counters: dict[str, float] = {}
         self._spans: list[Span] = []
 
     def record_counter(self, name: str, value: float = 1.0, tags: dict[str, str] | None = None) -> None:
         key = name
-        self._counters[key] = self._counters.get(key, 0.0) + value
+        with self._lock:
+            self._counters[key] = self._counters.get(key, 0.0) + value
         self._write_metric("counter", name, value, tags)
 
     def record_histogram(self, name: str, value: float, tags: dict[str, str] | None = None) -> None:
@@ -53,7 +56,8 @@ class MetricsCollector:
 
     def end_span(self, span: Span) -> None:
         span.end_time = time.monotonic()
-        self._spans.append(span)
+        with self._lock:
+            self._spans.append(span)
         self._write_metric(
             "span", span.name, span.duration_ms,
             {"span_id": span.id, "parent_id": span.parent_id or ""},
@@ -61,14 +65,15 @@ class MetricsCollector:
 
     def _write_metric(self, metric_type: str, name: str, value: float, tags: dict[str, str] | None = None) -> None:
         record = {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "type": metric_type,
             "name": name,
             "value": round(value, 3),
             "tags": tags or {},
         }
         try:
-            with open(self._path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            with self._lock:
+                with open(self._path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
         except Exception:
             logger.debug("Failed to write metric: %s/%s", metric_type, name)

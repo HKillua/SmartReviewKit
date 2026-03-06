@@ -17,6 +17,7 @@ import gzip
 import json
 import math
 import os
+import threading
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 
@@ -93,6 +94,7 @@ class BM25Indexer:
         self.index_dir = Path(index_dir)
         self.k1 = k1
         self.b = b
+        self._lock = threading.Lock()
         
         # In-memory index structure
         self._index: Dict[str, Dict[str, Any]] = {}
@@ -220,8 +222,9 @@ class BM25Indexer:
             if "metadata" not in data or "index" not in data:
                 raise ValueError(f"Invalid index file structure: missing metadata or index")
             
-            self._metadata = data["metadata"]
-            self._index = data["index"]
+            with self._lock:
+                self._metadata = data["metadata"]
+                self._index = data["index"]
             
             return True
             
@@ -253,45 +256,43 @@ class BM25Indexer:
             >>> results = indexer.query(["machine", "learning"], top_k=5)
             >>> results[0]["score"] > 0  # True if matches found
         """
-        if not self._index:
-            raise ValueError("Index not loaded. Call load() or build() first.")
-        
-        if not query_terms:
-            raise ValueError("query_terms cannot be empty")
-        
-        # Calculate BM25 scores for all documents
-        scores: Dict[str, float] = {}
-        
-        for term in query_terms:
-            if term not in self._index:
-                continue  # Term not in corpus, skip
+        with self._lock:
+            if not self._index:
+                raise ValueError("Index not loaded. Call load() or build() first.")
             
-            term_data = self._index[term]
-            idf = term_data["idf"]
+            if not query_terms:
+                raise ValueError("query_terms cannot be empty")
             
-            for posting in term_data["postings"]:
-                chunk_id = posting["chunk_id"]
-                tf = posting["tf"]
-                doc_length = posting["doc_length"]
+            scores: Dict[str, float] = {}
+            
+            for term in query_terms:
+                if term not in self._index:
+                    continue
                 
-                # BM25 score contribution from this term
-                term_score = self._calculate_bm25_score(
-                    tf=tf,
-                    doc_length=doc_length,
-                    avg_doc_length=self._metadata["avg_doc_length"],
-                    idf=idf
-                )
+                term_data = self._index[term]
+                idf = term_data["idf"]
                 
-                scores[chunk_id] = scores.get(chunk_id, 0.0) + term_score
-        
-        # Sort by score descending and return top_k
-        sorted_results = sorted(
-            [{"chunk_id": cid, "score": score} for cid, score in scores.items()],
-            key=lambda x: x["score"],
-            reverse=True
-        )
-        
-        return sorted_results[:top_k]
+                for posting in term_data["postings"]:
+                    chunk_id = posting["chunk_id"]
+                    tf = posting["tf"]
+                    doc_length = posting["doc_length"]
+                    
+                    term_score = self._calculate_bm25_score(
+                        tf=tf,
+                        doc_length=doc_length,
+                        avg_doc_length=self._metadata["avg_doc_length"],
+                        idf=idf
+                    )
+                    
+                    scores[chunk_id] = scores.get(chunk_id, 0.0) + term_score
+            
+            sorted_results = sorted(
+                [{"chunk_id": cid, "score": score} for cid, score in scores.items()],
+                key=lambda x: x["score"],
+                reverse=True
+            )
+            
+            return sorted_results[:top_k]
     
     def add_document(
         self,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from enum import Enum
 from typing import Optional
@@ -47,17 +48,19 @@ class RateLimitHook(LifecycleHook):
     def __init__(self, requests_per_minute: int = 20) -> None:
         self._rpm = requests_per_minute
         self._buckets: dict[str, TokenBucket] = {}
+        self._buckets_lock = threading.Lock()
 
     def _get_bucket(self, user_id: str) -> TokenBucket:
-        if user_id not in self._buckets:
-            if len(self._buckets) >= self._MAX_BUCKETS:
-                oldest_key = next(iter(self._buckets))
-                del self._buckets[oldest_key]
-            self._buckets[user_id] = TokenBucket(
-                rate=self._rpm / 60.0,
-                capacity=self._rpm,
-            )
-        return self._buckets[user_id]
+        with self._buckets_lock:
+            if user_id not in self._buckets:
+                if len(self._buckets) >= self._MAX_BUCKETS:
+                    oldest_key = next(iter(self._buckets))
+                    del self._buckets[oldest_key]
+                self._buckets[user_id] = TokenBucket(
+                    rate=self._rpm / 60.0,
+                    capacity=self._rpm,
+                )
+            return self._buckets[user_id]
 
     async def before_message(self, user_id: str, message: str) -> Optional[str]:
         bucket = self._get_bucket(user_id)
@@ -81,29 +84,29 @@ class CircuitBreaker:
         self._failures = 0
         self._state = CircuitState.CLOSED
         self._opened_at: float = 0.0
+        self._lock = threading.Lock()
 
     @property
     def state(self) -> CircuitState:
-        if self._state == CircuitState.OPEN:
-            if time.monotonic() - self._opened_at >= self._cooldown:
-                self._state = CircuitState.HALF_OPEN
-        return self._state
+        with self._lock:
+            if self._state == CircuitState.OPEN:
+                if time.monotonic() - self._opened_at >= self._cooldown:
+                    self._state = CircuitState.HALF_OPEN
+            return self._state
 
     def record_success(self) -> None:
-        self._failures = 0
-        self._state = CircuitState.CLOSED
+        with self._lock:
+            self._failures = 0
+            self._state = CircuitState.CLOSED
 
     def record_failure(self) -> None:
-        self._failures += 1
-        if self._failures >= self._threshold:
-            self._state = CircuitState.OPEN
-            self._opened_at = time.monotonic()
-            logger.warning("Circuit breaker OPEN after %d failures", self._failures)
+        with self._lock:
+            self._failures += 1
+            if self._failures >= self._threshold:
+                self._state = CircuitState.OPEN
+                self._opened_at = time.monotonic()
+                logger.warning("Circuit breaker OPEN after %d failures", self._failures)
 
     def allow_request(self) -> bool:
         s = self.state
-        if s == CircuitState.CLOSED:
-            return True
-        if s == CircuitState.HALF_OPEN:
-            return True
-        return False
+        return s in (CircuitState.CLOSED, CircuitState.HALF_OPEN)

@@ -31,11 +31,13 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
         hybrid_search: Any = None,
         reranker: Any = None,
         query_enhancer: Any = None,
+        conflict_detector: Any = None,
     ) -> None:
         self._settings = settings
         self._hybrid_search = hybrid_search
         self._reranker = reranker
         self._query_enhancer = query_enhancer
+        self._conflict_detector = conflict_detector
         self._initialized = hybrid_search is not None
         self._current_collection: Optional[str] = None
         self._embedding_client: Any = None
@@ -185,6 +187,21 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
             if args.use_parent:
                 results = self._resolve_parents(results, args.collection)
 
+            conflict_section = ""
+            if self._conflict_detector is not None and len(results) > 1:
+                try:
+                    from src.core.conflict.types import ConflictReport
+                    report: ConflictReport = await self._conflict_detector.detect(effective_query, results)
+                    if report.has_conflicts:
+                        cl = [f"\n⚠️ **知识冲突检测** (共 {len(report.conflicts)} 处)："]
+                        for c in report.conflicts:
+                            cl.append(f"- [{c.type.value}] {c.description} (置信度: {c.confidence:.0%})")
+                        cl.append(f"\n**裁决建议**: {report.resolution_summary}")
+                        cl.append("")
+                        conflict_section = "\n".join(cl)
+                except Exception:
+                    logger.warning("Conflict detection failed, skipping", exc_info=True)
+
             lines: list[str] = [f"检索到 {len(results)} 条相关内容：\n"]
             for i, r in enumerate(results, 1):
                 source = r.metadata.get("source_path", "未知来源")
@@ -197,7 +214,10 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                 lines.append(r.text[:800])
                 lines.append("")
 
-            return ToolResult(success=True, result_for_llm="\n".join(lines))
+            result_text = "\n".join(lines)
+            if conflict_section:
+                result_text += "\n" + conflict_section
+            return ToolResult(success=True, result_for_llm=result_text)
 
         except Exception as exc:
             logger.exception("KnowledgeQueryTool failed")

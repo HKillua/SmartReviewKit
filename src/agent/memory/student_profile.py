@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -54,6 +55,7 @@ class StudentProfileMemory:
         Path(db_dir).mkdir(parents=True, exist_ok=True)
         self._db_path = str(Path(db_dir) / "profiles.db")
         self._conn: Optional[aiosqlite.Connection] = None
+        self._conn_lock = asyncio.Lock()
         self._init_db_sync()
 
     def _init_db_sync(self) -> None:
@@ -61,9 +63,10 @@ class StudentProfileMemory:
             conn.execute(_CREATE_SQL)
 
     async def _get_conn(self) -> aiosqlite.Connection:
-        if self._conn is None:
-            self._conn = await aiosqlite.connect(self._db_path)
-        return self._conn
+        async with self._conn_lock:
+            if self._conn is None:
+                self._conn = await aiosqlite.connect(self._db_path)
+            return self._conn
 
     async def get_profile(self, user_id: str) -> StudentProfile:
         db = await self._get_conn()
@@ -84,17 +87,29 @@ class StudentProfileMemory:
     })
 
     async def update_profile(self, user_id: str, updates: dict) -> None:
-        profile = await self.get_profile(user_id)
+        db = await self._get_conn()
+        async with db.execute(
+            "SELECT data FROM student_profiles WHERE user_id = ?", (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+
+        if row:
+            try:
+                profile = StudentProfile.model_validate_json(row[0])
+            except Exception:
+                profile = StudentProfile(user_id=user_id)
+        else:
+            profile = StudentProfile(user_id=user_id)
+
         for key, value in updates.items():
             if key in self._ALLOWED_UPDATE_FIELDS:
                 setattr(profile, key, value)
-        profile.last_active = datetime.now()
+        profile.last_active = datetime.now(timezone.utc)
 
-        db = await self._get_conn()
         await db.execute(
             """INSERT OR REPLACE INTO student_profiles (user_id, data, updated_at)
                VALUES (?, ?, ?)""",
-            (user_id, profile.model_dump_json(), datetime.now().isoformat()),
+            (user_id, profile.model_dump_json(), datetime.now(timezone.utc).isoformat()),
         )
         await db.commit()
 

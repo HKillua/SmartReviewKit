@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -48,11 +49,13 @@ class FileAuditLogger:
     def __init__(self, log_path: str = "logs/audit.jsonl") -> None:
         self._path = Path(log_path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_lock = threading.Lock()
 
     def log_event(self, event: AuditEvent) -> None:
         event.parameters = _sanitize(event.parameters)
-        with open(self._path, "a", encoding="utf-8") as f:
-            f.write(event.model_dump_json() + "\n")
+        with self._write_lock:
+            with open(self._path, "a", encoding="utf-8") as f:
+                f.write(event.model_dump_json() + "\n")
 
 
 class AuditHook(LifecycleHook):
@@ -61,15 +64,18 @@ class AuditHook(LifecycleHook):
     def __init__(self, audit_logger: FileAuditLogger | None = None) -> None:
         self._logger = audit_logger or FileAuditLogger()
         self._start_times: dict[str, float] = {}
+        self._times_lock = threading.Lock()
 
     async def before_tool(self, tool_name: str, context: ToolContext) -> None:
-        self._start_times[context.request_id] = time.monotonic()
+        with self._times_lock:
+            self._start_times[context.request_id] = time.monotonic()
 
     async def after_tool(
         self, tool_name: str, result: ToolResult, context: ToolContext | None = None,
     ) -> Optional[ToolResult]:
         key = context.request_id if context else ""
-        start = self._start_times.pop(key, time.monotonic())
+        with self._times_lock:
+            start = self._start_times.pop(key, time.monotonic())
         duration = (time.monotonic() - start) * 1000
 
         event = AuditEvent(
