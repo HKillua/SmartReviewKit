@@ -72,13 +72,21 @@ class StudentProfileMemory:
         ) as cursor:
             row = await cursor.fetchone()
         if row:
-            return StudentProfile.model_validate_json(row[0])
+            try:
+                return StudentProfile.model_validate_json(row[0])
+            except Exception:
+                logger.warning("Corrupted profile data for %s, returning default", user_id)
         return StudentProfile(user_id=user_id)
+
+    _ALLOWED_UPDATE_FIELDS = frozenset({
+        "preferences", "weak_topics", "strong_topics", "learning_pace",
+        "total_sessions", "total_quizzes", "overall_accuracy", "last_active", "notes",
+    })
 
     async def update_profile(self, user_id: str, updates: dict) -> None:
         profile = await self.get_profile(user_id)
         for key, value in updates.items():
-            if hasattr(profile, key):
+            if key in self._ALLOWED_UPDATE_FIELDS:
                 setattr(profile, key, value)
         profile.last_active = datetime.now()
 

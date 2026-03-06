@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -9,7 +10,7 @@ import os
 import tempfile
 import uuid
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -48,6 +49,7 @@ class FileConversationStore(ConversationStore):
     def __init__(self, base_dir: str = "data/conversations") -> None:
         self._base_dir = Path(base_dir)
         self._base_dir.mkdir(parents=True, exist_ok=True)
+        self._write_locks: dict[str, asyncio.Lock] = {}
 
     def _user_dir(self, user_id: str) -> Path:
         hashed = hashlib.sha256(user_id.encode()).hexdigest()[:12]
@@ -59,12 +61,13 @@ class FileConversationStore(ConversationStore):
         return self._user_dir(user_id) / f"{conversation_id}.json"
 
     async def create(self, user_id: str) -> Conversation:
+        now = datetime.now(timezone.utc)
         conv = Conversation(
             id=uuid.uuid4().hex[:16],
             user_id=user_id,
             messages=[],
-            created_at=datetime.now(),
-            updated_at=datetime.now(),
+            created_at=now,
+            updated_at=now,
         )
         await self.update(conv)
         return conv
@@ -95,24 +98,30 @@ class FileConversationStore(ConversationStore):
             data.setdefault("title", "")
         return data
 
+    def _get_write_lock(self, conversation_id: str) -> asyncio.Lock:
+        if conversation_id not in self._write_locks:
+            self._write_locks[conversation_id] = asyncio.Lock()
+        return self._write_locks[conversation_id]
+
     async def update(self, conversation: Conversation) -> None:
-        conversation.updated_at = datetime.now()
-        path = self._conv_path(conversation.user_id, conversation.id)
-        data = conversation.model_dump_json(indent=2)
-        # Atomic write via temp file + rename
-        fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-        fd_closed = False
-        try:
-            os.write(fd, data.encode("utf-8"))
-            os.close(fd)
-            fd_closed = True
-            os.replace(tmp, str(path))
-        except Exception:
-            if not fd_closed:
+        lock = self._get_write_lock(conversation.id)
+        async with lock:
+            conversation.updated_at = datetime.now(timezone.utc)
+            path = self._conv_path(conversation.user_id, conversation.id)
+            data = conversation.model_dump_json(indent=2)
+            fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+            fd_closed = False
+            try:
+                os.write(fd, data.encode("utf-8"))
                 os.close(fd)
-            if os.path.exists(tmp):
-                os.unlink(tmp)
-            raise
+                fd_closed = True
+                os.replace(tmp, str(path))
+            except Exception:
+                if not fd_closed:
+                    os.close(fd)
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+                raise
 
     async def list_conversations(self, user_id: str, limit: int = 20) -> list[Conversation]:
         d = self._user_dir(user_id)
@@ -144,12 +153,13 @@ class MemoryConversationStore(ConversationStore):
         self._store: dict[str, Conversation] = {}
 
     async def create(self, user_id: str) -> Conversation:
+        now = datetime.now(timezone.utc)
         conv = Conversation(
             id=uuid.uuid4().hex[:16],
             user_id=user_id,
             messages=[],
-            created_at=datetime.now(),
-            updated_at=datetime.now(),
+            created_at=now,
+            updated_at=now,
         )
         self._store[conv.id] = conv
         return conv
@@ -161,7 +171,7 @@ class MemoryConversationStore(ConversationStore):
         return None
 
     async def update(self, conversation: Conversation) -> None:
-        conversation.updated_at = datetime.now()
+        conversation.updated_at = datetime.now(timezone.utc)
         self._store[conversation.id] = conversation
 
     async def list_conversations(self, user_id: str, limit: int = 20) -> list[Conversation]:

@@ -94,6 +94,7 @@ class Agent:
         self.skill_workflow = skill_workflow
         self.context_filter = context_filter
         self.review_hook = review_hook
+        self._bg_tasks: set[asyncio.Task] = set()
 
     async def chat(
         self,
@@ -204,9 +205,20 @@ class Agent:
             metadata={"conversation_id": conversation.id, "title": conversation.title},
         )
 
-        # P8: save + after-message hooks run in background so the SSE generator
-        # completes immediately after DONE, freeing the HTTP connection.
-        asyncio.create_task(self._post_message_tasks(conversation))
+        task = asyncio.create_task(self._post_message_tasks(conversation))
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._on_bg_task_done)
+
+    def _on_bg_task_done(self, task: asyncio.Task) -> None:
+        self._bg_tasks.discard(task)
+        if not task.cancelled() and task.exception():
+            logger.error("Background task failed: %s", task.exception())
+
+    async def flush(self) -> None:
+        """Await all pending background tasks — call during graceful shutdown."""
+        if self._bg_tasks:
+            await asyncio.gather(*self._bg_tasks, return_exceptions=True)
+            self._bg_tasks.clear()
 
     async def _post_message_tasks(self, conversation: Conversation) -> None:
         """Background task: save conversation and run after-message hooks."""

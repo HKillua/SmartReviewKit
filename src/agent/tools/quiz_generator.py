@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any, Optional
@@ -110,9 +111,8 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
         if self._search is None:
             return ToolResult(success=False, error="知识检索服务未初始化")
 
-        # Retrieve knowledge
         try:
-            results = self._search.search(query=args.topic, top_k=6)
+            results = await asyncio.to_thread(self._search.search, query=args.topic, top_k=6)
         except Exception as exc:
             return ToolResult(success=False, error=f"知识检索失败: {exc}")
 
@@ -155,13 +155,9 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
             if resp.error:
                 return ToolResult(success=False, error=f"LLM 生成失败: {resp.error}")
 
-            raw = (resp.content or "").strip()
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-
-            try:
-                questions = json.loads(raw)
-            except json.JSONDecodeError:
+            from src.agent.utils.json_helpers import safe_parse_json
+            questions = safe_parse_json(resp.content or "")
+            if questions is None:
                 return ToolResult(success=True, result_for_llm=resp.content or "")
 
             formatted = _format_questions(questions, args.question_type)

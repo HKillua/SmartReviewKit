@@ -9,7 +9,7 @@ Defines the fundamental data structures for the Agent system:
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal, Optional
 
@@ -99,10 +99,14 @@ class LlmStreamChunk(BaseModel):
 # Conversation Layer
 # ---------------------------------------------------------------------------
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 class Message(BaseModel):
     role: RoleType
     content: Optional[str] = None
-    timestamp: datetime = Field(default_factory=datetime.now)
+    timestamp: datetime = Field(default_factory=_utcnow)
     tool_calls: Optional[list[ToolCallData]] = None
     tool_call_id: Optional[str] = None
 
@@ -112,6 +116,6 @@ class Conversation(BaseModel):
     user_id: str
     title: str = ""
     messages: list[Message] = Field(default_factory=list)
-    created_at: datetime = Field(default_factory=datetime.now)
-    updated_at: datetime = Field(default_factory=datetime.now)
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
     schema_version: int = 1

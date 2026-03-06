@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Optional
 
@@ -70,7 +71,7 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
             return ToolResult(success=False, error="知识检索服务未初始化")
 
         try:
-            results = self._search.search(query=args.topic, top_k=8)
+            results = await asyncio.to_thread(self._search.search, query=args.topic, top_k=8)
         except Exception as exc:
             logger.exception("HybridSearch failed in ReviewSummaryTool")
             return ToolResult(success=False, error=f"知识检索失败: {exc}")

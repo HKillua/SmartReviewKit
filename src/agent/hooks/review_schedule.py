@@ -16,7 +16,7 @@ directly in Agent.chat).
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from src.agent.hooks.lifecycle import LifecycleHook
@@ -74,7 +74,7 @@ class ReviewScheduleHook(LifecycleHook):
 
         # ── Step 1: Ebbinghaus decay ──
         if self._enable_decay and self._kmap:
-            now = datetime.now()
+            now = datetime.now(timezone.utc)
             last = self._last_decay.get(user_id)
             if last is None or (now - last) > self._decay_cooldown:
                 try:

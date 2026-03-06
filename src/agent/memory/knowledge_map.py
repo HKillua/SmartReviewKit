@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -64,7 +64,10 @@ class KnowledgeMapMemory:
         ) as cursor:
             row = await cursor.fetchone()
         if row:
-            return KnowledgeNode.model_validate_json(row[0])
+            try:
+                return KnowledgeNode.model_validate_json(row[0])
+            except Exception:
+                logger.warning("Corrupted knowledge node data for %s/%s", user_id, concept)
         return None
 
     async def update_mastery(self, user_id: str, concept: str, correct: bool) -> None:
@@ -81,7 +84,7 @@ class KnowledgeMapMemory:
             node.mastery_level = max(0.0, node.mastery_level - 0.15)
             node.review_interval_days = max(1.0, node.review_interval_days / 2.0)
 
-        node.last_reviewed = datetime.now()
+        node.last_reviewed = datetime.now(timezone.utc)
 
         db = await self._get_conn()
         await db.execute(
@@ -96,14 +99,20 @@ class KnowledgeMapMemory:
             "SELECT data FROM knowledge_nodes WHERE user_id = ?", (user_id,)
         ) as cursor:
             rows = await cursor.fetchall()
-        return [KnowledgeNode.model_validate_json(r[0]) for r in rows]
+        nodes: list[KnowledgeNode] = []
+        for r in rows:
+            try:
+                nodes.append(KnowledgeNode.model_validate_json(r[0]))
+            except Exception:
+                logger.warning("Skipping corrupted knowledge node for user %s", user_id)
+        return nodes
 
     async def get_weak_nodes(self, user_id: str, threshold: float = 0.5) -> list[KnowledgeNode]:
         nodes = await self._get_all_nodes(user_id)
         return [n for n in nodes if n.mastery_level < threshold]
 
     async def get_due_for_review(self, user_id: str) -> list[KnowledgeNode]:
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         nodes = await self._get_all_nodes(user_id)
         result = []
         for node in nodes:
@@ -115,32 +124,40 @@ class KnowledgeMapMemory:
 
     async def apply_decay(self, user_id: str) -> int:
         """Apply Ebbinghaus forgetting curve decay to all nodes. Returns count of decayed nodes."""
-        now = datetime.now()
-        decayed = 0
+        now = datetime.now(timezone.utc)
         db = await self._get_conn()
         async with db.execute(
             "SELECT data FROM knowledge_nodes WHERE user_id = ?", (user_id,)
         ) as cursor:
             rows = await cursor.fetchall()
 
+        batch_updates: list[tuple[str, str, str]] = []
         for r in rows:
-            node = KnowledgeNode.model_validate_json(r[0])
+            try:
+                node = KnowledgeNode.model_validate_json(r[0])
+            except Exception:
+                continue
             if node.last_reviewed is None:
                 continue
-            days_since = (now - node.last_reviewed).total_seconds() / 86400
+            last_reviewed = node.last_reviewed
+            if last_reviewed.tzinfo is None:
+                last_reviewed = last_reviewed.replace(tzinfo=timezone.utc)
+            days_since = (now - last_reviewed).total_seconds() / 86400
             if days_since < 0.5:
                 continue
             retention = math.exp(-days_since / (node.review_interval_days * 2))
             new_mastery = max(0.0, node.mastery_level * retention)
             if abs(new_mastery - node.mastery_level) > 0.01:
                 node.mastery_level = round(new_mastery, 3)
-                await db.execute(
-                    "UPDATE knowledge_nodes SET data = ? WHERE user_id = ? AND concept = ?",
-                    (node.model_dump_json(), user_id, node.concept),
-                )
-                decayed += 1
-        await db.commit()
-        return decayed
+                batch_updates.append((node.model_dump_json(), user_id, node.concept))
+
+        if batch_updates:
+            await db.executemany(
+                "UPDATE knowledge_nodes SET data = ? WHERE user_id = ? AND concept = ?",
+                batch_updates,
+            )
+            await db.commit()
+        return len(batch_updates)
 
     async def close(self) -> None:
         if self._conn is not None:

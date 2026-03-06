@@ -97,29 +97,54 @@ class SessionMemory:
             (user_id, limit),
         ) as cursor:
             rows = await cursor.fetchall()
-        return [SessionSummary.model_validate_json(r[0]) for r in rows]
+        results: list[SessionSummary] = []
+        for r in rows:
+            try:
+                results.append(SessionSummary.model_validate_json(r[0]))
+            except Exception:
+                logger.warning("Skipping corrupted session summary")
+        return results
 
     async def get_topic_history(
         self, user_id: str, topic: str, limit: int = 10
     ) -> list[SessionSummary]:
-        """Return sessions where *topic* appeared (case-insensitive substring match)."""
-        all_sessions = await self.get_recent_sessions(user_id, limit=100)
+        """Return sessions where *topic* appeared (SQL LIKE + in-memory verification)."""
+        db = await self._get_conn()
+        async with db.execute(
+            "SELECT data FROM session_summaries WHERE user_id = ? AND data LIKE ? ORDER BY created_at DESC LIMIT ?",
+            (user_id, f"%{topic}%", limit * 3),
+        ) as cursor:
+            rows = await cursor.fetchall()
         topic_lower = topic.lower()
-        matched = [
-            s
-            for s in all_sessions
-            if any(topic_lower in t.lower() for t in s.topics)
-        ]
-        return matched[:limit]
+        matched: list[SessionSummary] = []
+        for r in rows:
+            try:
+                s = SessionSummary.model_validate_json(r[0])
+            except Exception:
+                continue
+            if any(topic_lower in t.lower() for t in s.topics):
+                matched.append(s)
+                if len(matched) >= limit:
+                    break
+        return matched
 
     async def search_sessions(
         self, user_id: str, query: str, limit: int = 5
     ) -> list[SessionSummary]:
-        """Keyword search across session summaries and topics."""
-        all_sessions = await self.get_recent_sessions(user_id, limit=100)
+        """Keyword search across session summaries and topics (SQL pre-filter)."""
+        db = await self._get_conn()
+        async with db.execute(
+            "SELECT data FROM session_summaries WHERE user_id = ? AND data LIKE ? ORDER BY created_at DESC LIMIT ?",
+            (user_id, f"%{query}%", limit * 5),
+        ) as cursor:
+            rows = await cursor.fetchall()
         query_lower = query.lower()
         scored: list[tuple[float, SessionSummary]] = []
-        for s in all_sessions:
+        for r in rows:
+            try:
+                s = SessionSummary.model_validate_json(r[0])
+            except Exception:
+                continue
             score = 0.0
             searchable = " ".join(s.topics + s.key_questions) + " " + s.summary_text
             searchable_lower = searchable.lower()

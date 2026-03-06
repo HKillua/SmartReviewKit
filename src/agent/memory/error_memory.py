@@ -87,6 +87,9 @@ class ErrorMemory:
         if mastered is not None:
             query += " AND mastered = ?"
             params.append(int(mastered))
+        if topic:
+            query += " AND data LIKE ?"
+            params.append(f"%{topic}%")
         query += " ORDER BY created_at DESC LIMIT ?"
         params.append(limit)
 
@@ -94,9 +97,12 @@ class ErrorMemory:
         async with db.execute(query, params) as cursor:
             rows = await cursor.fetchall()
 
-        records = [ErrorRecord.model_validate_json(r[0]) for r in rows]
-        if topic:
-            records = [r for r in records if topic.lower() in r.topic.lower()]
+        records: list[ErrorRecord] = []
+        for r in rows:
+            try:
+                records.append(ErrorRecord.model_validate_json(r[0]))
+            except Exception:
+                logger.warning("Skipping corrupted error record")
         return records
 
     async def mark_mastered(self, error_id: str) -> None:

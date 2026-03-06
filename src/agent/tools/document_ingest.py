@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Any
@@ -59,6 +60,9 @@ class DocumentIngestTool(Tool[DocumentIngestArgs]):
         if not path.exists():
             return ToolResult(success=False, error=f"文件不存在: {args.file_path}")
 
+        if path.is_symlink():
+            return ToolResult(success=False, error="不允许通过符号链接导入文件")
+
         if not self._is_path_allowed(path):
             return ToolResult(success=False, error="文件路径不在允许的目录范围内")
 
@@ -68,7 +72,7 @@ class DocumentIngestTool(Tool[DocumentIngestArgs]):
 
         try:
             pipeline = self._get_pipeline(args.collection)
-            result = pipeline.run(str(path))
+            result = await asyncio.to_thread(pipeline.run, str(path))
 
             if result.success:
                 return ToolResult(

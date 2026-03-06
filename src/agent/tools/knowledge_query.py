@@ -39,6 +39,7 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
         self._initialized = hybrid_search is not None
         self._current_collection: Optional[str] = None
         self._embedding_client: Any = None
+        self._init_lock = asyncio.Lock()
 
         retrieval_cfg = None
         if settings and hasattr(settings, 'retrieval'):
@@ -108,7 +109,8 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
 
     async def execute(self, context: ToolContext, args: KnowledgeQueryArgs) -> ToolResult:
         try:
-            self._ensure_initialized(args.collection)
+            async with self._init_lock:
+                self._ensure_initialized(args.collection)
 
             effective_query = args.query
             hyde_vector = None

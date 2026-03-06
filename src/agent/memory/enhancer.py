@@ -11,7 +11,7 @@ import asyncio
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from src.agent.hooks.lifecycle import LifecycleHook
@@ -171,7 +171,10 @@ class MemoryContextEnhancer:
             for n in due[:5]:
                 days = ""
                 if n.last_reviewed:
-                    d = (datetime.now() - n.last_reviewed).days
+                    lr = n.last_reviewed
+                    if lr.tzinfo is None:
+                        lr = lr.replace(tzinfo=timezone.utc)
+                    d = (datetime.now(timezone.utc) - lr).days
                     days = f", {d}天未复习"
                 due_lines.append(f"- {n.concept} (掌握度: {n.mastery_level:.0%}{days})")
             sections.append("### 需要复习的知识点\n" + "\n".join(due_lines))
@@ -181,9 +184,12 @@ class MemoryContextEnhancer:
             sections.append(f"### 低掌握度知识\n- {weak_items}")
 
         if errors:
+            from collections import Counter
+            topic_counts = Counter(e.topic for e in errors if e.topic)
             err_lines = []
             for e in errors[:3]:
-                err_lines.append(f"- {e.topic}: {e.question[:40]}… (错{1}次)")
+                count = topic_counts.get(e.topic, 1)
+                err_lines.append(f"- {e.topic}: {e.question[:40]}… (错{count}次)")
             sections.append("### 错题提醒\n" + "\n".join(err_lines))
 
         if not sections:
@@ -259,7 +265,7 @@ class MemoryRecordHook(LifecycleHook):
                 profile = await self._profile.get_profile(user_id)
                 updates: dict[str, Any] = {
                     "total_sessions": profile.total_sessions + 1,
-                    "last_active": datetime.now(),
+                    "last_active": datetime.now(timezone.utc),
                 }
 
                 # Merge preference updates
@@ -303,7 +309,7 @@ class MemoryRecordHook(LifecycleHook):
         # Step 4: Save tool chains to skill memory (existing logic)
         if self._skills:
             try:
-                self._save_tool_chains(conversation)
+                await self._save_tool_chains(conversation)
             except Exception:
                 logger.warning("Failed to save tool chains")
 
@@ -342,13 +348,9 @@ class MemoryRecordHook(LifecycleHook):
         if not response.content:
             return None
 
-        text = response.content.strip()
-        # Strip markdown code fence if present
-        if text.startswith("```"):
-            text = re.sub(r"^```\w*\n?", "", text)
-            text = re.sub(r"\n?```$", "", text)
-
-        return json.loads(text)
+        from src.agent.utils.json_helpers import safe_parse_json
+        result = safe_parse_json(response.content)
+        return result
 
     def _extract_via_rules(self, conversation: Conversation) -> dict:
         """Heuristic rule-based extraction from conversation messages."""
@@ -427,7 +429,7 @@ class MemoryRecordHook(LifecycleHook):
             obs[t] = "strong"
         return obs
 
-    def _save_tool_chains(self, conversation: Conversation) -> None:
+    async def _save_tool_chains(self, conversation: Conversation) -> None:
         tool_chain: list[str] = []
         for m in conversation.messages:
             if m.tool_calls:
@@ -439,7 +441,6 @@ class MemoryRecordHook(LifecycleHook):
                 None,
             )
             if user_msg:
-                import asyncio
                 from src.agent.memory.skill_memory import ToolUsageRecord
 
                 record = ToolUsageRecord(
@@ -447,4 +448,7 @@ class MemoryRecordHook(LifecycleHook):
                     tool_chain=tool_chain,
                     quality_score=0.8,
                 )
-                asyncio.create_task(self._skills.save_usage(conversation.user_id, record))
+                try:
+                    await self._skills.save_usage(conversation.user_id, record)
+                except Exception:
+                    logger.warning("Failed to save tool usage record")

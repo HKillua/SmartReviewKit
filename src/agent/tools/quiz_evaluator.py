@@ -76,8 +76,8 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
             )
 
         try:
-            import json
             from src.agent.types import LlmMessage, LlmRequest
+            from src.agent.utils.json_helpers import safe_parse_json
 
             prompt = EVAL_PROMPT_TEMPLATE.format(
                 question_type=sanitize_user_input(args.question_type, max_length=50),
@@ -97,16 +97,12 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
             if resp.error:
                 return ToolResult(success=False, error=f"评判失败: {resp.error}")
 
-            raw = (resp.content or "").strip()
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-
-            try:
-                result = json.loads(raw)
-            except json.JSONDecodeError:
+            result = safe_parse_json(resp.content or "")
+            if result is None:
                 result = {"verdict": "unknown", "explanation": resp.content, "key_concepts": []}
 
-            verdict = result.get("verdict", "unknown")
+            verdict = result.get("verdict", "unknown").lower().strip()
+            result["verdict"] = verdict
             is_correct = verdict == "correct"
 
             # Update memory
