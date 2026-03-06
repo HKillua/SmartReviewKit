@@ -217,16 +217,22 @@ class CrossEncoderReranker(BaseReranker):
         Raises:
             CrossEncoderRerankError: If scoring fails or times out.
         """
+        import concurrent.futures
+
         try:
-            # Use model.predict() to score all pairs in batch
-            scores = self.model.predict(pairs)
-            
-            # Convert numpy array to list if needed
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(self.model.predict, pairs)
+                scores = future.result(timeout=self.timeout)
+
             if hasattr(scores, 'tolist'):
                 scores = scores.tolist()
-            
+
             return scores
-            
+
+        except concurrent.futures.TimeoutError:
+            raise CrossEncoderRerankError(
+                f"Cross-Encoder scoring timed out after {self.timeout}s"
+            )
         except Exception as e:
             raise CrossEncoderRerankError(
                 f"Failed to score pairs with Cross-Encoder: {e}"

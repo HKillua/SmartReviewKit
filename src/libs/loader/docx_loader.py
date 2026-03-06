@@ -210,7 +210,7 @@ class DocxLoader(BaseLoader):
             return blobs
         try:
             for drawing in para._element.findall(f".//{{{_WP_NS}}}inline"):
-                blip = drawing.find(f".//{{{A_NS}}}blip" if False else f".//{{{_A_NS}}}blip")
+                blip = drawing.find(f".//{{{_A_NS}}}blip")
                 if blip is None:
                     continue
                 r_embed = blip.get(f"{{{_R_NS}}}embed")

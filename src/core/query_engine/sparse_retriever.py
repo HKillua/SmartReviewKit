@@ -220,21 +220,27 @@ class SparseRetriever:
             )
     
     def _ensure_index_loaded(self, collection: str) -> bool:
-        """Ensure the BM25 index is loaded for the given collection.
-        
-        Always reloads from disk because the index may have been updated
-        by another process (e.g., dashboard ingestion).  The load is
-        fast (a single JSON file read) compared to the overall query.
-        
-        Args:
-            collection: The collection name to load.
-        
-        Returns:
-            True if index is loaded and ready, False otherwise.
+        """Load BM25 index with mtime-based cache to avoid redundant disk I/O.
+
+        Reloads only when the underlying JSON file has been modified since the
+        last successful load.
         """
+        if not hasattr(self, "_index_cache"):
+            self._index_cache: dict[str, float] = {}
+
         try:
-            loaded = self.bm25_indexer.load(collection=collection)
-            return loaded
+            idx_path = self.bm25_indexer._get_index_path(collection)
+            if idx_path.exists():
+                current_mtime = idx_path.stat().st_mtime
+                cached_mtime = self._index_cache.get(collection, -1.0)
+                if current_mtime == cached_mtime:
+                    return True
+                loaded = self.bm25_indexer.load(collection=collection)
+                if loaded:
+                    self._index_cache[collection] = current_mtime
+                return loaded
+            else:
+                return False
         except Exception as e:
             logger.warning(f"Failed to load BM25 index for collection '{collection}': {e}")
             return False

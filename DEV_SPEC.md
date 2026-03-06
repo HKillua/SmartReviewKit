@@ -331,6 +331,7 @@ markers = [
 | J | RAG 深度优化 | 19 | 4 天 | A-I |
 | K | 记忆系统深度升级（个性化复习助手） | 9 | 3 天 | D, F, J |
 | L | 前端 UI 优化 + 会话管理完善 | 7 | 1.5 天 | D, H |
+| M | RAG 深度优化 II — 面试无死角 | 16 | 3 天 | A-L |
 
 ### 4.2 进度跟踪
 
@@ -2302,3 +2303,187 @@ dependencies = [
 | **新前端** | 调用 `/api/chat` SSE 端点即可 |
 | **多课程** | 通过 collection 隔离不同课程的知识库 |
 | **集群部署** | 将 VectorStore 切换到 Milvus Cluster，ConversationStore 和 Memory 迁移到 Redis/PostgreSQL |
+
+---
+
+## 阶段 M：RAG 深度优化 II — 面试无死角
+
+> 目标：针对 RAG 系统逐一消除面试深度拷打中可能暴露的薄弱点，涵盖**中文分词、查询增强、检索质量、工程优化、评估体系**五大维度共 16 项任务。
+
+### M 阶段总览
+
+| 分组 | 任务 | 说明 | 状态 |
+|------|------|------|------|
+| **Group 1: 基础修复** | M1 | SparseEncoder + QueryProcessor 接入 jieba 中文分词 | ✅ 完成 |
+| | M2 | SemanticSplitter batch embed bug 修复 | ✅ 完成 |
+| | M3 | DocxLoader 死代码 + CrossEncoder timeout 修复 | ✅ 完成 |
+| | M4 | BM25 索引 mtime 缓存 | ✅ 完成 |
+| **Group 2: 查询增强** | M5 | QueryEnhancer — Query Rewriting (LLM 查询改写) | ✅ 完成 |
+| | M6 | HyDE (Hypothetical Document Embedding) | ✅ 完成 |
+| | M7 | Multi-Query Retrieval (查询分解) | ✅ 完成 |
+| **Group 3: 检索质量** | M8 | MMR 多样性控制 | ✅ 完成 |
+| | M9 | Reranker 集成到 HybridSearch 管线 | ✅ 完成 |
+| | M10 | Contextual Retrieval (chunk 上下文注入) | ✅ 完成 |
+| **Group 4: 工程优化** | M11 | Embedding LRU 缓存 | ✅ 完成 |
+| | M12 | RRF 可配权重 (dense_weight / sparse_weight) | ✅ 完成 |
+| | M13 | Chunk 语义去重 (SimHash) | ✅ 完成 |
+| **Group 5: 评估体系** | M14 | 检索评估指标 (Hit Rate / MRR / NDCG / P@k / R@k) | ✅ 完成 |
+| | M15 | Golden Test Set + 自动化评估脚本 | ✅ 完成 |
+| | M16 | DEV_SPEC.md 阶段 M + 复习文档 | ✅ 完成 |
+
+---
+
+### M1: SparseEncoder + QueryProcessor 接入 jieba 中文分词
+
+**问题**: `_tokenize` 使用 `re.findall(r'\b[\w-]+\b', text)` 无法正确切分中文。
+**方案**: 引入 `jieba.cut` 对 CJK 文本进行分词，保留英文 regex fallback。
+**文件**:
+- `src/ingestion/embedding/sparse_encoder.py` — 重写 `_tokenize`，添加中文停用词表
+- `src/core/query_engine/query_processor.py` — `_tokenize` 同步替换为 jieba
+- `pyproject.toml` — 新增 `jieba>=0.42.1` 依赖
+**测试**: `SparseEncoder.encode()` 对中文文本输出精确分词结果
+
+---
+
+### M2: SemanticSplitter batch embed bug 修复
+
+**问题**: `_embed_batch` 实现为逐条 `embedder.embed(t)` 调用（返回单向量），但 `split_text` 期望返回向量列表。
+**方案**: 改为 `embedder.embed(texts)` 批量调用。
+**文件**: `src/libs/splitter/semantic_splitter.py`
+
+---
+
+### M3: DocxLoader 死代码 + CrossEncoder timeout 修复
+
+**问题**:
+1. `docx_loader.py` 行 213: `if False` 永远跳过一个分支，属于死代码
+2. `cross_encoder_reranker.py` 声明了 `timeout` 参数但从未在 `_score_pairs` 中使用
+**方案**:
+1. 删除 `if False` 分支
+2. 使用 `concurrent.futures.ThreadPoolExecutor` + `future.result(timeout=self.timeout)` 实现超时
+**文件**:
+- `src/libs/loader/docx_loader.py`
+- `src/libs/reranker/cross_encoder_reranker.py`
+
+---
+
+### M4: BM25 索引 mtime 缓存
+
+**问题**: `SparseRetriever._ensure_index_loaded` 每次查询都重新从磁盘加载 BM25 索引 JSON。
+**方案**: 基于文件 mtime 的缓存，仅在文件变更时重新加载。
+**文件**: `src/core/query_engine/sparse_retriever.py`
+
+---
+
+### M5-M7: 查询增强模块 (QueryEnhancer)
+
+**新文件**: `src/core/query_engine/query_enhancer.py`
+
+统一模块包含三种策略：
+
+| 策略 | 说明 | Prompt |
+|------|------|--------|
+| M5: Query Rewriting | LLM 改写查询为更适合检索的形式 | `config/prompts/query_rewrite.txt` |
+| M6: HyDE | 生成假设性文档，用其 embedding 替代原始查询 embedding | `config/prompts/hyde.txt` |
+| M7: Multi-Query | 将复杂问题拆分为 2-4 个独立子查询 | `config/prompts/multi_query.txt` |
+
+所有策略均为 `async def`，通过 `settings.retrieval.*_enabled` 开关控制。
+
+---
+
+### M8: MMR 多样性控制
+
+**新文件**: `src/core/query_engine/mmr.py`
+**算法**: `MMR = λ · sim(d, q) - (1-λ) · max sim(d, S)`
+**参数**: `mmr_lambda` (0.7 = 偏向相关性，0.3 = 偏向多样性)
+**集成**: 在 `HybridSearch` 融合后可选调用
+
+---
+
+### M9: Reranker 集成到 HybridSearch 管线
+
+**修改**: `HybridSearch.__init__` 新增 `reranker: BaseReranker` 参数
+**流程**: 在 fusion 之后、top_k 截断之前，若 `config.rerank_enabled=True` 则调用 `reranker.rerank()`
+**容错**: reranker 失败时 fallback 到原始排序
+**文件**: `src/core/query_engine/hybrid_search.py`
+
+---
+
+### M10: Contextual Retrieval (chunk 上下文注入)
+
+**新文件**: `src/ingestion/transform/contextual_enricher.py`
+**原理**: 参考 Anthropic "Contextual Retrieval"，为每个 chunk 添加文档级上下文前缀
+**模式**:
+- `rule`: 基于标题/文件名/节标题拼接（无 LLM 开销）
+- `llm`: LLM 生成 1-2 句定位描述
+**配置**: `settings.retrieval.contextual_enrichment: rule|llm|off`
+
+---
+
+### M11: Embedding LRU 缓存
+
+**新文件**: `src/libs/embedding/cached_embedding.py`
+**设计**: 透明代理模式包装 `BaseEmbedding`，SHA-256 哈希文本作为缓存 key
+**容量**: `max_size=4096`（可通过 `settings.retrieval.embedding_cache_size` 配置）
+**监控**: 每 200 次调用输出 hit/miss 统计
+
+---
+
+### M12: RRF 可配权重
+
+**修改**: `HybridSearch._fuse_results` 改用 `fusion.fuse_with_weights(weights=[dense_weight, sparse_weight])`
+**配置**: `settings.retrieval.dense_weight / sparse_weight`
+**文件**: `src/core/query_engine/hybrid_search.py`
+
+---
+
+### M13: Chunk 语义去重 (SimHash)
+
+**新文件**: `src/ingestion/transform/chunk_dedup.py`
+**算法**: 64-bit SimHash + Hamming 距离阈值 (默认 3)
+**集成点**: Ingestion Pipeline 在 chunking 后、encoding 前去重
+**配置**: `settings.retrieval.dedup_enabled / dedup_threshold`
+
+---
+
+### M14: 检索评估指标
+
+**新文件**: `src/libs/evaluator/retrieval_metrics.py`
+**指标**: Hit Rate, MRR, NDCG@k, Precision@k, Recall@k
+**接口**: 实现 `BaseEvaluator`，可直接注入 `EvalRunner`
+
+---
+
+### M15: Golden Test Set + 自动化评估脚本
+
+**新文件**:
+- `tests/fixtures/golden_test_set.json` — 10 条计算机网络知识点测试用例
+- `scripts/run_eval.py` — CLI 脚本，初始化 HybridSearch + RetrievalMetricsEvaluator，运行评估并输出 JSON 报告
+
+**用法**: `python scripts/run_eval.py --top-k 10 --output data/eval_report.json`
+
+---
+
+### M16: 文档输出
+
+- 更新 `DEV_SPEC.md` — 阶段 M 详细 spec（本节）
+- 新建 `docs/RAG_DEEP_OPTIMIZATION_II.md` — 复习与面试话术文档
+
+### settings.yaml 新增配置项
+
+```yaml
+retrieval:
+  dense_weight: 1.0          # RRF 中 dense 路权重
+  sparse_weight: 1.0         # RRF 中 sparse 路权重
+  rerank_enabled: false       # 是否启用 Reranker
+  rerank_top_k: 5            # Reranker 返回 top-k
+  mmr_enabled: false          # 是否启用 MMR 多样性控制
+  mmr_lambda: 0.7            # MMR λ 参数
+  query_rewrite_enabled: false
+  hyde_enabled: false
+  multi_query_enabled: false
+  contextual_enrichment: "rule"  # rule / llm / off
+  embedding_cache_size: 4096
+  dedup_enabled: true
+  dedup_threshold: 3          # SimHash Hamming 距离阈值
+```

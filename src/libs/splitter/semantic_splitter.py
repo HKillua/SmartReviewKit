@@ -122,7 +122,7 @@ class SemanticSplitter(BaseSplitter):
             embedder = EmbeddingFactory.create(self._settings)
 
             def _embed_batch(texts: List[str]) -> List[List[float]]:
-                return [embedder.embed(t) for t in texts]
+                return embedder.embed(texts)
 
             self._embed_fn = _embed_batch
             return _embed_batch

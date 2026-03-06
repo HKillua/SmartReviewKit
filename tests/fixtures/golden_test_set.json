@@ -1,36 +1,66 @@
 {
-  "description": "Golden test set for Modular RAG MCP Server evaluation. Contains test queries with expected chunk IDs for IR metrics and optional reference answers for LLM-as-Judge metrics.",
+  "description": "计算机网络课程 RAG 检索质量 Golden Test Set",
   "version": "1.0",
   "test_cases": [
     {
-      "query": "What is Modular RAG?",
+      "query": "TCP三次握手的过程是什么？",
       "expected_chunk_ids": [],
-      "expected_sources": [],
-      "reference_answer": "Modular RAG is a Retrieval-Augmented Generation system built with modular, pluggable components that can be configured and swapped independently."
+      "expected_sources": ["计算机网络"],
+      "reference_answer": "TCP三次握手：客户端发送SYN，服务端回复SYN+ACK，客户端发送ACK。"
     },
     {
-      "query": "How to configure Azure OpenAI?",
+      "query": "OSI七层模型和TCP/IP四层模型有什么区别？",
       "expected_chunk_ids": [],
-      "expected_sources": [],
-      "reference_answer": "Configure Azure OpenAI by setting the provider to 'azure' in settings.yaml, along with the deployment_name, azure_endpoint, api_version, and api_key fields."
+      "expected_sources": ["计算机网络"],
+      "reference_answer": "OSI有物理层、数据链路层、网络层、传输层、会话层、表示层、应用层；TCP/IP简化为网络接口层、网际层、传输层、应用层。"
     },
     {
-      "query": "What is hybrid search and how does it work?",
+      "query": "什么是CSMA/CD协议？",
       "expected_chunk_ids": [],
-      "expected_sources": [],
-      "reference_answer": "Hybrid search combines dense retrieval (semantic embeddings) and sparse retrieval (BM25 keyword matching), then fuses results using Reciprocal Rank Fusion (RRF) for better recall."
+      "expected_sources": ["计算机网络"],
+      "reference_answer": "CSMA/CD（载波侦听多路访问/冲突检测）用于以太网，站点先侦听再发送，若检测到冲突则停止并退避。"
     },
     {
-      "query": "Explain the chunking strategy",
+      "query": "IP地址的分类方式和子网掩码的作用",
       "expected_chunk_ids": [],
-      "expected_sources": [],
-      "reference_answer": "Documents are split into chunks using configurable strategies (recursive, semantic, or fixed-length). Chunks are then refined and enriched with metadata before storage."
+      "expected_sources": ["计算机网络"],
+      "reference_answer": "IP地址分为A/B/C/D/E五类，子网掩码用于划分网络号和主机号。"
     },
     {
-      "query": "What evaluation metrics are supported?",
+      "query": "HTTP和HTTPS的区别",
       "expected_chunk_ids": [],
-      "expected_sources": [],
-      "reference_answer": "The system supports hit_rate, MRR (custom metrics), and Ragas LLM-as-Judge metrics including faithfulness, answer_relevancy, and context_precision."
+      "expected_sources": ["计算机网络"],
+      "reference_answer": "HTTPS在HTTP基础上加入TLS/SSL加密，使用443端口。"
+    },
+    {
+      "query": "路由算法有哪些？距离向量和链路状态有什么区别？",
+      "expected_chunk_ids": [],
+      "expected_sources": ["计算机网络"],
+      "reference_answer": "距离向量算法（如RIP）各路由器交换路由表，链路状态算法（如OSPF）每个路由器掌握全网拓扑。"
+    },
+    {
+      "query": "DNS域名解析的过程",
+      "expected_chunk_ids": [],
+      "expected_sources": ["计算机网络"],
+      "reference_answer": "DNS解析包括递归查询和迭代查询，从本地DNS到根服务器、顶级域服务器、权威服务器逐级解析。"
+    },
+    {
+      "query": "什么是滑动窗口协议？",
+      "expected_chunk_ids": [],
+      "expected_sources": ["计算机网络"],
+      "reference_answer": "滑动窗口协议通过维护发送窗口和接收窗口来实现流量控制和可靠传输。"
+    },
+    {
+      "query": "ARP协议的工作原理",
+      "expected_chunk_ids": [],
+      "expected_sources": ["计算机网络"],
+      "reference_answer": "ARP通过广播请求将IP地址解析为MAC地址，并缓存映射关系。"
+    },
+    {
+      "query": "拥塞控制的四种算法是什么？",
+      "expected_chunk_ids": [],
+      "expected_sources": ["计算机网络"],
+      "reference_answer": "慢开始、拥塞避免、快重传、快恢复。"
     }
   ]
 }

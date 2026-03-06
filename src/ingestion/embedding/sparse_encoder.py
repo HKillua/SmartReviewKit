@@ -8,63 +8,62 @@ Design Principles:
 - Observable: Accepts TraceContext for future observability integration
 - Deterministic: Same inputs produce same term statistics
 - Clear Contracts: Well-defined output structure for downstream BM25Indexer
+- Chinese-Aware: Uses jieba for Chinese segmentation with English regex fallback
 """
 
-from typing import List, Dict, Optional, Any
-from collections import Counter
+from __future__ import annotations
+
+import logging
 import re
+from collections import Counter
+from typing import Any, Dict, List, Optional, Set
+
 from src.core.types import Chunk
+
+logger = logging.getLogger(__name__)
+
+try:
+    import jieba
+
+    jieba.setLogLevel(logging.WARNING)
+    _JIEBA_AVAILABLE = True
+except ImportError:
+    _JIEBA_AVAILABLE = False
+
+_CJK_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
+_EN_TOKEN_RE = re.compile(r"[A-Za-z0-9][\w-]*")
+
+_CHINESE_STOPWORDS: Set[str] = {
+    "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一",
+    "一个", "上", "也", "很", "到", "说", "要", "去", "你", "会", "着",
+    "没有", "看", "好", "自己", "这", "他", "她", "它", "们", "那", "些",
+    "所以", "因为", "但是", "而且", "或者", "如果", "虽然", "然而",
+    "可以", "能", "将", "把", "被", "让", "给", "对", "从", "以",
+    "与", "及", "等", "之", "其", "中", "为", "而", "于", "并",
+}
 
 
 class SparseEncoder:
     """Encodes text chunks into BM25 term statistics.
-    
-    This encoder prepares term-level statistics needed for BM25 indexing.
-    The actual index construction is handled by BM25Indexer (C12).
-    
-    Output Structure:
-        For each chunk, produces:
-        {
-            "chunk_id": str,
-            "term_frequencies": Dict[str, int],  # term -> count in this chunk
-            "doc_length": int,                    # number of terms in chunk
-            "unique_terms": int                   # vocabulary size in chunk
-        }
-    
-    Design:
-    - Tokenization: Simple whitespace + lowercasing (can be enhanced later)
-    - Stop Words: None by default (can add in future iterations)
-    - Deterministic: Same chunk text always produces same statistics
-    
-    Example:
-        >>> from src.core.types import Chunk
-        >>> encoder = SparseEncoder()
-        >>> 
-        >>> chunks = [Chunk(id="1", text="Hello world hello", metadata={})]
-        >>> stats = encoder.encode(chunks)
-        >>> stats[0]["term_frequencies"]["hello"]  # 2
-        >>> stats[0]["doc_length"]  # 3
+
+    Uses jieba for Chinese text segmentation, and standard regex for
+    English / numeric tokens.  Mixed-language text is handled seamlessly.
     """
-    
+
     def __init__(
         self,
-        min_term_length: int = 2,
+        min_term_length: int = 1,
         lowercase: bool = True,
+        use_stopwords: bool = True,
     ):
-        """Initialize SparseEncoder.
-        
-        Args:
-            min_term_length: Minimum character length for a term (default: 2)
-            lowercase: Whether to convert terms to lowercase (default: True)
-        
-        Raises:
-            ValueError: If min_term_length < 1
-        """
         if min_term_length < 1:
             raise ValueError(f"min_term_length must be >= 1, got {min_term_length}")
-        
+
         self.min_term_length = min_term_length
         self.lowercase = lowercase
+        self._stopwords: Set[str] = _CHINESE_STOPWORDS.copy() if use_stopwords else set()
+        if not _JIEBA_AVAILABLE:
+            logger.warning("jieba not installed; Chinese segmentation disabled")
     
     def encode(
         self,
@@ -129,31 +128,33 @@ class SparseEncoder:
         return results
     
     def _tokenize(self, text: str) -> List[str]:
-        """Tokenize text into terms.
-        
-        Current implementation:
-        - Split on whitespace and punctuation
-        - Optionally lowercase
-        - Filter by minimum term length
-        
-        Args:
-            text: Input text to tokenize
-        
-        Returns:
-            List of valid terms
+        """Tokenize text using jieba (Chinese) + regex (English).
+
+        Mixed-language text is split by scanning for CJK ranges.
+        Chinese segments are passed through ``jieba.cut``; non-Chinese
+        segments are tokenised with a simple ``\\w+`` regex.
         """
-        # Split on whitespace and common punctuation
-        # Keep alphanumeric and hyphens, underscores
-        tokens = re.findall(r'\b[\w-]+\b', text)
-        
-        # Apply lowercase if configured
-        if self.lowercase:
-            tokens = [t.lower() for t in tokens]
-        
-        # Filter by minimum length
-        terms = [t for t in tokens if len(t) >= self.min_term_length]
-        
-        return terms
+        tokens: List[str] = []
+
+        if _JIEBA_AVAILABLE and _CJK_RE.search(text):
+            for word in jieba.cut(text):
+                word = word.strip()
+                if not word:
+                    continue
+                if self.lowercase:
+                    word = word.lower()
+                if len(word) < self.min_term_length:
+                    continue
+                if word in self._stopwords:
+                    continue
+                tokens.append(word)
+        else:
+            raw = _EN_TOKEN_RE.findall(text)
+            if self.lowercase:
+                raw = [t.lower() for t in raw]
+            tokens = [t for t in raw if len(t) >= self.min_term_length and t not in self._stopwords]
+
+        return tokens
     
     def get_corpus_stats(
         self,

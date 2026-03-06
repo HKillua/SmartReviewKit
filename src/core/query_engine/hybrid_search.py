@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from src.core.query_engine.fusion import RRFFusion
     from src.core.query_engine.query_processor import QueryProcessor
     from src.core.query_engine.sparse_retriever import SparseRetriever
+    from src.libs.reranker.base_reranker import BaseReranker
     from src.core.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -59,17 +60,7 @@ def _snapshot_results(
 
 @dataclass
 class HybridSearchConfig:
-    """Configuration for HybridSearch.
-    
-    Attributes:
-        dense_top_k: Number of results from dense retrieval
-        sparse_top_k: Number of results from sparse retrieval
-        fusion_top_k: Final number of results after fusion
-        enable_dense: Whether to use dense retrieval
-        enable_sparse: Whether to use sparse retrieval
-        parallel_retrieval: Whether to run retrievals in parallel
-        metadata_filter_post: Apply metadata filters after fusion (fallback)
-    """
+    """Configuration for HybridSearch."""
     dense_top_k: int = 20
     sparse_top_k: int = 20
     fusion_top_k: int = 10
@@ -77,6 +68,12 @@ class HybridSearchConfig:
     enable_sparse: bool = True
     parallel_retrieval: bool = True
     metadata_filter_post: bool = True
+    dense_weight: float = 1.0
+    sparse_weight: float = 1.0
+    rerank_enabled: bool = False
+    rerank_top_k: int = 5
+    mmr_enabled: bool = False
+    mmr_lambda: float = 0.7
 
 
 @dataclass
@@ -144,6 +141,7 @@ class HybridSearch:
         sparse_retriever: Optional[SparseRetriever] = None,
         fusion: Optional[RRFFusion] = None,
         config: Optional[HybridSearchConfig] = None,
+        reranker: Optional[BaseReranker] = None,
     ) -> None:
         """Initialize HybridSearch with components.
         
@@ -164,6 +162,7 @@ class HybridSearch:
         self.dense_retriever = dense_retriever
         self.sparse_retriever = sparse_retriever
         self.fusion = fusion
+        self.reranker = reranker
         
         # Extract config from settings or use provided/default
         self.config = config or self._extract_config(settings)
@@ -198,6 +197,12 @@ class HybridSearch:
             enable_sparse=True,
             parallel_retrieval=True,
             metadata_filter_post=True,
+            dense_weight=getattr(retrieval_config, 'dense_weight', 1.0),
+            sparse_weight=getattr(retrieval_config, 'sparse_weight', 1.0),
+            rerank_enabled=getattr(retrieval_config, 'rerank_enabled', False),
+            rerank_top_k=getattr(retrieval_config, 'rerank_top_k', 5),
+            mmr_enabled=getattr(retrieval_config, 'mmr_enabled', False),
+            mmr_lambda=getattr(retrieval_config, 'mmr_lambda', 0.7),
         )
     
     def search(
@@ -293,7 +298,11 @@ class HybridSearch:
         if merged_filters and self.config.metadata_filter_post:
             fused_results = self._apply_metadata_filters(fused_results, merged_filters)
         
-        # Step 6: Limit to top_k
+        # Step 6: Reranker (if enabled and available)
+        if self.config.rerank_enabled and self.reranker is not None:
+            fused_results = self._apply_reranker(query, fused_results, trace)
+        
+        # Step 7: Limit to top_k
         final_results = fused_results[:effective_top_k]
         
         logger.debug(f"HybridSearch: returning {len(final_results)} results")
@@ -613,12 +622,15 @@ class HybridSearch:
             return []
         
         if len(ranking_lists) == 1:
-            # Only one source, no fusion needed
             return ranking_lists[0][:top_k]
         
+        weights = [self.config.dense_weight, self.config.sparse_weight]
+        weights = weights[:len(ranking_lists)]
+        
         _t0 = time.monotonic()
-        fused = self.fusion.fuse(
+        fused = self.fusion.fuse_with_weights(
             ranking_lists=ranking_lists,
+            weights=weights,
             top_k=top_k,
             trace=trace,
         )
@@ -701,6 +713,49 @@ class HybridSearch:
         
         return filtered
     
+    def _apply_reranker(
+        self,
+        query: str,
+        results: List[RetrievalResult],
+        trace: Optional[Any],
+    ) -> List[RetrievalResult]:
+        """Rerank results using the injected reranker."""
+        if not results:
+            return results
+        try:
+            _t0 = time.monotonic()
+            candidates = [
+                {"chunk_id": r.chunk_id, "text": r.text, "metadata": r.metadata}
+                for r in results
+            ]
+            reranked = self.reranker.rerank(  # type: ignore[union-attr]
+                query=query,
+                candidates=candidates,
+                top_k=self.config.rerank_top_k,
+            )
+            _elapsed = (time.monotonic() - _t0) * 1000.0
+
+            reranked_results = [
+                RetrievalResult(
+                    chunk_id=c["chunk_id"],
+                    score=c.get("rerank_score", 0.0),
+                    text=c.get("text", ""),
+                    metadata=c.get("metadata", {}),
+                )
+                for c in reranked
+            ]
+            if trace is not None:
+                trace.record_stage("reranker", {
+                    "method": type(self.reranker).__name__,
+                    "input_count": len(results),
+                    "output_count": len(reranked_results),
+                }, elapsed_ms=_elapsed)
+            logger.debug("Reranker: %d -> %d results", len(results), len(reranked_results))
+            return reranked_results
+        except Exception as exc:
+            logger.warning("Reranker failed, returning original order: %s", exc)
+            return results
+
     def _matches_filters(
         self,
         metadata: Dict[str, Any],

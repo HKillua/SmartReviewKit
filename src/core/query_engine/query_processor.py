@@ -206,42 +206,37 @@ class QueryProcessor:
         return filters, query_without_filters
     
     def _tokenize(self, text: str) -> List[str]:
-        """Tokenize text into words/terms.
-        
-        Uses a hybrid approach:
-        - Split on whitespace and punctuation for English
-        - Character-based extraction for Chinese (simple approach)
-        
-        Args:
-            text: Text to tokenize
-            
-        Returns:
-            List of tokens
+        """Tokenize text using jieba for Chinese and regex for English.
+
+        Falls back to regex-only if jieba is not installed.
         """
         tokens: List[str] = []
-        
-        # Split on whitespace and common delimiters
-        # Keep alphanumeric, Chinese characters, hyphens, underscores
-        pattern = re.compile(r'[\w\u4e00-\u9fff]+[-_\w\u4e00-\u9fff]*', re.UNICODE)
-        raw_tokens = pattern.findall(text)
-        
-        for token in raw_tokens:
-            # Check if token contains Chinese characters
-            if re.search(r'[\u4e00-\u9fff]', token):
-                # For mixed Chinese-English tokens, split carefully
-                # Extract Chinese sequences and non-Chinese sequences separately
-                parts = re.findall(r'[\u4e00-\u9fff]+|[a-zA-Z0-9_-]+', token)
-                for part in parts:
-                    if re.match(r'[\u4e00-\u9fff]+', part):
-                        # Chinese: add as single token (could do char-level later)
-                        tokens.append(part)
-                    else:
-                        # English/number: add as-is
-                        tokens.append(part)
-            else:
-                # Pure English/number token
-                tokens.append(token)
-        
+
+        try:
+            import jieba
+            _has_jieba = True
+        except ImportError:
+            _has_jieba = False
+
+        if _has_jieba and re.search(r'[\u4e00-\u9fff]', text):
+            for word in jieba.cut(text):
+                word = word.strip()
+                if not word:
+                    continue
+                if re.match(r'^[\u4e00-\u9fff]+$', word):
+                    tokens.append(word)
+                elif re.match(r'^[A-Za-z0-9][\w-]*$', word):
+                    tokens.append(word)
+        else:
+            pattern = re.compile(r'[\w\u4e00-\u9fff]+[-_\w\u4e00-\u9fff]*', re.UNICODE)
+            raw_tokens = pattern.findall(text)
+            for token in raw_tokens:
+                if re.search(r'[\u4e00-\u9fff]', token):
+                    parts = re.findall(r'[\u4e00-\u9fff]+|[a-zA-Z0-9_-]+', token)
+                    tokens.extend(parts)
+                else:
+                    tokens.append(token)
+
         return tokens
     
     def _filter_keywords(self, tokens: List[str]) -> List[str]:

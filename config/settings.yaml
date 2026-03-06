@@ -60,7 +60,20 @@ retrieval:
   dense_top_k: 20
   sparse_top_k: 20
   fusion_top_k: 10
-  rrf_k: 60  # RRF constant
+  rrf_k: 60
+  dense_weight: 1.0
+  sparse_weight: 1.0
+  rerank_enabled: false
+  rerank_top_k: 5
+  mmr_enabled: false
+  mmr_lambda: 0.7
+  query_rewrite_enabled: false
+  hyde_enabled: false
+  multi_query_enabled: false
+  contextual_enrichment: "rule"  # rule / llm / off
+  embedding_cache_size: 4096
+  dedup_enabled: true
+  dedup_threshold: 3
 
 # =============================================================================
 # Rerank Configuration
