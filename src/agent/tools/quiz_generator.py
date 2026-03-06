@@ -22,12 +22,52 @@ QUIZ_PROMPT_TEMPLATE = """请根据以下知识内容，生成 {count} 道{quest
 {weak_points_hint}
 
 要求:
-1. 每道题用 JSON 对象表示，包含字段: question, options (选择题), answer, explanation, concepts
+1. 每道题用 JSON 对象表示，包含字段: question, options (选择题才需要), answer, explanation, concepts
 2. 所有题目放在一个 JSON 数组中
 3. concepts 是该题涉及的知识点列表
 4. 难度应与级别匹配: 1=基础概念, 2=理解应用, 3=综合分析, 4=设计优化, 5=前沿拓展
+5. **explanation 字段必须包含详细的解题思路和知识点分析**，至少 2-3 句话，要说明：
+   - 为什么正确答案是对的
+   - 其他选项（如选择题）为什么是错的
+   - 涉及的核心原理或概念
 
 请输出 JSON 数组（不要有多余文本）："""
+
+
+def _format_questions(questions: list[dict], question_type: str) -> str:
+    """Format quiz questions as Markdown with answers and explanations."""
+    parts: list[str] = []
+    for i, q in enumerate(questions, 1):
+        text = q.get("question", "")
+        parts.append(f"### 第 {i} 题\n\n{text}")
+
+        options = q.get("options")
+        if options:
+            if isinstance(options, dict):
+                for key, val in options.items():
+                    parts.append(f"- **{key}.** {val}")
+            elif isinstance(options, list):
+                for idx, val in enumerate(options):
+                    label = chr(ord("A") + idx)
+                    parts.append(f"- **{label}.** {val}")
+            parts.append("")
+
+        answer = q.get("answer", "")
+        parts.append(f"<details>\n<summary>🔑 查看答案与解析</summary>\n")
+        parts.append(f"**答案**: {answer}\n")
+
+        explanation = q.get("explanation", "")
+        if explanation:
+            parts.append(f"**解析**: {explanation}\n")
+
+        concepts = q.get("concepts", [])
+        if concepts:
+            parts.append(f"**涉及知识点**: {', '.join(concepts)}")
+
+        parts.append("</details>\n")
+
+    header = f"以下是 {len(questions)} 道{question_type}：\n"
+    return header + "\n".join(parts)
 
 
 class QuizGeneratorArgs(BaseModel):
@@ -124,9 +164,10 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
             except json.JSONDecodeError:
                 return ToolResult(success=True, result_for_llm=resp.content or "")
 
+            formatted = _format_questions(questions, args.question_type)
             return ToolResult(
                 success=True,
-                result_for_llm=json.dumps(questions, ensure_ascii=False, indent=2),
+                result_for_llm=formatted,
                 metadata={"question_count": len(questions)},
             )
         except Exception as exc:
