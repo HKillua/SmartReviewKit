@@ -107,6 +107,7 @@ class Message(BaseModel):
 class Conversation(BaseModel):
     id: str
     user_id: str
+    title: str = ""
     messages: list[Message] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)

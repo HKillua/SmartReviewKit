@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>计算机网络课程学习助手</title>
+  <title>SmartReviewKit</title>
   <link rel="stylesheet" href="/static/style.css" />
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github-dark.min.css" />
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" />
@@ -14,53 +14,90 @@
 </head>
 <body>
   <div id="app">
-    <header>
-      <h1>📚 计算机网络课程学习助手</h1>
-      <div class="header-actions">
-        <button id="themeToggle" title="切换主题">🌙</button>
-        <button id="uploadBtn" title="上传课件">📎 上传</button>
-        <button id="helpBtn" title="帮助">❓</button>
+    <!-- Sidebar -->
+    <aside id="sidebar">
+      <div class="sidebar-header">
+        <button id="newChatBtn" class="new-chat-btn">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 1v14M1 8h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          <span>新建对话</span>
+        </button>
       </div>
-    </header>
+      <nav id="conversationList" class="conversation-list"></nav>
+      <div class="sidebar-footer">
+        <button id="uploadBtn" class="sidebar-action-btn">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 1v10M4 5l4-4 4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M1 11v3a1 1 0 001 1h12a1 1 0 001-1v-3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+          <span>上传课件</span>
+        </button>
+        <button id="themeToggle" class="sidebar-action-btn">
+          <svg id="themeIcon" width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="3.5" stroke="currentColor" stroke-width="1.5"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.05 3.05l1.41 1.41M11.54 11.54l1.41 1.41M3.05 12.95l1.41-1.41M11.54 4.46l1.41-1.41" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+          <span id="themeLabel">浅色模式</span>
+        </button>
+      </div>
+    </aside>
 
-    <main>
+    <!-- Sidebar overlay for mobile -->
+    <div id="sidebarOverlay" class="sidebar-overlay"></div>
+
+    <!-- Main Chat Panel -->
+    <div id="mainPanel" class="main-panel">
+      <header id="topBar">
+        <button id="menuBtn" class="menu-btn">
+          <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M3 5h14M3 10h14M3 15h14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        </button>
+        <h1 id="chatTitle">SmartReviewKit</h1>
+        <div class="top-bar-spacer"></div>
+      </header>
+
       <div id="chatContainer">
         <div id="messages">
-          <div class="message assistant">
-            <div class="message-content">
-              <p>你好！我是计算机网络课程学习助手。我可以帮你：</p>
-              <ul>
-                <li><strong>知识问答</strong> — 回答计算机网络相关问题（TCP/IP、路由、应用层协议等）</li>
-                <li><strong>考点复习</strong> — 按章节生成结构化考点总结</li>
-                <li><strong>习题练习</strong> — 出题、答题、评判</li>
-                <li><strong>课件管理</strong> — 上传 PDF/PPT 扩展知识库</li>
-              </ul>
-              <p>试试输入 <code>/help</code> 查看所有技能，或直接提问吧！</p>
+          <!-- Welcome message -->
+          <div id="welcomeScreen" class="welcome-screen">
+            <div class="welcome-logo">
+              <svg width="40" height="40" viewBox="0 0 40 40" fill="none"><rect width="40" height="40" rx="8" fill="var(--primary)"/><path d="M12 14h16M12 20h10M12 26h14" stroke="white" stroke-width="2" stroke-linecap="round"/></svg>
+            </div>
+            <h2>计算机网络课程学习助手</h2>
+            <p class="welcome-subtitle">基于 RAG + Memory 的智能复习助手</p>
+            <div class="welcome-suggestions">
+              <button class="suggestion-btn" data-msg="帮我总结 TCP 三次握手的考点">TCP 三次握手考点</button>
+              <button class="suggestion-btn" data-msg="出几道关于 IP 协议的选择题">IP 协议习题练习</button>
+              <button class="suggestion-btn" data-msg="帮我复习应用层协议">复习应用层协议</button>
+              <button class="suggestion-btn" data-msg="/help">查看所有技能</button>
             </div>
           </div>
         </div>
       </div>
 
       <div id="inputArea">
-        <textarea id="messageInput" placeholder="输入你的问题...（Shift+Enter 换行）" rows="1"></textarea>
-        <button id="sendBtn">发送</button>
+        <div class="input-wrapper">
+          <textarea id="messageInput" placeholder="输入你的问题..." rows="1"></textarea>
+          <button id="sendBtn" disabled>
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2 8h12M9 3l5 5-5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        </div>
+        <p class="input-hint">Enter 发送，Shift+Enter 换行</p>
       </div>
-    </main>
+    </div>
 
     <!-- Upload Modal -->
     <div id="uploadModal" class="modal hidden">
+      <div class="modal-backdrop"></div>
       <div class="modal-content">
-        <h2>上传课件</h2>
+        <div class="modal-header">
+          <h2>上传课件</h2>
+          <button id="closeModal" class="modal-close">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          </button>
+        </div>
         <div id="dropZone">
+          <svg width="40" height="40" viewBox="0 0 40 40" fill="none"><path d="M20 5v20M12 13l8-8 8 8" stroke="var(--text-secondary)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 25v8a2 2 0 002 2h26a2 2 0 002-2v-8" stroke="var(--text-secondary)" stroke-width="2" stroke-linecap="round"/></svg>
           <p>拖拽文件到此处，或点击选择</p>
-          <p class="hint">支持 .pdf 和 .pptx 格式，最大 50MB</p>
-          <input type="file" id="fileInput" accept=".pdf,.pptx" hidden />
+          <p class="hint">支持 .pdf / .pptx / .docx，最大 50MB</p>
+          <input type="file" id="fileInput" accept=".pdf,.pptx,.docx" hidden />
         </div>
         <div id="uploadProgress" class="hidden">
           <div class="progress-bar"><div class="progress-fill"></div></div>
           <p id="uploadStatus"></p>
         </div>
-        <button id="closeModal">关闭</button>
       </div>
     </div>
   </div>

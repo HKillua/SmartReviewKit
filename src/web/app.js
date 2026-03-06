@@ -1,38 +1,57 @@
-/** Database Course Agent — Frontend Application */
+/** SmartReviewKit — ChatGPT-style Frontend */
 
-const messagesEl = document.getElementById('messages');
-const inputEl = document.getElementById('messageInput');
-const sendBtn = document.getElementById('sendBtn');
-const themeToggle = document.getElementById('themeToggle');
-const uploadBtn = document.getElementById('uploadBtn');
-const helpBtn = document.getElementById('helpBtn');
-const uploadModal = document.getElementById('uploadModal');
-const closeModal = document.getElementById('closeModal');
-const dropZone = document.getElementById('dropZone');
-const fileInput = document.getElementById('fileInput');
-const uploadProgress = document.getElementById('uploadProgress');
-const uploadStatus = document.getElementById('uploadStatus');
-const progressFill = document.querySelector('.progress-fill');
+const $ = (sel) => document.querySelector(sel);
+const $$ = (sel) => document.querySelectorAll(sel);
+
+const messagesEl = $('#messages');
+const inputEl = $('#messageInput');
+const sendBtn = $('#sendBtn');
+const themeToggle = $('#themeToggle');
+const themeLabel = $('#themeLabel');
+const uploadBtn = $('#uploadBtn');
+const uploadModal = $('#uploadModal');
+const closeModal = $('#closeModal');
+const dropZone = $('#dropZone');
+const fileInput = $('#fileInput');
+const uploadProgress = $('#uploadProgress');
+const uploadStatus = $('#uploadStatus');
+const progressFill = $('.progress-fill');
+const sidebar = $('#sidebar');
+const sidebarOverlay = $('#sidebarOverlay');
+const menuBtn = $('#menuBtn');
+const newChatBtn = $('#newChatBtn');
+const convListEl = $('#conversationList');
+const chatTitle = $('#chatTitle');
+const welcomeScreen = $('#welcomeScreen');
 
 let conversationId = null;
 let isStreaming = false;
+const USER_ID = 'default_user';
 
-// --- Theme ---
+// ================================================================
+// THEME
+// ================================================================
+
 function initTheme() {
   const saved = localStorage.getItem('theme') || 'light';
-  document.documentElement.setAttribute('data-theme', saved);
-  themeToggle.textContent = saved === 'dark' ? '☀️' : '🌙';
+  applyTheme(saved);
+}
+
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  themeLabel.textContent = theme === 'dark' ? '浅色模式' : '深色模式';
+  localStorage.setItem('theme', theme);
 }
 
 themeToggle.addEventListener('click', () => {
   const current = document.documentElement.getAttribute('data-theme');
-  const next = current === 'dark' ? 'light' : 'dark';
-  document.documentElement.setAttribute('data-theme', next);
-  localStorage.setItem('theme', next);
-  themeToggle.textContent = next === 'dark' ? '☀️' : '🌙';
+  applyTheme(current === 'dark' ? 'light' : 'dark');
 });
 
-// --- Markdown rendering ---
+// ================================================================
+// MARKDOWN + KATEX
+// ================================================================
+
 marked.setOptions({
   highlight: (code, lang) => {
     if (lang && hljs.getLanguage(lang)) {
@@ -47,12 +66,10 @@ function renderMarkdown(text) {
   return marked.parse(text);
 }
 
-function renderMathInElement(el) {
-  if (typeof renderMathInElement_ === 'undefined' && typeof window.renderMathInElement === 'undefined') return;
-  const fn = window.renderMathInElement;
-  if (!fn) return;
+function renderMath(el) {
+  if (!window.renderMathInElement) return;
   try {
-    fn(el, {
+    window.renderMathInElement(el, {
       delimiters: [
         { left: '$$', right: '$$', display: true },
         { left: '$', right: '$', display: false },
@@ -61,35 +78,7 @@ function renderMathInElement(el) {
       ],
       throwOnError: false,
     });
-  } catch (e) { /* ignore KaTeX errors */ }
-}
-
-// --- Messages ---
-function addMessage(role, content) {
-  const div = document.createElement('div');
-  div.className = `message ${role}`;
-  const inner = document.createElement('div');
-  inner.className = 'message-content';
-  inner.innerHTML = role === 'user' ? `<p>${escapeHtml(content)}</p>` : renderMarkdown(content);
-  if (role !== 'user') renderMathInElement(inner);
-  div.appendChild(inner);
-  messagesEl.appendChild(div);
-  scrollToBottom();
-  return inner;
-}
-
-function addToolIndicator(toolName) {
-  const div = document.createElement('div');
-  div.className = 'message assistant';
-  div.innerHTML = `<div class="tool-indicator"><span class="spinner"></span> 正在调用工具: ${escapeHtml(toolName)}</div>`;
-  messagesEl.appendChild(div);
-  scrollToBottom();
-  return div;
-}
-
-function scrollToBottom() {
-  const container = document.getElementById('chatContainer');
-  container.scrollTop = container.scrollHeight;
+  } catch (_) {}
 }
 
 function escapeHtml(text) {
@@ -98,20 +87,101 @@ function escapeHtml(text) {
   return d.innerHTML;
 }
 
-// --- Chat ---
-async function sendMessage() {
-  const message = inputEl.value.trim();
+// ================================================================
+// MESSAGES
+// ================================================================
+
+function hideWelcome() {
+  if (welcomeScreen) welcomeScreen.style.display = 'none';
+}
+
+function showWelcome() {
+  if (welcomeScreen) welcomeScreen.style.display = '';
+}
+
+function addMessage(role, content) {
+  hideWelcome();
+  const div = document.createElement('div');
+  div.className = 'message';
+
+  const avatarClass = role === 'user' ? 'user' : 'ai';
+  const avatarLetter = role === 'user' ? 'U' : 'AI';
+
+  const avatarHtml = `<div class="msg-avatar ${avatarClass}">${avatarLetter}</div>`;
+  const bodyHtml = role === 'user'
+    ? `<div class="msg-body"><p>${escapeHtml(content)}</p></div>`
+    : `<div class="msg-body">${renderMarkdown(content)}</div>`;
+
+  div.innerHTML = avatarHtml + bodyHtml;
+
+  const bodyEl = div.querySelector('.msg-body');
+  if (role !== 'user') renderMath(bodyEl);
+
+  messagesEl.appendChild(div);
+  scrollToBottom();
+  return bodyEl;
+}
+
+function addThinkingIndicator() {
+  hideWelcome();
+  const div = document.createElement('div');
+  div.className = 'message';
+  div.id = 'thinkingMsg';
+  div.innerHTML = `
+    <div class="msg-avatar ai">AI</div>
+    <div class="msg-body">
+      <div class="thinking-dots"><span></span><span></span><span></span></div>
+    </div>`;
+  messagesEl.appendChild(div);
+  scrollToBottom();
+  return div;
+}
+
+function removeThinking() {
+  const el = $('#thinkingMsg');
+  if (el) el.remove();
+}
+
+function addToolIndicator(toolName) {
+  hideWelcome();
+  const div = document.createElement('div');
+  div.className = 'message';
+  div.innerHTML = `
+    <div class="msg-avatar ai">AI</div>
+    <div class="msg-body">
+      <div class="tool-indicator"><span class="spinner"></span> 正在调用: ${escapeHtml(toolName)}</div>
+    </div>`;
+  messagesEl.appendChild(div);
+  scrollToBottom();
+  return div;
+}
+
+function scrollToBottom() {
+  const container = $('#chatContainer');
+  requestAnimationFrame(() => {
+    container.scrollTop = container.scrollHeight;
+  });
+}
+
+// ================================================================
+// CHAT
+// ================================================================
+
+async function sendMessage(overrideMsg) {
+  const message = overrideMsg || inputEl.value.trim();
   if (!message || isStreaming) return;
 
   addMessage('user', message);
   inputEl.value = '';
   inputEl.style.height = 'auto';
+  updateSendBtn();
   isStreaming = true;
   sendBtn.disabled = true;
 
   let assistantEl = null;
   let fullContent = '';
   let currentToolEl = null;
+  const thinkingEl = addThinkingIndicator();
 
   try {
     const resp = await fetch('/api/chat', {
@@ -120,7 +190,7 @@ async function sendMessage() {
       body: JSON.stringify({
         message,
         conversation_id: conversationId,
-        user_id: 'default_user',
+        user_id: USER_ID,
       }),
     });
 
@@ -145,43 +215,62 @@ async function sendMessage() {
           const event = JSON.parse(jsonStr);
           switch (event.type) {
             case 'text_delta':
+              removeThinking();
               if (currentToolEl) { currentToolEl.remove(); currentToolEl = null; }
               if (!assistantEl) { assistantEl = addMessage('assistant', ''); fullContent = ''; }
               fullContent += event.content || '';
               assistantEl.innerHTML = renderMarkdown(fullContent);
-              renderMathInElement(assistantEl);
+              renderMath(assistantEl);
               scrollToBottom();
               break;
             case 'tool_start':
+              removeThinking();
               currentToolEl = addToolIndicator(event.tool_name || 'unknown');
               break;
             case 'tool_result':
               if (currentToolEl) { currentToolEl.remove(); currentToolEl = null; }
               break;
             case 'done':
+              removeThinking();
               if (event.metadata?.conversation_id) {
                 conversationId = event.metadata.conversation_id;
               }
+              if (event.metadata?.title) {
+                chatTitle.textContent = event.metadata.title;
+              }
+              loadConversationList();
               break;
             case 'error':
+              removeThinking();
               if (!assistantEl) { assistantEl = addMessage('assistant', ''); fullContent = ''; }
-              fullContent += `\n\n⚠️ ${event.content || '发生错误'}`;
+              fullContent += `\n\n**Error:** ${event.content || '发生错误'}`;
               assistantEl.innerHTML = renderMarkdown(fullContent);
               break;
           }
-        } catch (e) { /* skip malformed SSE */ }
+        } catch (_) {}
       }
     }
   } catch (err) {
-    addMessage('assistant', `⚠️ 网络错误: ${err.message}`);
+    removeThinking();
+    addMessage('assistant', `**网络错误:** ${err.message}`);
   } finally {
     isStreaming = false;
     sendBtn.disabled = false;
+    updateSendBtn();
     inputEl.focus();
   }
 }
 
-sendBtn.addEventListener('click', sendMessage);
+// ================================================================
+// INPUT HANDLING
+// ================================================================
+
+function updateSendBtn() {
+  sendBtn.disabled = !inputEl.value.trim() || isStreaming;
+}
+
+sendBtn.addEventListener('click', () => sendMessage());
+
 inputEl.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
@@ -191,19 +280,143 @@ inputEl.addEventListener('keydown', (e) => {
 
 inputEl.addEventListener('input', () => {
   inputEl.style.height = 'auto';
-  inputEl.style.height = Math.min(inputEl.scrollHeight, 150) + 'px';
+  inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + 'px';
+  updateSendBtn();
 });
 
-// --- Help ---
-helpBtn.addEventListener('click', () => {
-  inputEl.value = '/help';
-  sendMessage();
+// Suggestion buttons
+document.addEventListener('click', (e) => {
+  if (e.target.classList.contains('suggestion-btn')) {
+    const msg = e.target.dataset.msg;
+    if (msg) sendMessage(msg);
+  }
 });
 
-// --- Upload ---
+// ================================================================
+// SIDEBAR — CONVERSATION LIST
+// ================================================================
+
+async function loadConversationList() {
+  try {
+    const resp = await fetch(`/api/conversations?user_id=${USER_ID}&limit=50`);
+    if (!resp.ok) return;
+    const convs = await resp.json();
+    renderConversationList(convs);
+  } catch (_) {}
+}
+
+function renderConversationList(convs) {
+  convListEl.innerHTML = '';
+  for (const c of convs) {
+    const item = document.createElement('div');
+    item.className = 'conv-item' + (c.id === conversationId ? ' active' : '');
+    item.innerHTML = `
+      <svg class="conv-item-icon" width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2 3h12v8a1 1 0 01-1 1H5l-3 3V3z" stroke="currentColor" stroke-width="1.2"/></svg>
+      <span class="conv-item-title">${escapeHtml(c.title || '新对话')}</span>
+      <button class="conv-item-delete" data-id="${c.id}" title="删除">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      </button>`;
+
+    item.addEventListener('click', (e) => {
+      if (e.target.closest('.conv-item-delete')) return;
+      switchConversation(c.id);
+    });
+
+    const deleteBtn = item.querySelector('.conv-item-delete');
+    deleteBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      deleteConversation(c.id);
+    });
+
+    convListEl.appendChild(item);
+  }
+}
+
+async function switchConversation(id) {
+  if (id === conversationId) return;
+  conversationId = id;
+
+  try {
+    const resp = await fetch(`/api/conversations/${id}?user_id=${USER_ID}`);
+    if (!resp.ok) return;
+    const conv = await resp.json();
+
+    clearMessages();
+    chatTitle.textContent = conv.title || 'SmartReviewKit';
+
+    for (const msg of conv.messages) {
+      if (msg.role === 'user') {
+        addMessage('user', msg.content || '');
+      } else if (msg.role === 'assistant' && msg.content) {
+        addMessage('assistant', msg.content);
+      }
+    }
+
+    loadConversationList();
+    closeSidebar();
+  } catch (_) {}
+}
+
+async function deleteConversation(id) {
+  try {
+    await fetch(`/api/conversations/${id}?user_id=${USER_ID}`, { method: 'DELETE' });
+    if (id === conversationId) {
+      startNewChat();
+    }
+    loadConversationList();
+  } catch (_) {}
+}
+
+// ================================================================
+// NEW CHAT
+// ================================================================
+
+function startNewChat() {
+  conversationId = null;
+  clearMessages();
+  showWelcome();
+  chatTitle.textContent = 'SmartReviewKit';
+  loadConversationList();
+  closeSidebar();
+  inputEl.focus();
+}
+
+function clearMessages() {
+  messagesEl.innerHTML = '';
+  if (welcomeScreen) {
+    messagesEl.appendChild(welcomeScreen);
+  }
+}
+
+newChatBtn.addEventListener('click', startNewChat);
+
+// ================================================================
+// SIDEBAR TOGGLE (mobile)
+// ================================================================
+
+function openSidebar() {
+  sidebar.classList.add('open');
+  sidebarOverlay.classList.add('active');
+}
+
+function closeSidebar() {
+  sidebar.classList.remove('open');
+  sidebarOverlay.classList.remove('active');
+}
+
+menuBtn.addEventListener('click', () => {
+  sidebar.classList.contains('open') ? closeSidebar() : openSidebar();
+});
+
+sidebarOverlay.addEventListener('click', closeSidebar);
+
+// ================================================================
+// FILE UPLOAD
+// ================================================================
+
 uploadBtn.addEventListener('click', () => uploadModal.classList.remove('hidden'));
 closeModal.addEventListener('click', () => uploadModal.classList.add('hidden'));
-uploadModal.addEventListener('click', (e) => { if (e.target === uploadModal) uploadModal.classList.add('hidden'); });
+$('.modal-backdrop')?.addEventListener('click', () => uploadModal.classList.add('hidden'));
 
 dropZone.addEventListener('click', () => fileInput.click());
 dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('drag-over'); });
@@ -225,22 +438,28 @@ async function uploadFile(file) {
 
   try {
     progressFill.style.width = '60%';
-    const resp = await fetch('/api/upload?user_id=default_user', { method: 'POST', body: formData });
+    const resp = await fetch(`/api/upload?user_id=${USER_ID}`, { method: 'POST', body: formData });
     const result = await resp.json();
     progressFill.style.width = '100%';
 
     if (result.success) {
-      uploadStatus.textContent = `✅ ${file.name} 上传成功！分块数: ${result.chunk_count}`;
-      addMessage('assistant', `📎 课件 **${file.name}** 已成功导入知识库（${result.chunk_count} 个分块）。`);
+      uploadStatus.textContent = `${file.name} 上传成功 (${result.chunk_count} 个分块)`;
+      addMessage('assistant', `课件 **${file.name}** 已成功导入知识库（${result.chunk_count} 个分块）。`);
+      setTimeout(() => uploadModal.classList.add('hidden'), 1500);
     } else {
-      uploadStatus.textContent = `❌ 上传失败: ${result.error}`;
+      uploadStatus.textContent = `上传失败: ${result.error}`;
     }
   } catch (err) {
-    uploadStatus.textContent = `❌ 上传错误: ${err.message}`;
+    uploadStatus.textContent = `上传错误: ${err.message}`;
     progressFill.style.width = '0%';
   }
 }
 
-// --- Init ---
+// ================================================================
+// INIT
+// ================================================================
+
 initTheme();
+loadConversationList();
+updateSendBtn();
 inputEl.focus();

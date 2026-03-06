@@ -122,6 +122,12 @@ class Agent:
         # --- Append user message ---
         conversation.messages.append(Message(role="user", content=effective_message))
 
+        # --- Auto-generate title from first user message ---
+        if not conversation.title:
+            conversation.title = effective_message[:30].strip()
+            if len(effective_message) > 30:
+                conversation.title += "..."
+
         # --- Build system prompt ---
         tool_schemas = self.tools.get_all_schemas()
 
@@ -175,7 +181,10 @@ class Agent:
             logger.exception("Agent tool loop error")
             yield StreamEvent(type=StreamEventType.ERROR, content=str(exc))
 
-        yield StreamEvent(type=StreamEventType.DONE, metadata={"conversation_id": conversation.id})
+        yield StreamEvent(
+            type=StreamEventType.DONE,
+            metadata={"conversation_id": conversation.id, "title": conversation.title},
+        )
 
         # --- Save conversation ---
         await self.conversations.update(conversation)

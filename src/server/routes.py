@@ -47,6 +47,23 @@ async def chat_endpoint(request: ChatRequest):
     return EventSourceResponse(event_generator())
 
 
+@router.get("/api/conversations")
+async def list_conversations(user_id: str = "default_user", limit: int = 50):
+    """List conversations for a user (for sidebar)."""
+    if _agent is None:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    convs = await _agent.conversations.list_conversations(user_id, limit=limit)
+    return [
+        {
+            "id": c.id,
+            "title": c.title or c.messages[0].content[:30] + "..." if c.messages else "新对话",
+            "updated_at": c.updated_at.isoformat(),
+            "message_count": len(c.messages),
+        }
+        for c in convs
+    ]
+
+
 @router.get("/api/conversations/{conversation_id}")
 async def get_conversation(conversation_id: str, user_id: str = "default_user"):
     """Retrieve conversation history."""
@@ -56,6 +73,17 @@ async def get_conversation(conversation_id: str, user_id: str = "default_user"):
     if conv is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
     return conv.model_dump()
+
+
+@router.delete("/api/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str, user_id: str = "default_user"):
+    """Delete a conversation."""
+    if _agent is None:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    deleted = await _agent.conversations.delete(conversation_id, user_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return {"success": True}
 
 
 @router.post("/api/upload", response_model=UploadResponse)

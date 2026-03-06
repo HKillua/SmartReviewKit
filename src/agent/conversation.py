@@ -37,6 +37,10 @@ class ConversationStore(ABC):
     async def list_conversations(self, user_id: str, limit: int = 20) -> list[Conversation]:
         ...
 
+    @abstractmethod
+    async def delete(self, conversation_id: str, user_id: str) -> bool:
+        ...
+
 
 class FileConversationStore(ConversationStore):
     """JSON-file-based conversation store with per-user directory isolation."""
@@ -110,6 +114,13 @@ class FileConversationStore(ConversationStore):
                 continue
         return convs
 
+    async def delete(self, conversation_id: str, user_id: str) -> bool:
+        path = self._conv_path(user_id, conversation_id)
+        if path.exists():
+            path.unlink()
+            return True
+        return False
+
 
 class MemoryConversationStore(ConversationStore):
     """In-memory store for testing."""
@@ -144,3 +155,10 @@ class MemoryConversationStore(ConversationStore):
             key=lambda c: c.updated_at,
             reverse=True,
         )[:limit]
+
+    async def delete(self, conversation_id: str, user_id: str) -> bool:
+        conv = self._store.get(conversation_id)
+        if conv and conv.user_id == user_id:
+            del self._store[conversation_id]
+            return True
+        return False
