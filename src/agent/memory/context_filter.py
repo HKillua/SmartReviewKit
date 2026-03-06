@@ -17,6 +17,7 @@ from typing import Optional
 
 from src.agent.memory.base import ConversationFilter
 from src.agent.types import Message
+from src.agent.utils.ttl_cache import TTLCache
 
 logger = logging.getLogger(__name__)
 
@@ -41,12 +42,18 @@ class ContextEngineeringFilter(ConversationFilter):
     When ``compaction_threshold`` is set and an LLM service is provided,
     messages exceeding the threshold are summarised into a single
     ``[COMPACTED_SUMMARY]`` message (Level 3, inspired by CoPaw Compaction).
+
+    Level 4 applies a token budget — messages exceeding ``max_tokens`` are
+    trimmed from the oldest end.
     """
+
+    _TOKEN_RATIO = 1.5  # rough chars-per-token for mixed CJK/English text
 
     def __init__(
         self,
         *,
         max_messages: int = 40,
+        max_tokens: int = 0,
         tool_result_max_chars: int = 2000,
         offload_dir: str = "data/context_offload",
         llm_service: object | None = None,
@@ -54,37 +61,58 @@ class ContextEngineeringFilter(ConversationFilter):
         compaction_keep_recent: int = 10,
     ) -> None:
         self._max_messages = max_messages
+        self._max_tokens = max_tokens
         self._tool_max = tool_result_max_chars
         self._offload_dir = Path(offload_dir)
         self._offload_dir.mkdir(parents=True, exist_ok=True)
         self._llm = llm_service
         self._compact_threshold = compaction_threshold
         self._compact_keep = compaction_keep_recent
-        self._cached_compactions: dict[str, str] = {}
+        self._cached_compactions: TTLCache[str] = TTLCache(max_size=64, ttl_seconds=3600.0)
+
+    def _estimate_tokens(self, text: str) -> int:
+        """Estimate token count using character-based heuristic."""
+        if not text:
+            return 0
+        return int(len(text) / self._TOKEN_RATIO) + 1
+
+    def _apply_token_budget(self, messages: list[Message]) -> list[Message]:
+        """Level 4: trim oldest messages until total tokens fit within budget."""
+        if self._max_tokens <= 0:
+            return messages
+        total = sum(self._estimate_tokens(m.content or "") for m in messages)
+        if total <= self._max_tokens:
+            return messages
+        trimmed = list(messages)
+        while len(trimmed) > 1 and total > self._max_tokens:
+            removed = trimmed.pop(0)
+            total -= self._estimate_tokens(removed.content or "")
+        return trimmed
 
     def filter_messages(self, messages: list[Message]) -> list[Message]:
+        """Sync entry point. Prefer ``filter_messages_async`` in async contexts."""
         msgs = list(messages)
 
         # Level 2: offload large tool results
         msgs = self._offload_tool_results(msgs)
 
-        # Level 3: LLM compaction (sync wrapper — Agent can also call filter_messages_async)
+        # Level 3: LLM compaction (only when no running event loop)
         if self._llm and len(msgs) > self._compact_threshold:
             try:
-                loop = asyncio.get_running_loop()
+                asyncio.get_running_loop()
+                logger.debug(
+                    "filter_messages called inside async context — "
+                    "compaction skipped (use filter_messages_async instead)"
+                )
             except RuntimeError:
-                loop = None
-
-            if loop and loop.is_running():
-                # Inside an async context — schedule but can't await here,
-                # fall through to Level 1 sliding window
-                pass
-            else:
                 msgs = asyncio.run(self._compact_messages(msgs))
 
         # Level 1: sliding window (fallback if compaction didn't run)
         if len(msgs) > self._max_messages:
             msgs = msgs[-self._max_messages:]
+
+        # Level 4: token budget enforcement
+        msgs = self._apply_token_budget(msgs)
 
         return msgs
 
@@ -103,6 +131,9 @@ class ContextEngineeringFilter(ConversationFilter):
         if len(msgs) > self._max_messages:
             msgs = msgs[-self._max_messages:]
 
+        # Level 4: token budget enforcement
+        msgs = self._apply_token_budget(msgs)
+
         return msgs
 
     async def _compact_messages(self, messages: list[Message]) -> list[Message]:
@@ -117,13 +148,14 @@ class ContextEngineeringFilter(ConversationFilter):
             "".join(m.content or "" for m in old_msgs).encode()
         ).hexdigest()[:16]
 
-        if cache_key in self._cached_compactions:
-            summary_text = self._cached_compactions[cache_key]
+        cached = self._cached_compactions.get_value(cache_key)
+        if cached is not None:
+            summary_text = cached
         else:
             summary_text = await self._summarize_via_llm(old_msgs)
             if not summary_text:
                 return messages  # LLM failed → fall through to Level 1
-            self._cached_compactions[cache_key] = summary_text
+            self._cached_compactions.put(cache_key, summary_text)
 
         compacted_msg = Message(
             role="system",

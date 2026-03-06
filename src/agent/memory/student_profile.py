@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import aiosqlite
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
@@ -35,29 +35,33 @@ class StudentProfile(BaseModel):
     notes: str = ""
 
 
+_CREATE_SQL = """
+    CREATE TABLE IF NOT EXISTS student_profiles (
+        user_id TEXT PRIMARY KEY,
+        data TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+"""
+
+
 class StudentProfileMemory:
-    """SQLite-backed student profile store."""
+    """SQLite-backed student profile store (async via aiosqlite)."""
 
     def __init__(self, db_dir: str = "data/memory") -> None:
         Path(db_dir).mkdir(parents=True, exist_ok=True)
         self._db_path = str(Path(db_dir) / "profiles.db")
-        self._init_db()
+        self._init_db_sync()
 
-    def _init_db(self) -> None:
+    def _init_db_sync(self) -> None:
         with sqlite3.connect(self._db_path) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS student_profiles (
-                    user_id TEXT PRIMARY KEY,
-                    data TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-            """)
+            conn.execute(_CREATE_SQL)
 
     async def get_profile(self, user_id: str) -> StudentProfile:
-        with sqlite3.connect(self._db_path) as conn:
-            row = conn.execute(
+        async with aiosqlite.connect(self._db_path) as db:
+            async with db.execute(
                 "SELECT data FROM student_profiles WHERE user_id = ?", (user_id,)
-            ).fetchone()
+            ) as cursor:
+                row = await cursor.fetchone()
         if row:
             return StudentProfile.model_validate_json(row[0])
         return StudentProfile(user_id=user_id)
@@ -69,9 +73,13 @@ class StudentProfileMemory:
                 setattr(profile, key, value)
         profile.last_active = datetime.now()
 
-        with sqlite3.connect(self._db_path) as conn:
-            conn.execute(
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
                 """INSERT OR REPLACE INTO student_profiles (user_id, data, updated_at)
                    VALUES (?, ?, ?)""",
                 (user_id, profile.model_dump_json(), datetime.now().isoformat()),
             )
+            await db.commit()
+
+    async def close(self) -> None:
+        pass

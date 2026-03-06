@@ -42,12 +42,17 @@ class TokenBucket:
 class RateLimitHook(LifecycleHook):
     """Per-user rate limiting using token-bucket algorithm."""
 
+    _MAX_BUCKETS = 1024
+
     def __init__(self, requests_per_minute: int = 20) -> None:
         self._rpm = requests_per_minute
         self._buckets: dict[str, TokenBucket] = {}
 
     def _get_bucket(self, user_id: str) -> TokenBucket:
         if user_id not in self._buckets:
+            if len(self._buckets) >= self._MAX_BUCKETS:
+                oldest_key = next(iter(self._buckets))
+                del self._buckets[oldest_key]
             self._buckets[user_id] = TokenBucket(
                 rate=self._rpm / 60.0,
                 capacity=self._rpm,

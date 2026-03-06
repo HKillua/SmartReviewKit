@@ -2594,3 +2594,49 @@ retrieval:
   min_score: 0.15            # 最低相关度阈值
   post_dedup_enabled: true   # 检索后语义去重
 ```
+
+---
+
+## Phase O: Agent 代码质量深度修复（面试加固） ✅
+
+> 通过深度代码审查发现 3 个 Bug、6 个死代码/接线问题、5 个安全漏洞、5 个架构缺陷，全部修复。
+
+### O-Phase1: Bug 修复 ✅
+
+| 编号 | 修复内容 | 文件 | 状态 |
+|------|---------|------|------|
+| O1 | AuditHook after_tool 取 key 修复 | `hooks/audit.py`, `hooks/lifecycle.py`, `agent.py` | ✅ |
+| O2 | FileConversationStore fd 清理修复 | `conversation.py` | ✅ |
+| O3 | assistant 消息 content 保留 | `agent.py` | ✅ |
+| O4 | 动态 import 反模式清理 | `agent.py`, `app.py` | ✅ |
+| O5 | Message.role Literal 约束 | `types.py` | ✅ |
+
+### O-Phase2: 接线补全 ✅
+
+| 编号 | 修复内容 | 文件 | 状态 |
+|------|---------|------|------|
+| O6 | RateLimitHook 接入 Agent | `app.py`, `config.py` | ✅ |
+| O7 | RetryWithBackoffMiddleware 实现 | `hooks/retry_middleware.py` (新建), `app.py` | ✅ |
+| O8 | max_context_tokens Level 4 裁剪 | `context_filter.py`, `app.py` | ✅ |
+
+### O-Phase3: 安全加固 ✅
+
+| 编号 | 修复内容 | 文件 | 状态 |
+|------|---------|------|------|
+| O9 | 路径穿越防护 (3 处) | `document_ingest.py`, `routes.py`, `registry.py` | ✅ |
+| O10 | SSE 断连检测 | `routes.py` | ✅ |
+| O11 | Prompt Injection 防护 | `utils/sanitizer.py` (新建), `quiz_*.py`, `review_summary.py` | ✅ |
+
+### O-Phase4: 架构改进 ✅
+
+| 编号 | 修复内容 | 文件 | 状态 |
+|------|---------|------|------|
+| O12 | aiosqlite 迁移 (5 个 store) | `student_profile.py`, `error_memory.py`, `knowledge_map.py`, `session_memory.py`, `feedback_store.py` | ✅ |
+| O13 | Graceful Shutdown Handler | `app.py` | ✅ |
+| O14 | Async Compaction 修复 | `context_filter.py` | ✅ |
+| O15 | Conversation Schema 版本化 | `types.py`, `conversation.py` | ✅ |
+| O16 | TTL/LRU 缓存淘汰 | `utils/ttl_cache.py` (新建), `context_filter.py`, `rate_limit.py` | ✅ |
+
+### 测试: 34 项全部通过 ✅
+
+详细复习文档: `docs/AGENT_HARDENING.md`

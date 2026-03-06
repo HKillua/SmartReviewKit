@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from src.agent.tools.base import Tool
 from src.agent.types import ToolContext, ToolResult
+from src.agent.utils.sanitizer import sanitize_user_input
 
 logger = logging.getLogger(__name__)
 
@@ -79,10 +80,10 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
             from src.agent.types import LlmMessage, LlmRequest
 
             prompt = EVAL_PROMPT_TEMPLATE.format(
-                question_type=args.question_type,
-                question=args.question,
-                correct_answer=args.correct_answer,
-                user_answer=args.user_answer,
+                question_type=sanitize_user_input(args.question_type, max_length=50),
+                question=sanitize_user_input(args.question),
+                correct_answer=sanitize_user_input(args.correct_answer),
+                user_answer=sanitize_user_input(args.user_answer),
             )
 
             req = LlmRequest(

@@ -65,13 +65,17 @@ class AuditHook(LifecycleHook):
     async def before_tool(self, tool_name: str, context: ToolContext) -> None:
         self._start_times[context.request_id] = time.monotonic()
 
-    async def after_tool(self, tool_name: str, result: ToolResult) -> Optional[ToolResult]:
-        start = self._start_times.pop("", time.monotonic())
+    async def after_tool(
+        self, tool_name: str, result: ToolResult, context: ToolContext | None = None,
+    ) -> Optional[ToolResult]:
+        key = context.request_id if context else ""
+        start = self._start_times.pop(key, time.monotonic())
         duration = (time.monotonic() - start) * 1000
 
         event = AuditEvent(
             action="tool_call",
             tool_name=tool_name,
+            user_id=context.user_id if context else "",
             result_summary=result.result_for_llm[:200] if result.success else (result.error or "")[:200],
             duration_ms=round(duration, 2),
             metadata={"success": result.success},

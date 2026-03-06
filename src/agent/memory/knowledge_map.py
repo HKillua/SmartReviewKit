@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import math
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import aiosqlite
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
@@ -25,31 +25,35 @@ class KnowledgeNode(BaseModel):
     review_interval_days: float = 1.0
 
 
+_CREATE_SQL = """
+    CREATE TABLE IF NOT EXISTS knowledge_nodes (
+        user_id TEXT NOT NULL,
+        concept TEXT NOT NULL,
+        data TEXT NOT NULL,
+        PRIMARY KEY (user_id, concept)
+    )
+"""
+
+
 class KnowledgeMapMemory:
-    """SQLite-backed knowledge map with Ebbinghaus forgetting curve."""
+    """SQLite-backed knowledge map with Ebbinghaus forgetting curve (async via aiosqlite)."""
 
     def __init__(self, db_dir: str = "data/memory") -> None:
         Path(db_dir).mkdir(parents=True, exist_ok=True)
         self._db_path = str(Path(db_dir) / "knowledge_map.db")
-        self._init_db()
+        self._init_db_sync()
 
-    def _init_db(self) -> None:
+    def _init_db_sync(self) -> None:
         with sqlite3.connect(self._db_path) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS knowledge_nodes (
-                    user_id TEXT NOT NULL,
-                    concept TEXT NOT NULL,
-                    data TEXT NOT NULL,
-                    PRIMARY KEY (user_id, concept)
-                )
-            """)
+            conn.execute(_CREATE_SQL)
 
     async def get_node(self, user_id: str, concept: str) -> Optional[KnowledgeNode]:
-        with sqlite3.connect(self._db_path) as conn:
-            row = conn.execute(
+        async with aiosqlite.connect(self._db_path) as db:
+            async with db.execute(
                 "SELECT data FROM knowledge_nodes WHERE user_id = ? AND concept = ?",
                 (user_id, concept),
-            ).fetchone()
+            ) as cursor:
+                row = await cursor.fetchone()
         if row:
             return KnowledgeNode.model_validate_json(row[0])
         return None
@@ -70,36 +74,30 @@ class KnowledgeMapMemory:
 
         node.last_reviewed = datetime.now()
 
-        with sqlite3.connect(self._db_path) as conn:
-            conn.execute(
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
                 "INSERT OR REPLACE INTO knowledge_nodes (user_id, concept, data) VALUES (?, ?, ?)",
                 (user_id, concept, node.model_dump_json()),
             )
+            await db.commit()
 
     async def _get_all_nodes(self, user_id: str) -> list[KnowledgeNode]:
-        with sqlite3.connect(self._db_path) as conn:
-            rows = conn.execute(
+        async with aiosqlite.connect(self._db_path) as db:
+            async with db.execute(
                 "SELECT data FROM knowledge_nodes WHERE user_id = ?", (user_id,)
-            ).fetchall()
+            ) as cursor:
+                rows = await cursor.fetchall()
         return [KnowledgeNode.model_validate_json(r[0]) for r in rows]
 
     async def get_weak_nodes(self, user_id: str, threshold: float = 0.5) -> list[KnowledgeNode]:
-        with sqlite3.connect(self._db_path) as conn:
-            rows = conn.execute(
-                "SELECT data FROM knowledge_nodes WHERE user_id = ?", (user_id,)
-            ).fetchall()
-        nodes = [KnowledgeNode.model_validate_json(r[0]) for r in rows]
+        nodes = await self._get_all_nodes(user_id)
         return [n for n in nodes if n.mastery_level < threshold]
 
     async def get_due_for_review(self, user_id: str) -> list[KnowledgeNode]:
         now = datetime.now()
-        with sqlite3.connect(self._db_path) as conn:
-            rows = conn.execute(
-                "SELECT data FROM knowledge_nodes WHERE user_id = ?", (user_id,)
-            ).fetchall()
+        nodes = await self._get_all_nodes(user_id)
         result = []
-        for r in rows:
-            node = KnowledgeNode.model_validate_json(r[0])
+        for node in nodes:
             if node.last_reviewed is None:
                 result.append(node)
             elif (now - node.last_reviewed).total_seconds() > node.review_interval_days * 86400:
@@ -110,10 +108,11 @@ class KnowledgeMapMemory:
         """Apply Ebbinghaus forgetting curve decay to all nodes. Returns count of decayed nodes."""
         now = datetime.now()
         decayed = 0
-        with sqlite3.connect(self._db_path) as conn:
-            rows = conn.execute(
+        async with aiosqlite.connect(self._db_path) as db:
+            async with db.execute(
                 "SELECT data FROM knowledge_nodes WHERE user_id = ?", (user_id,)
-            ).fetchall()
+            ) as cursor:
+                rows = await cursor.fetchall()
 
             for r in rows:
                 node = KnowledgeNode.model_validate_json(r[0])
@@ -126,9 +125,13 @@ class KnowledgeMapMemory:
                 new_mastery = max(0.0, node.mastery_level * retention)
                 if abs(new_mastery - node.mastery_level) > 0.01:
                     node.mastery_level = round(new_mastery, 3)
-                    conn.execute(
+                    await db.execute(
                         "UPDATE knowledge_nodes SET data = ? WHERE user_id = ? AND concept = ?",
                         (node.model_dump_json(), user_id, node.concept),
                     )
                     decayed += 1
+            await db.commit()
         return decayed
+
+    async def close(self) -> None:
+        pass

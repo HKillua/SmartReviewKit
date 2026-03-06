@@ -37,6 +37,7 @@ dependencies = [
     "openai>=1.0.0",
     "httpx>=0.24.0",
     "jieba>=0.42.1",
+    "aiosqlite>=0.20.0",
 ]
 
 [project.optional-dependencies]

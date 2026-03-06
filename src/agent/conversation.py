@@ -69,12 +69,15 @@ class FileConversationStore(ConversationStore):
         await self.update(conv)
         return conv
 
+    _CURRENT_SCHEMA_VERSION = 1
+
     async def get(self, conversation_id: str, user_id: str) -> Optional[Conversation]:
         path = self._conv_path(user_id, conversation_id)
         if not path.exists():
             return None
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
+            data = self._migrate_schema(data)
             conv = Conversation.model_validate(data)
             if conv.user_id != user_id:
                 return None
@@ -83,18 +86,30 @@ class FileConversationStore(ConversationStore):
             logger.exception("Failed to load conversation %s", conversation_id)
             return None
 
+    @classmethod
+    def _migrate_schema(cls, data: dict) -> dict:
+        """Apply forward-compatible migrations to conversation data."""
+        version = data.get("schema_version", 0)
+        if version < 1:
+            data.setdefault("schema_version", 1)
+            data.setdefault("title", "")
+        return data
+
     async def update(self, conversation: Conversation) -> None:
         conversation.updated_at = datetime.now()
         path = self._conv_path(conversation.user_id, conversation.id)
         data = conversation.model_dump_json(indent=2)
         # Atomic write via temp file + rename
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+        fd_closed = False
         try:
             os.write(fd, data.encode("utf-8"))
             os.close(fd)
+            fd_closed = True
             os.replace(tmp, str(path))
         except Exception:
-            os.close(fd) if not os.get_inheritable(fd) else None  # noqa: SIM if
+            if not fd_closed:
+                os.close(fd)
             if os.path.exists(tmp):
                 os.unlink(tmp)
             raise

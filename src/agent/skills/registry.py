@@ -116,7 +116,11 @@ class SkillRegistry:
         )
 
     def load_resource(self, skill_name: str, resource_path: str) -> Optional[str]:
-        path = self._skills_dir / skill_name / resource_path
+        base = (self._skills_dir / skill_name).resolve()
+        path = (base / resource_path).resolve()
+        if not str(path).startswith(str(base)):
+            logger.warning("Path traversal attempt blocked: %s", resource_path)
+            return None
         if path.exists():
             return path.read_text(encoding="utf-8")
         return None

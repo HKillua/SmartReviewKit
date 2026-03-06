@@ -9,7 +9,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse
 
 from src.server.models import ChatRequest, HealthResponse, UploadResponse
@@ -41,7 +41,7 @@ def configure_routes(
 
 
 @router.post("/api/chat")
-async def chat_endpoint(request: ChatRequest):
+async def chat_endpoint(http_request: Request, request: ChatRequest):
     """SSE streaming chat endpoint."""
     if _chat_handler is None:
         raise HTTPException(status_code=503, detail="Agent not initialized")
@@ -50,9 +50,12 @@ async def chat_endpoint(request: ChatRequest):
 
     async def event_generator():
         async for chunk in _chat_handler.handle_stream(request):
+            if await http_request.is_disconnected():
+                logger.info("Client disconnected, stopping SSE stream")
+                break
             yield {"event": "message", "data": chunk.model_dump_json()}
 
-    return EventSourceResponse(event_generator())
+    return EventSourceResponse(event_generator(), media_type="text/event-stream")
 
 
 @router.get("/api/conversations")
@@ -108,9 +111,12 @@ async def upload_file(file: UploadFile = File(...), user_id: str = "default_user
     if len(content) > _max_upload_mb * 1024 * 1024:
         raise HTTPException(status_code=413, detail=f"File too large (max {_max_upload_mb}MB)")
 
+    safe_filename = Path(file.filename).name
     save_dir = Path(_upload_dir) / user_id
     save_dir.mkdir(parents=True, exist_ok=True)
-    save_path = save_dir / file.filename
+    save_path = (save_dir / safe_filename).resolve()
+    if not str(save_path).startswith(str(save_dir.resolve())):
+        raise HTTPException(status_code=400, detail="Invalid filename")
     save_path.write_bytes(content)
 
     if _agent is None:

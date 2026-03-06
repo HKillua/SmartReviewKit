@@ -11,9 +11,11 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
+
+RoleType = Literal["user", "assistant", "system", "tool"]
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +66,7 @@ class ToolResult(BaseModel):
 # ---------------------------------------------------------------------------
 
 class LlmMessage(BaseModel):
-    role: str
+    role: RoleType
     content: Optional[str] = None
     tool_calls: Optional[list[ToolCallData]] = None
     tool_call_id: Optional[str] = None
@@ -97,7 +99,7 @@ class LlmStreamChunk(BaseModel):
 # ---------------------------------------------------------------------------
 
 class Message(BaseModel):
-    role: str
+    role: RoleType
     content: Optional[str] = None
     timestamp: datetime = Field(default_factory=datetime.now)
     tool_calls: Optional[list[ToolCallData]] = None
@@ -111,3 +113,4 @@ class Conversation(BaseModel):
     messages: list[Message] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
+    schema_version: int = 1

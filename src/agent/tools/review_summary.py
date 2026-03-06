@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from src.agent.tools.base import Tool
 from src.agent.types import ToolContext, ToolResult
+from src.agent.utils.sanitizer import sanitize_user_input
 
 logger = logging.getLogger(__name__)
 
@@ -91,10 +92,10 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
             except Exception:
                 logger.warning("Failed to retrieve weak concepts from ErrorMemory")
 
-        chapter_line = f"章节: {args.chapter}" if args.chapter else ""
+        chapter_line = f"章节: {sanitize_user_input(args.chapter, max_length=100)}" if args.chapter else ""
 
         prompt = REVIEW_PROMPT_TEMPLATE.format(
-            topic=args.topic,
+            topic=sanitize_user_input(args.topic),
             chapter_line=chapter_line,
             context=knowledge_text,
             weak_points_section=weak_section,

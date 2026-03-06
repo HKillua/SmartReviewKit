@@ -28,6 +28,7 @@ from src.agent.types import (
     StreamEventType,
     ToolCallData,
     ToolContext,
+    ToolResult,
 )
 
 logger = logging.getLogger(__name__)
@@ -243,9 +244,9 @@ class Agent:
 
             # If LLM returned tool calls → execute tools
             if response.tool_calls:
-                # Record assistant message with tool calls
+                # Record assistant message with tool calls (preserve content if present)
                 conversation.messages.append(
-                    Message(role="assistant", tool_calls=response.tool_calls)
+                    Message(role="assistant", content=response.content, tool_calls=response.tool_calls)
                 )
 
                 for tc in response.tool_calls:
@@ -266,7 +267,7 @@ class Agent:
                             break
 
                     if tool_blocked:
-                        tool_result_obj = __import__("src.agent.types", fromlist=["ToolResult"]).ToolResult(
+                        tool_result_obj = ToolResult(
                             success=False, error="Tool execution blocked by hook"
                         )
                     else:
@@ -277,7 +278,7 @@ class Agent:
                     # After-tool hooks
                     for hook in self.hooks:
                         try:
-                            modified = await hook.after_tool(tc.name, tool_result_obj)
+                            modified = await hook.after_tool(tc.name, tool_result_obj, context=tool_ctx)
                             if modified is not None:
                                 tool_result_obj = modified
                         except Exception:

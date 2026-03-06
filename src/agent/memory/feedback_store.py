@@ -6,34 +6,44 @@ import logging
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
+
+import aiosqlite
 
 logger = logging.getLogger(__name__)
 
 
+_CREATE_SQL = """
+    CREATE TABLE IF NOT EXISTS feedback (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        conversation_id TEXT NOT NULL,
+        message_index INTEGER DEFAULT -1,
+        rating TEXT NOT NULL CHECK(rating IN ('up', 'down')),
+        comment TEXT DEFAULT '',
+        query TEXT DEFAULT '',
+        response_preview TEXT DEFAULT '',
+        created_at REAL NOT NULL
+    )
+"""
+
+
 class FeedbackStore:
-    """SQLite-backed store for user feedback on agent responses."""
+    """SQLite-backed store for user feedback on agent responses.
+
+    Sync methods (add/list_recent/stats) are kept for backward compatibility
+    with the routes layer. An async close() is provided for graceful shutdown.
+    """
 
     def __init__(self, db_path: str = "data/db/feedback.db") -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._db_path = db_path
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._init_db()
 
     def _init_db(self) -> None:
-        self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS feedback (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT NOT NULL,
-                conversation_id TEXT NOT NULL,
-                message_index INTEGER DEFAULT -1,
-                rating TEXT NOT NULL CHECK(rating IN ('up', 'down')),
-                comment TEXT DEFAULT '',
-                query TEXT DEFAULT '',
-                response_preview TEXT DEFAULT '',
-                created_at REAL NOT NULL
-            )
-        """)
+        self._conn.execute(_CREATE_SQL)
         self._conn.commit()
 
     def add(

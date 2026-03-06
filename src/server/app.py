@@ -9,6 +9,7 @@ from typing import Any
 import yaml
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from src.agent.agent import Agent
@@ -22,6 +23,8 @@ from src.agent.config import (
 )
 from src.agent.conversation import FileConversationStore
 from src.agent.llm.factory import create_llm_service
+from src.agent.hooks.rate_limit import RateLimitHook
+from src.agent.hooks.retry_middleware import RetryWithBackoffMiddleware
 from src.agent.hooks.review_schedule import ReviewScheduleHook
 from src.agent.memory.context_filter import ContextEngineeringFilter
 from src.agent.memory.enhancer import MemoryContextEnhancer, MemoryRecordHook
@@ -188,6 +191,7 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
     if memory_cfg.compaction_enabled:
         context_filter = ContextEngineeringFilter(
             max_messages=agent_cfg.max_context_messages,
+            max_tokens=agent_cfg.max_context_tokens,
             llm_service=llm,
             compaction_threshold=memory_cfg.compaction_threshold_messages,
         )
@@ -231,9 +235,13 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
     conv_store = FileConversationStore(agent_cfg.conversation_store_dir)
 
     # --- Agent ---
-    hooks: list = [memory_hook]
+    rate_limit_hook = RateLimitHook(requests_per_minute=agent_cfg.rate_limit_rpm)
+    hooks: list = [rate_limit_hook, memory_hook]
     if review_hook:
         hooks.insert(0, review_hook)
+
+    # --- LLM Middlewares (retry + circuit breaker) ---
+    retry_middleware = RetryWithBackoffMiddleware(llm_service=llm)
 
     agent = Agent(
         llm_service=llm,
@@ -242,6 +250,7 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         config=agent_cfg,
         prompt_builder=SystemPromptBuilder(agent_cfg.system_prompt_path),
         lifecycle_hooks=hooks,
+        llm_middlewares=[retry_middleware],
         memory_enhancer=memory_enhancer,
         skill_workflow=skill_workflow,
         context_filter=context_filter,
@@ -274,7 +283,7 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
     if web_dir.exists():
         app.mount("/static", StaticFiles(directory=str(web_dir)), name="static")
 
-        @app.get("/", response_class=__import__("fastapi.responses", fromlist=["HTMLResponse"]).HTMLResponse)
+        @app.get("/", response_class=HTMLResponse)
         async def index():
             return (web_dir / "index.html").read_text(encoding="utf-8")
 
@@ -284,6 +293,23 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         if agent_cfg.auto_ingest_dir:
             logger.info("Running startup auto-ingestion from: %s", agent_cfg.auto_ingest_dir)
             _auto_ingest(agent_cfg.auto_ingest_dir, collection)
+
+    # --- Shutdown: close DB connections and resources ---
+    @app.on_event("shutdown")
+    async def _shutdown_cleanup() -> None:
+        logger.info("Shutting down — closing resources...")
+        for store in (profile_mem, error_mem, kmap_mem, skill_mem, session_mem):
+            if store and hasattr(store, "close"):
+                try:
+                    await store.close()
+                except Exception:
+                    logger.warning("Failed to close memory store %s", type(store).__name__)
+        if feedback_store:
+            try:
+                feedback_store.close()
+            except Exception:
+                logger.warning("Failed to close FeedbackStore")
+        logger.info("Shutdown complete")
 
     logger.info(
         "Agent ready — tools: %s, skills: %s",

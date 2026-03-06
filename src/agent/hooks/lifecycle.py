@@ -30,7 +30,7 @@ class LifecycleHook:
         """
 
     async def after_tool(
-        self, tool_name: str, result: ToolResult
+        self, tool_name: str, result: ToolResult, context: ToolContext | None = None,
     ) -> Optional[ToolResult]:
         """Called after a tool finishes.
 

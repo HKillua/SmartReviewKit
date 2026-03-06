@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from src.agent.tools.base import Tool
 from src.agent.types import ToolContext, ToolResult
+from src.agent.utils.sanitizer import sanitize_user_input
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +93,7 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
 
         prompt = QUIZ_PROMPT_TEMPLATE.format(
             count=args.count,
-            question_type=args.question_type,
+            question_type=sanitize_user_input(args.question_type, max_length=50),
             difficulty=args.difficulty,
             context=knowledge_text,
             weak_points_hint=weak_hint,

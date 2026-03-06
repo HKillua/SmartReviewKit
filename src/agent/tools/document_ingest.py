@@ -22,9 +22,10 @@ class DocumentIngestArgs(BaseModel):
 class DocumentIngestTool(Tool[DocumentIngestArgs]):
     """Ingest a PDF or PPTX file into the knowledge base via IngestionPipeline."""
 
-    def __init__(self, settings: Any = None, pipeline: Any = None) -> None:
+    def __init__(self, settings: Any = None, pipeline: Any = None, allowed_dirs: list[str] | None = None) -> None:
         self._settings = settings
         self._pipeline = pipeline
+        self._allowed_dirs = allowed_dirs or ["data/uploads", "docs"]
 
     @property
     def name(self) -> str:
@@ -45,10 +46,21 @@ class DocumentIngestTool(Tool[DocumentIngestArgs]):
         from src.ingestion.pipeline import IngestionPipeline
         return IngestionPipeline(settings=self._settings, collection=collection)
 
+    def _is_path_allowed(self, file_path: Path) -> bool:
+        resolved = file_path.resolve()
+        for d in self._allowed_dirs:
+            base = Path(d).resolve()
+            if str(resolved).startswith(str(base) + "/") or resolved == base:
+                return True
+        return False
+
     async def execute(self, context: ToolContext, args: DocumentIngestArgs) -> ToolResult:
         path = Path(args.file_path)
         if not path.exists():
             return ToolResult(success=False, error=f"文件不存在: {args.file_path}")
+
+        if not self._is_path_allowed(path):
+            return ToolResult(success=False, error="文件路径不在允许的目录范围内")
 
         ext = path.suffix.lower()
         if ext not in (".pdf", ".pptx"):
