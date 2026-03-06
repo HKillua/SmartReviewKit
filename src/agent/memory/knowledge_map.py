@@ -36,24 +36,33 @@ _CREATE_SQL = """
 
 
 class KnowledgeMapMemory:
-    """SQLite-backed knowledge map with Ebbinghaus forgetting curve (async via aiosqlite)."""
+    """SQLite-backed knowledge map with Ebbinghaus forgetting curve (async via aiosqlite).
+
+    Maintains a persistent connection to avoid per-query open/close overhead.
+    """
 
     def __init__(self, db_dir: str = "data/memory") -> None:
         Path(db_dir).mkdir(parents=True, exist_ok=True)
         self._db_path = str(Path(db_dir) / "knowledge_map.db")
+        self._conn: Optional[aiosqlite.Connection] = None
         self._init_db_sync()
 
     def _init_db_sync(self) -> None:
         with sqlite3.connect(self._db_path) as conn:
             conn.execute(_CREATE_SQL)
 
+    async def _get_conn(self) -> aiosqlite.Connection:
+        if self._conn is None:
+            self._conn = await aiosqlite.connect(self._db_path)
+        return self._conn
+
     async def get_node(self, user_id: str, concept: str) -> Optional[KnowledgeNode]:
-        async with aiosqlite.connect(self._db_path) as db:
-            async with db.execute(
-                "SELECT data FROM knowledge_nodes WHERE user_id = ? AND concept = ?",
-                (user_id, concept),
-            ) as cursor:
-                row = await cursor.fetchone()
+        db = await self._get_conn()
+        async with db.execute(
+            "SELECT data FROM knowledge_nodes WHERE user_id = ? AND concept = ?",
+            (user_id, concept),
+        ) as cursor:
+            row = await cursor.fetchone()
         if row:
             return KnowledgeNode.model_validate_json(row[0])
         return None
@@ -74,19 +83,19 @@ class KnowledgeMapMemory:
 
         node.last_reviewed = datetime.now()
 
-        async with aiosqlite.connect(self._db_path) as db:
-            await db.execute(
-                "INSERT OR REPLACE INTO knowledge_nodes (user_id, concept, data) VALUES (?, ?, ?)",
-                (user_id, concept, node.model_dump_json()),
-            )
-            await db.commit()
+        db = await self._get_conn()
+        await db.execute(
+            "INSERT OR REPLACE INTO knowledge_nodes (user_id, concept, data) VALUES (?, ?, ?)",
+            (user_id, concept, node.model_dump_json()),
+        )
+        await db.commit()
 
     async def _get_all_nodes(self, user_id: str) -> list[KnowledgeNode]:
-        async with aiosqlite.connect(self._db_path) as db:
-            async with db.execute(
-                "SELECT data FROM knowledge_nodes WHERE user_id = ?", (user_id,)
-            ) as cursor:
-                rows = await cursor.fetchall()
+        db = await self._get_conn()
+        async with db.execute(
+            "SELECT data FROM knowledge_nodes WHERE user_id = ?", (user_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
         return [KnowledgeNode.model_validate_json(r[0]) for r in rows]
 
     async def get_weak_nodes(self, user_id: str, threshold: float = 0.5) -> list[KnowledgeNode]:
@@ -108,30 +117,32 @@ class KnowledgeMapMemory:
         """Apply Ebbinghaus forgetting curve decay to all nodes. Returns count of decayed nodes."""
         now = datetime.now()
         decayed = 0
-        async with aiosqlite.connect(self._db_path) as db:
-            async with db.execute(
-                "SELECT data FROM knowledge_nodes WHERE user_id = ?", (user_id,)
-            ) as cursor:
-                rows = await cursor.fetchall()
+        db = await self._get_conn()
+        async with db.execute(
+            "SELECT data FROM knowledge_nodes WHERE user_id = ?", (user_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
 
-            for r in rows:
-                node = KnowledgeNode.model_validate_json(r[0])
-                if node.last_reviewed is None:
-                    continue
-                days_since = (now - node.last_reviewed).total_seconds() / 86400
-                if days_since < 0.5:
-                    continue
-                retention = math.exp(-days_since / (node.review_interval_days * 2))
-                new_mastery = max(0.0, node.mastery_level * retention)
-                if abs(new_mastery - node.mastery_level) > 0.01:
-                    node.mastery_level = round(new_mastery, 3)
-                    await db.execute(
-                        "UPDATE knowledge_nodes SET data = ? WHERE user_id = ? AND concept = ?",
-                        (node.model_dump_json(), user_id, node.concept),
-                    )
-                    decayed += 1
-            await db.commit()
+        for r in rows:
+            node = KnowledgeNode.model_validate_json(r[0])
+            if node.last_reviewed is None:
+                continue
+            days_since = (now - node.last_reviewed).total_seconds() / 86400
+            if days_since < 0.5:
+                continue
+            retention = math.exp(-days_since / (node.review_interval_days * 2))
+            new_mastery = max(0.0, node.mastery_level * retention)
+            if abs(new_mastery - node.mastery_level) > 0.01:
+                node.mastery_level = round(new_mastery, 3)
+                await db.execute(
+                    "UPDATE knowledge_nodes SET data = ? WHERE user_id = ? AND concept = ?",
+                    (node.model_dump_json(), user_id, node.concept),
+                )
+                decayed += 1
+        await db.commit()
         return decayed
 
     async def close(self) -> None:
-        pass
+        if self._conn is not None:
+            await self._conn.close()
+            self._conn = None

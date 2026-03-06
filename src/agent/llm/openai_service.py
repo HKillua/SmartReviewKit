@@ -71,17 +71,23 @@ class OpenAILlmService(LlmService):
         api_version: str | None = None,
         deployment_name: str | None = None,
         is_azure: bool = False,
+        timeout_seconds: float = 120.0,
+        connect_timeout_seconds: float = 10.0,
     ) -> None:
         try:
+            import httpx
             import openai
         except ImportError as exc:
             raise ImportError("openai package is required: pip install openai>=1.0") from exc
+
+        http_timeout = httpx.Timeout(timeout_seconds, connect=connect_timeout_seconds)
 
         if is_azure or azure_endpoint:
             self._client = openai.AsyncAzureOpenAI(
                 api_key=api_key or None,
                 azure_endpoint=azure_endpoint or "",
                 api_version=api_version or "2024-02-15-preview",
+                timeout=http_timeout,
             )
             self._model = deployment_name or model
         else:
@@ -90,6 +96,7 @@ class OpenAILlmService(LlmService):
                 kwargs["api_key"] = api_key
             if base_url:
                 kwargs["base_url"] = base_url
+            kwargs["timeout"] = http_timeout
             self._client = openai.AsyncOpenAI(**kwargs)
             self._model = model
 

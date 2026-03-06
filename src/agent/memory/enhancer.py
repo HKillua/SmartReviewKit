@@ -7,6 +7,7 @@ Provides two core components:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -72,95 +73,118 @@ class MemoryContextEnhancer:
         self._sessions = session_memory
 
     async def get_memory_summary(self, user_id: str) -> str:
-        """Build a structured text summary for system prompt injection."""
-        sections: list[str] = []
+        """Build a structured text summary for system prompt injection.
 
-        # ── Preference section ──
-        if self._profile:
+        P2: all independent DB reads run in parallel via asyncio.gather().
+        """
+
+        async def _load_profile():
+            if not self._profile:
+                return None
             try:
-                profile = await self._profile.get_profile(user_id)
-                prefs = profile.preferences or {}
-                detail = prefs.get("detail_level", "normal")
-                style = prefs.get("style", "default")
-                pref_lines: list[str] = []
-                if detail != "normal":
-                    label = {"concise": "简洁", "detailed": "详细"}.get(detail, detail)
-                    pref_lines.append(f"回答风格: {label}")
-                if style != "default":
-                    label = {"exam_focused": "考点版", "example_heavy": "多举例"}.get(style, style)
-                    pref_lines.append(f"内容偏好: {label}")
-                diff = prefs.get("quiz_difficulty")
-                if diff and diff != "medium":
-                    pref_lines.append(f"测验难度: {diff}")
-                if pref_lines:
-                    sections.append("### 学习偏好\n" + "\n".join(f"- {l}" for l in pref_lines))
-
-                if profile.total_sessions > 0:
-                    stats = (
-                        f"- 总会话: {profile.total_sessions}, "
-                        f"总测验: {profile.total_quizzes}, "
-                        f"正确率: {profile.overall_accuracy:.0%}"
-                    )
-                    sections.append("### 学习统计\n" + stats)
+                return await self._profile.get_profile(user_id)
             except Exception:
                 logger.warning("Failed to retrieve student profile")
+                return None
 
-        # ── Last session section ──
-        if self._sessions:
+        async def _load_sessions():
+            if not self._sessions:
+                return []
             try:
-                recent = await self._sessions.get_recent_sessions(user_id, limit=2)
-                if recent:
-                    last = recent[0]
-                    lines: list[str] = []
-                    if last.topics:
-                        lines.append(f"- 话题: {', '.join(last.topics[:5])}")
-                    if last.key_questions:
-                        lines.append(f"- 关键问题: {last.key_questions[0]}")
-                    obs = last.mastery_observations
-                    if obs:
-                        weak = [k for k, v in obs.items() if v == "weak"]
-                        strong = [k for k, v in obs.items() if v == "strong"]
-                        if weak:
-                            lines.append(f"- 薄弱: {', '.join(weak[:3])}")
-                        if strong:
-                            lines.append(f"- 掌握: {', '.join(strong[:3])}")
-                    if lines:
-                        sections.append("### 上次学习\n" + "\n".join(lines))
+                return await self._sessions.get_recent_sessions(user_id, limit=2)
             except Exception:
                 logger.warning("Failed to retrieve session memory")
+                return []
 
-        # ── Due for review ──
-        if self._kmap:
+        async def _load_kmap():
+            if not self._kmap:
+                return [], []
             try:
-                due = await self._kmap.get_due_for_review(user_id)
-                if due:
-                    due_lines = []
-                    for n in due[:5]:
-                        days = ""
-                        if n.last_reviewed:
-                            d = (datetime.now() - n.last_reviewed).days
-                            days = f", {d}天未复习"
-                        due_lines.append(f"- {n.concept} (掌握度: {n.mastery_level:.0%}{days})")
-                    sections.append("### 需要复习的知识点\n" + "\n".join(due_lines))
-
-                weak = await self._kmap.get_weak_nodes(user_id)
-                if weak:
-                    weak_items = ", ".join(f"{n.concept}({n.mastery_level:.0%})" for n in weak[:5])
-                    sections.append(f"### 低掌握度知识\n- {weak_items}")
+                due, weak = await asyncio.gather(
+                    self._kmap.get_due_for_review(user_id),
+                    self._kmap.get_weak_nodes(user_id),
+                )
+                return due or [], weak or []
             except Exception:
                 logger.warning("Failed to retrieve knowledge map")
+                return [], []
 
-        # ── Error reminders ──
-        if self._errors:
+        async def _load_errors():
+            if not self._errors:
+                return []
             try:
-                errors = await self._errors.get_errors(user_id, mastered=False, limit=5)
-                if errors:
-                    err_lines = []
-                    for e in errors[:3]:
-                        err_lines.append(f"- {e.topic}: {e.question[:40]}… (错{1}次)")
-                    sections.append("### 错题提醒\n" + "\n".join(err_lines))
+                return await self._errors.get_errors(user_id, mastered=False, limit=5)
             except Exception:
                 logger.warning("Failed to retrieve error memory")
+                return []
+
+        profile, recent_sessions, (due, weak), errors = await asyncio.gather(
+            _load_profile(), _load_sessions(), _load_kmap(), _load_errors(),
+        )
+
+        sections: list[str] = []
+
+        if profile is not None:
+            prefs = profile.preferences or {}
+            detail = prefs.get("detail_level", "normal")
+            style = prefs.get("style", "default")
+            pref_lines: list[str] = []
+            if detail != "normal":
+                label = {"concise": "简洁", "detailed": "详细"}.get(detail, detail)
+                pref_lines.append(f"回答风格: {label}")
+            if style != "default":
+                label = {"exam_focused": "考点版", "example_heavy": "多举例"}.get(style, style)
+                pref_lines.append(f"内容偏好: {label}")
+            diff = prefs.get("quiz_difficulty")
+            if diff and diff != "medium":
+                pref_lines.append(f"测验难度: {diff}")
+            if pref_lines:
+                sections.append("### 学习偏好\n" + "\n".join(f"- {l}" for l in pref_lines))
+            if profile.total_sessions > 0:
+                stats = (
+                    f"- 总会话: {profile.total_sessions}, "
+                    f"总测验: {profile.total_quizzes}, "
+                    f"正确率: {profile.overall_accuracy:.0%}"
+                )
+                sections.append("### 学习统计\n" + stats)
+
+        if recent_sessions:
+            last = recent_sessions[0]
+            lines: list[str] = []
+            if last.topics:
+                lines.append(f"- 话题: {', '.join(last.topics[:5])}")
+            if last.key_questions:
+                lines.append(f"- 关键问题: {last.key_questions[0]}")
+            obs = last.mastery_observations
+            if obs:
+                w = [k for k, v in obs.items() if v == "weak"]
+                s = [k for k, v in obs.items() if v == "strong"]
+                if w:
+                    lines.append(f"- 薄弱: {', '.join(w[:3])}")
+                if s:
+                    lines.append(f"- 掌握: {', '.join(s[:3])}")
+            if lines:
+                sections.append("### 上次学习\n" + "\n".join(lines))
+
+        if due:
+            due_lines = []
+            for n in due[:5]:
+                days = ""
+                if n.last_reviewed:
+                    d = (datetime.now() - n.last_reviewed).days
+                    days = f", {d}天未复习"
+                due_lines.append(f"- {n.concept} (掌握度: {n.mastery_level:.0%}{days})")
+            sections.append("### 需要复习的知识点\n" + "\n".join(due_lines))
+
+        if weak:
+            weak_items = ", ".join(f"{n.concept}({n.mastery_level:.0%})" for n in weak[:5])
+            sections.append(f"### 低掌握度知识\n- {weak_items}")
+
+        if errors:
+            err_lines = []
+            for e in errors[:3]:
+                err_lines.append(f"- {e.topic}: {e.question[:40]}… (错{1}次)")
+            sections.append("### 错题提醒\n" + "\n".join(err_lines))
 
         if not sections:
             return ""

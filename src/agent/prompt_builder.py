@@ -18,13 +18,17 @@ class SystemPromptBuilder:
 
     def __init__(self, template_path: str = "config/prompts/system_prompt.txt") -> None:
         self._template_path = Path(template_path)
+        self._cached_template: str | None = None
 
     def _load_template(self) -> str:
+        if self._cached_template is not None:
+            return self._cached_template
         try:
-            return self._template_path.read_text(encoding="utf-8")
+            self._cached_template = self._template_path.read_text(encoding="utf-8")
         except FileNotFoundError:
             logger.warning("System prompt template not found at %s, using default", self._template_path)
-            return _DEFAULT_TEMPLATE
+            self._cached_template = _DEFAULT_TEMPLATE
+        return self._cached_template
 
     def build(
         self,

@@ -6,6 +6,7 @@ LifecycleHooks, LlmMiddlewares, Memory and Skills.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from typing import AsyncGenerator, Optional
@@ -129,38 +130,48 @@ class Agent:
             if len(effective_message) > 30:
                 conversation.title += "..."
 
-        # --- Build system prompt ---
+        # --- Build system prompt (P1: parallel preprocess) ---
         tool_schemas = self.tools.get_all_schemas()
 
-        memory_ctx = ""
-        if self.memory_enhancer and hasattr(self.memory_enhancer, "get_memory_summary"):
-            try:
-                memory_ctx = await self.memory_enhancer.get_memory_summary(user_id)
-            except Exception:
-                logger.exception("Memory enhancer failed")
+        async def _fetch_memory() -> str:
+            if self.memory_enhancer and hasattr(self.memory_enhancer, "get_memory_summary"):
+                try:
+                    return await self.memory_enhancer.get_memory_summary(user_id)
+                except Exception:
+                    logger.exception("Memory enhancer failed")
+            return ""
 
-        # Proactive review recommendations (K4)
-        review_ctx = ""
-        if self.review_hook and hasattr(self.review_hook, "get_review_context"):
-            try:
-                review_ctx = await self.review_hook.get_review_context(user_id)
-            except Exception:
-                logger.exception("Review hook failed")
+        async def _fetch_review() -> str:
+            if self.review_hook and hasattr(self.review_hook, "get_review_context"):
+                try:
+                    return await self.review_hook.get_review_context(user_id)
+                except Exception:
+                    logger.exception("Review hook failed")
+            return ""
+
+        async def _fetch_skill() -> object | None:
+            if self.skill_workflow and hasattr(self.skill_workflow, "try_handle"):
+                try:
+                    return await self.skill_workflow.try_handle(effective_message, user_id)
+                except Exception:
+                    logger.exception("Skill workflow handler failed")
+            return None
+
+        memory_ctx, review_ctx, wf_result = await asyncio.gather(
+            _fetch_memory(), _fetch_review(), _fetch_skill()
+        )
+
         if review_ctx:
             memory_ctx = (memory_ctx + "\n\n" + review_ctx).strip() if memory_ctx else review_ctx
 
         skill_ctx = ""
-        if self.skill_workflow and hasattr(self.skill_workflow, "try_handle"):
-            try:
-                wf_result = await self.skill_workflow.try_handle(effective_message, user_id)
-                if hasattr(wf_result, "direct_response") and wf_result.direct_response:
-                    yield StreamEvent(type=StreamEventType.TEXT_DELTA, content=wf_result.direct_response)
-                    yield StreamEvent(type=StreamEventType.DONE)
-                    return
-                if hasattr(wf_result, "skill_instruction") and wf_result.skill_instruction:
-                    skill_ctx = wf_result.skill_instruction
-            except Exception:
-                logger.exception("Skill workflow handler failed")
+        if wf_result is not None:
+            if hasattr(wf_result, "direct_response") and wf_result.direct_response:
+                yield StreamEvent(type=StreamEventType.TEXT_DELTA, content=wf_result.direct_response)
+                yield StreamEvent(type=StreamEventType.DONE)
+                return
+            if hasattr(wf_result, "skill_instruction") and wf_result.skill_instruction:
+                skill_ctx = wf_result.skill_instruction
 
         system_prompt = self.prompt_builder.build(
             tool_schemas=tool_schemas,
@@ -187,15 +198,21 @@ class Agent:
             metadata={"conversation_id": conversation.id, "title": conversation.title},
         )
 
-        # --- Save conversation ---
-        await self.conversations.update(conversation)
+        # P8: save + after-message hooks run in background so the SSE generator
+        # completes immediately after DONE, freeing the HTTP connection.
+        asyncio.create_task(self._post_message_tasks(conversation))
 
-        # --- After-message hooks ---
+    async def _post_message_tasks(self, conversation: Conversation) -> None:
+        """Background task: save conversation and run after-message hooks."""
+        try:
+            await self.conversations.update(conversation)
+        except Exception:
+            logger.exception("Failed to save conversation in background")
         for hook in self.hooks:
             try:
                 await hook.after_message(conversation)
             except Exception:
-                logger.exception("after_message hook failed")
+                logger.exception("after_message hook failed in background")
 
     async def _tool_loop(
         self,
@@ -204,9 +221,13 @@ class Agent:
         tool_schemas: list[dict],
         tool_ctx: ToolContext,
     ) -> AsyncGenerator[StreamEvent, None]:
-        """Inner ReAct loop: call LLM → execute tools → repeat."""
+        """Inner ReAct loop: call LLM -> execute tools -> repeat.
+
+        P0 fix: when streaming is enabled, text_delta events are yielded
+        in real-time as each token arrives from the LLM, instead of being
+        buffered into a list first.
+        """
         for iteration in range(self.config.max_tool_iterations):
-            # Build messages
             llm_messages = await self._build_llm_messages(conversation, system_prompt)
 
             request = LlmRequest(
@@ -217,7 +238,6 @@ class Agent:
                 stream=self.config.stream_responses,
             )
 
-            # Apply before-request middlewares
             for mw in self.middlewares:
                 try:
                     request = await mw.before_llm_request(request)
@@ -225,13 +245,26 @@ class Agent:
                     logger.exception("before_llm_request middleware failed")
 
             if request.stream:
-                response, events = await self._handle_streaming(request)
-                for ev in events:
-                    yield ev
+                # P0: consume stream in real-time — yield text_delta as each
+                # token arrives, while accumulating the full LlmResponse.
+                chunks: list[LlmStreamChunk] = []
+                content_parts: list[str] = []
+
+                async for chunk in self.llm.stream_request(request):
+                    chunks.append(chunk)
+                    if chunk.delta_content:
+                        content_parts.append(chunk.delta_content)
+                        yield StreamEvent(
+                            type=StreamEventType.TEXT_DELTA,
+                            content=chunk.delta_content,
+                        )
+
+                full_content = "".join(content_parts) or None
+                tool_calls = _accumulate_tool_calls(chunks)
+                response = LlmResponse(content=full_content, tool_calls=tool_calls)
             else:
                 response = await self.llm.send_request(request)
 
-            # Apply after-response middlewares (reverse order)
             for mw in reversed(self.middlewares):
                 try:
                     response = await mw.after_llm_response(request, response)
@@ -242,9 +275,7 @@ class Agent:
                 yield StreamEvent(type=StreamEventType.ERROR, content=response.error)
                 return
 
-            # If LLM returned tool calls → execute tools
             if response.tool_calls:
-                # Record assistant message with tool calls (preserve content if present)
                 conversation.messages.append(
                     Message(role="assistant", content=response.content, tool_calls=response.tool_calls)
                 )
@@ -256,7 +287,6 @@ class Agent:
                         metadata={"arguments": tc.arguments},
                     )
 
-                    # Before-tool hooks
                     tool_blocked = False
                     for hook in self.hooks:
                         try:
@@ -275,7 +305,6 @@ class Agent:
                             tc, tool_ctx, timeout=float(self.config.tool_timeout)
                         )
 
-                    # After-tool hooks
                     for hook in self.hooks:
                         try:
                             modified = await hook.after_tool(tc.name, tool_result_obj, context=tool_ctx)
@@ -291,7 +320,6 @@ class Agent:
                         metadata={"success": tool_result_obj.success},
                     )
 
-                    # Record tool result message
                     conversation.messages.append(
                         Message(
                             role="tool",
@@ -300,41 +328,17 @@ class Agent:
                         )
                     )
 
-                # Continue the loop for next LLM call
                 continue
 
-            # No tool calls — plain text response
             if response.content and not request.stream:
                 yield StreamEvent(type=StreamEventType.TEXT_DELTA, content=response.content)
             conversation.messages.append(Message(role="assistant", content=response.content or ""))
             return
 
-        # Exhausted iterations
         yield StreamEvent(
             type=StreamEventType.ERROR,
             content=f"达到最大工具调用轮次 ({self.config.max_tool_iterations})，请简化问题后重试。",
         )
-
-    async def _handle_streaming(
-        self, request: LlmRequest
-    ) -> tuple[LlmResponse, list[StreamEvent]]:
-        """Consume the stream, yielding text_delta events and assembling the final LlmResponse."""
-        events: list[StreamEvent] = []
-        chunks: list[LlmStreamChunk] = []
-        content_parts: list[str] = []
-
-        async for chunk in self.llm.stream_request(request):
-            chunks.append(chunk)
-            if chunk.delta_content:
-                content_parts.append(chunk.delta_content)
-                events.append(
-                    StreamEvent(type=StreamEventType.TEXT_DELTA, content=chunk.delta_content)
-                )
-
-        full_content = "".join(content_parts) or None
-        tool_calls = _accumulate_tool_calls(chunks)
-
-        return LlmResponse(content=full_content, tool_calls=tool_calls), events
 
     async def _build_llm_messages(
         self, conversation: Conversation, system_prompt: str

@@ -2640,3 +2640,29 @@ retrieval:
 ### 测试: 34 项全部通过 ✅
 
 详细复习文档: `docs/AGENT_HARDENING.md`
+
+---
+
+## Phase P: 端到端延迟深度优化 ✅
+
+**目标**: 解决从前端输入到首字显示延迟过长的问题，将首字响应时间缩短 50-70%。
+
+### P-Phase 核心修复 ✅
+
+| 编号 | 优先级 | 修复内容 | 文件 | 状态 |
+|------|--------|---------|------|------|
+| P0 | 致命 | 流式输出伪流式 → 真实时流式（重构 _tool_loop 内联 stream 消费，实时 yield） | `agent.py` | ✅ |
+| P1 | 关键 | Agent 预处理三步串行 → asyncio.gather() 并行 | `agent.py` | ✅ |
+| P2 | 关键 | Memory Summary 5 次串行 DB 查询 → asyncio.gather() 并行 | `memory/enhancer.py` | ✅ |
+| P3 | 关键 | hybrid_search.search() 同步阻塞 → asyncio.to_thread() 包装 | `tools/knowledge_query.py` | ✅ |
+| P4 | 高 | 每次请求重读 prompt 模板 → __init__ 缓存 | `prompt_builder.py` | ✅ |
+| P5 | 高 | aiosqlite 每次操作新连接 → 持久化 Connection 复用 | 4 个 memory store | ✅ |
+| P6 | 高 | Multi-query 子查询串行 → asyncio.gather() 并行 | `tools/knowledge_query.py` | ✅ |
+| P7 | 中 | 前端每 chunk 全量 Markdown + Math 渲染 → 80ms debounce | `web/app.js` | ✅ |
+| P8 | 中 | after_message hooks 阻塞 SSE 关闭 → asyncio.create_task() 后台 | `agent.py` | ✅ |
+| P9 | 中 | LLM 无显式超时 → httpx.Timeout(120s total, 10s connect) | `llm/openai_service.py` | ✅ |
+| P10 | 低 | 前端 loadConversationList 即时调用 → setTimeout 延迟 | `web/app.js` | ✅ |
+
+### 测试: 11 项全部通过 ✅
+
+详细复习文档: `docs/LATENCY_OPTIMIZATION.md`

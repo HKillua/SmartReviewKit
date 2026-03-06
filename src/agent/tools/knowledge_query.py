@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Optional
 
@@ -121,8 +122,6 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
             if hyde_vector is not None:
                 search_kwargs["query_vector"] = hyde_vector
 
-            # Multi-query: decompose and merge
-            all_results = []
             queries = [effective_query]
             if self._query_enhancer is not None:
                 try:
@@ -132,14 +131,21 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                 except Exception:
                     logger.warning("Multi-query decompose failed")
 
-            for q in queries:
-                results = self._hybrid_search.search(
+            # P3+P6: run searches via asyncio.to_thread to avoid blocking
+            # the event loop, and run sub-queries in parallel.
+            async def _search_one(q: str) -> list:
+                r = await asyncio.to_thread(
+                    self._hybrid_search.search,
                     query=q,
                     top_k=args.top_k,
                     **search_kwargs,
                 )
-                if isinstance(results, list):
-                    all_results.extend(results)
+                return r if isinstance(r, list) else []
+
+            search_results = await asyncio.gather(*[_search_one(q) for q in queries])
+            all_results: list = []
+            for batch in search_results:
+                all_results.extend(batch)
 
             # Deduplicate by chunk_id, keep highest score
             seen: dict[str, Any] = {}

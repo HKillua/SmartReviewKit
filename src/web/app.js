@@ -28,6 +28,30 @@ let conversationId = null;
 let isStreaming = false;
 const USER_ID = 'default_user';
 
+/* P7: debounced rendering — avoid full markdown+math re-render on every tiny chunk */
+let _renderTimer = null;
+let _renderPending = false;
+function scheduleRender(el, content) {
+  _renderPending = true;
+  if (_renderTimer) return;
+  _renderTimer = setTimeout(() => {
+    _renderTimer = null;
+    if (_renderPending) {
+      _renderPending = false;
+      el.innerHTML = renderMarkdown(content);
+      renderMath(el);
+      scrollToBottom();
+    }
+  }, 80);
+}
+function flushRender(el, content) {
+  if (_renderTimer) { clearTimeout(_renderTimer); _renderTimer = null; }
+  _renderPending = false;
+  el.innerHTML = renderMarkdown(content);
+  renderMath(el);
+  scrollToBottom();
+}
+
 // ================================================================
 // THEME
 // ================================================================
@@ -219,9 +243,7 @@ async function sendMessage(overrideMsg) {
               if (currentToolEl) { currentToolEl.remove(); currentToolEl = null; }
               if (!assistantEl) { assistantEl = addMessage('assistant', ''); fullContent = ''; }
               fullContent += event.content || '';
-              assistantEl.innerHTML = renderMarkdown(fullContent);
-              renderMath(assistantEl);
-              scrollToBottom();
+              scheduleRender(assistantEl, fullContent);
               break;
             case 'tool_start':
               removeThinking();
@@ -232,13 +254,14 @@ async function sendMessage(overrideMsg) {
               break;
             case 'done':
               removeThinking();
+              if (assistantEl && fullContent) flushRender(assistantEl, fullContent);
               if (event.metadata?.conversation_id) {
                 conversationId = event.metadata.conversation_id;
               }
               if (event.metadata?.title) {
                 chatTitle.textContent = event.metadata.title;
               }
-              loadConversationList();
+              setTimeout(() => loadConversationList(), 300);
               break;
             case 'error':
               removeThinking();

@@ -45,11 +45,15 @@ _CREATE_SQL = """
 
 
 class ErrorMemory:
-    """SQLite-backed error record store (async via aiosqlite)."""
+    """SQLite-backed error record store (async via aiosqlite).
+
+    Maintains a persistent connection to avoid per-query open/close overhead.
+    """
 
     def __init__(self, db_dir: str = "data/memory") -> None:
         Path(db_dir).mkdir(parents=True, exist_ok=True)
         self._db_path = str(Path(db_dir) / "errors.db")
+        self._conn: Optional[aiosqlite.Connection] = None
         self._init_db_sync()
 
     def _init_db_sync(self) -> None:
@@ -57,14 +61,19 @@ class ErrorMemory:
             conn.execute(_CREATE_SQL)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_err_user ON error_records(user_id)")
 
+    async def _get_conn(self) -> aiosqlite.Connection:
+        if self._conn is None:
+            self._conn = await aiosqlite.connect(self._db_path)
+        return self._conn
+
     async def add_error(self, user_id: str, record: ErrorRecord) -> None:
         record.user_id = user_id
-        async with aiosqlite.connect(self._db_path) as db:
-            await db.execute(
-                "INSERT OR REPLACE INTO error_records (id, user_id, data, mastered, created_at) VALUES (?, ?, ?, ?, ?)",
-                (record.id, user_id, record.model_dump_json(), int(record.mastered), record.created_at.isoformat()),
-            )
-            await db.commit()
+        db = await self._get_conn()
+        await db.execute(
+            "INSERT OR REPLACE INTO error_records (id, user_id, data, mastered, created_at) VALUES (?, ?, ?, ?, ?)",
+            (record.id, user_id, record.model_dump_json(), int(record.mastered), record.created_at.isoformat()),
+        )
+        await db.commit()
 
     async def get_errors(
         self,
@@ -81,9 +90,9 @@ class ErrorMemory:
         query += " ORDER BY created_at DESC LIMIT ?"
         params.append(limit)
 
-        async with aiosqlite.connect(self._db_path) as db:
-            async with db.execute(query, params) as cursor:
-                rows = await cursor.fetchall()
+        db = await self._get_conn()
+        async with db.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
 
         records = [ErrorRecord.model_validate_json(r[0]) for r in rows]
         if topic:
@@ -91,18 +100,18 @@ class ErrorMemory:
         return records
 
     async def mark_mastered(self, error_id: str) -> None:
-        async with aiosqlite.connect(self._db_path) as db:
-            async with db.execute("SELECT data FROM error_records WHERE id = ?", (error_id,)) as cursor:
-                row = await cursor.fetchone()
-            if row:
-                record = ErrorRecord.model_validate_json(row[0])
-                record.mastered = True
-                record.mastered_at = datetime.now()
-                await db.execute(
-                    "UPDATE error_records SET data = ?, mastered = 1 WHERE id = ?",
-                    (record.model_dump_json(), error_id),
-                )
-                await db.commit()
+        db = await self._get_conn()
+        async with db.execute("SELECT data FROM error_records WHERE id = ?", (error_id,)) as cursor:
+            row = await cursor.fetchone()
+        if row:
+            record = ErrorRecord.model_validate_json(row[0])
+            record.mastered = True
+            record.mastered_at = datetime.now()
+            await db.execute(
+                "UPDATE error_records SET data = ?, mastered = 1 WHERE id = ?",
+                (record.model_dump_json(), error_id),
+            )
+            await db.commit()
 
     async def get_weak_concepts(self, user_id: str) -> list[str]:
         errors = await self.get_errors(user_id, mastered=False, limit=200)
@@ -113,4 +122,6 @@ class ErrorMemory:
         return [concept for concept, _ in counter.most_common(20)]
 
     async def close(self) -> None:
-        pass
+        if self._conn is not None:
+            await self._conn.close()
+            self._conn = None

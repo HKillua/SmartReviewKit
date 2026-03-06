@@ -45,23 +45,32 @@ _CREATE_SQL = """
 
 
 class StudentProfileMemory:
-    """SQLite-backed student profile store (async via aiosqlite)."""
+    """SQLite-backed student profile store (async via aiosqlite).
+
+    Maintains a persistent connection to avoid per-query open/close overhead.
+    """
 
     def __init__(self, db_dir: str = "data/memory") -> None:
         Path(db_dir).mkdir(parents=True, exist_ok=True)
         self._db_path = str(Path(db_dir) / "profiles.db")
+        self._conn: Optional[aiosqlite.Connection] = None
         self._init_db_sync()
 
     def _init_db_sync(self) -> None:
         with sqlite3.connect(self._db_path) as conn:
             conn.execute(_CREATE_SQL)
 
+    async def _get_conn(self) -> aiosqlite.Connection:
+        if self._conn is None:
+            self._conn = await aiosqlite.connect(self._db_path)
+        return self._conn
+
     async def get_profile(self, user_id: str) -> StudentProfile:
-        async with aiosqlite.connect(self._db_path) as db:
-            async with db.execute(
-                "SELECT data FROM student_profiles WHERE user_id = ?", (user_id,)
-            ) as cursor:
-                row = await cursor.fetchone()
+        db = await self._get_conn()
+        async with db.execute(
+            "SELECT data FROM student_profiles WHERE user_id = ?", (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
         if row:
             return StudentProfile.model_validate_json(row[0])
         return StudentProfile(user_id=user_id)
@@ -73,13 +82,15 @@ class StudentProfileMemory:
                 setattr(profile, key, value)
         profile.last_active = datetime.now()
 
-        async with aiosqlite.connect(self._db_path) as db:
-            await db.execute(
-                """INSERT OR REPLACE INTO student_profiles (user_id, data, updated_at)
-                   VALUES (?, ?, ?)""",
-                (user_id, profile.model_dump_json(), datetime.now().isoformat()),
-            )
-            await db.commit()
+        db = await self._get_conn()
+        await db.execute(
+            """INSERT OR REPLACE INTO student_profiles (user_id, data, updated_at)
+               VALUES (?, ?, ?)""",
+            (user_id, profile.model_dump_json(), datetime.now().isoformat()),
+        )
+        await db.commit()
 
     async def close(self) -> None:
-        pass
+        if self._conn is not None:
+            await self._conn.close()
+            self._conn = None

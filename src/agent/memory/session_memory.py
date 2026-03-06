@@ -13,6 +13,7 @@ import logging
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import aiosqlite
 from pydantic import BaseModel, Field
@@ -46,11 +47,15 @@ _CREATE_SQL = """
 
 
 class SessionMemory:
-    """SQLite-backed session summary store (async via aiosqlite)."""
+    """SQLite-backed session summary store (async via aiosqlite).
+
+    Maintains a persistent connection to avoid per-query open/close overhead.
+    """
 
     def __init__(self, db_dir: str = "data/memory") -> None:
         Path(db_dir).mkdir(parents=True, exist_ok=True)
         self._db_path = str(Path(db_dir) / "sessions.db")
+        self._conn: Optional[aiosqlite.Connection] = None
         self._init_db_sync()
 
     def _init_db_sync(self) -> None:
@@ -63,30 +68,35 @@ class SessionMemory:
                 "CREATE INDEX IF NOT EXISTS idx_sess_time ON session_summaries(created_at)"
             )
 
+    async def _get_conn(self) -> aiosqlite.Connection:
+        if self._conn is None:
+            self._conn = await aiosqlite.connect(self._db_path)
+        return self._conn
+
     async def save_session(self, user_id: str, summary: SessionSummary) -> None:
         summary.user_id = user_id
-        async with aiosqlite.connect(self._db_path) as db:
-            await db.execute(
-                "INSERT OR REPLACE INTO session_summaries (id, user_id, data, created_at) VALUES (?, ?, ?, ?)",
-                (
-                    summary.session_id,
-                    user_id,
-                    summary.model_dump_json(),
-                    summary.timestamp.isoformat(),
-                ),
-            )
-            await db.commit()
+        db = await self._get_conn()
+        await db.execute(
+            "INSERT OR REPLACE INTO session_summaries (id, user_id, data, created_at) VALUES (?, ?, ?, ?)",
+            (
+                summary.session_id,
+                user_id,
+                summary.model_dump_json(),
+                summary.timestamp.isoformat(),
+            ),
+        )
+        await db.commit()
         logger.debug("Saved session summary %s for user %s", summary.session_id, user_id)
 
     async def get_recent_sessions(
         self, user_id: str, limit: int = 5
     ) -> list[SessionSummary]:
-        async with aiosqlite.connect(self._db_path) as db:
-            async with db.execute(
-                "SELECT data FROM session_summaries WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
-                (user_id, limit),
-            ) as cursor:
-                rows = await cursor.fetchall()
+        db = await self._get_conn()
+        async with db.execute(
+            "SELECT data FROM session_summaries WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+            (user_id, limit),
+        ) as cursor:
+            rows = await cursor.fetchall()
         return [SessionSummary.model_validate_json(r[0]) for r in rows]
 
     async def get_topic_history(
@@ -122,13 +132,15 @@ class SessionMemory:
         return [s for _, s in scored[:limit]]
 
     async def get_session_count(self, user_id: str) -> int:
-        async with aiosqlite.connect(self._db_path) as db:
-            async with db.execute(
-                "SELECT COUNT(*) FROM session_summaries WHERE user_id = ?",
-                (user_id,),
-            ) as cursor:
-                row = await cursor.fetchone()
+        db = await self._get_conn()
+        async with db.execute(
+            "SELECT COUNT(*) FROM session_summaries WHERE user_id = ?",
+            (user_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
         return row[0] if row else 0
 
     async def close(self) -> None:
-        pass
+        if self._conn is not None:
+            await self._conn.close()
+            self._conn = None
