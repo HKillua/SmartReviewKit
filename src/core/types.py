@@ -318,6 +318,8 @@ class RetrievalResult:
         score: Relevance score (higher = more relevant, normalized to [0, 1])
         text: The actual text content of the retrieved chunk
         metadata: Associated metadata (source_path, chunk_index, title, etc.)
+        embedding: Optional cached embedding vector from dense retrieval,
+            reused by MMR to avoid redundant embedding calls.
     
     Example:
         >>> result = RetrievalResult(
@@ -336,6 +338,7 @@ class RetrievalResult:
     score: float
     text: str
     metadata: Dict[str, Any] = field(default_factory=dict)
+    embedding: Optional[List[float]] = field(default=None, repr=False)
     
     def __post_init__(self):
         """Validate fields after initialization."""

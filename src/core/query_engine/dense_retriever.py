@@ -147,13 +147,14 @@ class DenseRetriever:
                     "Check embedding client configuration and connectivity."
                 ) from e
         
-        # Step 2: Query the vector store
+        # Step 2: Query the vector store (include embeddings for MMR reuse)
         try:
             raw_results = self.vector_store.query(
                 vector=query_vector,
                 top_k=effective_top_k,
                 filters=filters,
                 trace=trace,
+                include_embeddings=True,
             )
         except Exception as e:
             raise RuntimeError(
@@ -209,6 +210,7 @@ class DenseRetriever:
         Args:
             raw_results: Raw results from vector store query.
                          Each result should have: id, score, text, metadata.
+                         Optionally includes 'embedding' for MMR reuse.
         
         Returns:
             List of RetrievalResult objects.
@@ -221,6 +223,7 @@ class DenseRetriever:
                     score=float(raw.get('score', 0.0)),
                     text=str(raw.get('text', '')),
                     metadata=raw.get('metadata', {}),
+                    embedding=raw.get('embedding'),
                 )
                 results.append(result)
             except (ValueError, TypeError) as e:

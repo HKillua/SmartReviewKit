@@ -81,8 +81,8 @@ retrieval:
 # Rerank Configuration
 # =============================================================================
 rerank:
-  enabled: false
-  provider: "none"  # Options: none, cross_encoder, llm
+  enabled: true
+  provider: "llm"  # Options: none, cross_encoder, llm
   model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
   top_k: 5
 

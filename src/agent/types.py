@@ -52,6 +52,7 @@ class ToolContext(BaseModel):
     conversation_id: str
     request_id: str = ""
     metadata: dict[str, Any] = Field(default_factory=dict)
+    recent_messages: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ToolResult(BaseModel):

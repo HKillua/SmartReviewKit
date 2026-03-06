@@ -238,12 +238,17 @@ class ChromaStore(BaseVectorStore):
         where_clause = self._build_where_clause(filters) if filters else None
         
         # Perform query
+        include_embeddings = kwargs.get("include_embeddings", False)
+        include_fields = ["metadatas", "distances", "documents"]
+        if include_embeddings:
+            include_fields.append("embeddings")
+
         try:
             results = self.collection.query(
                 query_embeddings=[vector],
                 n_results=top_k,
                 where=where_clause,
-                include=["metadatas", "distances", "documents"]
+                include=include_fields,
             )
         except Exception as e:
             raise RuntimeError(
@@ -259,6 +264,7 @@ class ChromaStore(BaseVectorStore):
             distances = results['distances'][0] if 'distances' in results else [0.0] * len(ids)
             metadatas = results['metadatas'][0] if 'metadatas' in results else [{}] * len(ids)
             documents = results['documents'][0] if 'documents' in results else [''] * len(ids)
+            embeddings = (results.get('embeddings') or [[]])[0] if include_embeddings else [None] * len(ids)
             
             for i, record_id in enumerate(ids):
                 # Convert distance to similarity score
@@ -267,12 +273,15 @@ class ChromaStore(BaseVectorStore):
                 distance = distances[i]
                 score = 1.0 - (distance / 2.0)
                 
-                output.append({
+                record: Dict[str, Any] = {
                     'id': record_id,
-                    'score': max(0.0, score),  # Clamp to [0, 1]
-                    'text': documents[i] if documents[i] else '',  # Include text from documents
-                    'metadata': metadatas[i] if metadatas[i] else {}
-                })
+                    'score': max(0.0, score),
+                    'text': documents[i] if documents[i] else '',
+                    'metadata': metadatas[i] if metadatas[i] else {},
+                }
+                if include_embeddings and i < len(embeddings) and embeddings[i] is not None:
+                    record['embedding'] = embeddings[i]
+                output.append(record)
         
         logger.debug(f"Query returned {len(output)} results")
         return output

@@ -179,10 +179,16 @@ class Agent:
             active_skill=skill_ctx,
         )
 
+        recent_msgs = [
+            {"role": m.role, "content": m.content or ""}
+            for m in conversation.messages[-6:]
+            if m.role in ("user", "assistant") and m.content
+        ]
         tool_ctx = ToolContext(
             user_id=user_id,
             conversation_id=conversation.id,
             request_id=request_id,
+            recent_messages=recent_msgs,
         )
 
         # --- Tool loop ---

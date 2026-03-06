@@ -2666,3 +2666,137 @@ retrieval:
 ### 测试: 11 项全部通过 ✅
 
 详细复习文档: `docs/LATENCY_OPTIMIZATION.md`
+
+---
+
+## Phase Q: RAG 召回策略深度优化 ✅
+
+> 目标：修复 Reranker 接入断线、配置驱动 Query Enhancement 开关、添加对话上下文感知检索、优化 MMR 嵌入复用性能、增强检索质量可观测性。
+
+### Q-Phase 核心优化 ✅
+
+| 编号 | 优先级 | 修复内容 | 文件 | 状态 |
+|------|--------|---------|------|------|
+| Q1 | 关键 | Reranker 接入修复 — `RerankerFactory.create()` 注入 HybridSearch | `server/app.py`, `config/settings.yaml` | ✅ |
+| Q2 | 关键 | 配置驱动 Query Enhancement — 按 settings 开关执行 rewrite/HyDE/multi-query | `tools/knowledge_query.py` | ✅ |
+| Q3 | 高 | 对话上下文感知检索 — conversation_aware_rewrite + ToolContext.recent_messages | `query_enhancer.py`, `types.py`, `agent.py`, `conversation_aware_rewrite.txt` | ✅ |
+| Q4 | 高 | MMR 嵌入复用 — DenseRetriever 返回 embedding，MMR 直接复用避免重复 embed | `core/types.py`, `dense_retriever.py`, `chroma_store.py`, `hybrid_search.py` | ✅ |
+| Q5 | 中 | 检索质量可观测性 — retrieval_summary trace + 离线评估脚本 (Hit Rate/MRR/NDCG) | `hybrid_search.py`, `scripts/eval_retrieval.py`, `data/eval/` | ✅ |
+
+### Q1: Reranker 接入修复
+
+**问题**: Phase M/N 中实现了 `RerankerFactory` 和 `CoreReranker`，但 `app.py._build_hybrid_search()` 未创建和注入 reranker 实例，导致 reranker 始终为 `None`。
+
+**修复**:
+
+变更文件:
+- `src/server/app.py` — 在 `_build_hybrid_search()` 中调用 `RerankerFactory.create(core_settings)` 创建 reranker，传入 `HybridSearch` 构造函数；失败时 warning 降级
+- `config/settings.yaml` — `rerank.enabled: true`, `rerank.provider: "llm"`
+
+数据流:
+```
+_build_hybrid_search()
+  → RerankerFactory.create(settings)  → reranker 实例
+  → HybridSearch(reranker=reranker)
+  → search() 中 _apply_reranker() 实际执行精排
+```
+
+### Q2: 配置驱动 Query Enhancement
+
+**问题**: `KnowledgeQueryTool.execute()` 无条件调用 `rewrite()`、`hyde_embed()`、`decompose()`，即使配置中关闭了相应开关。
+
+**修复**:
+
+变更文件: `src/agent/tools/knowledge_query.py`
+- `__init__` 读取 `settings.retrieval.query_rewrite_enabled / hyde_enabled / multi_query_enabled` 三个布尔标志
+- `execute()` 中按标志条件执行各增强步骤，禁用时直接跳过
+
+```python
+self._rewrite_enabled = bool(getattr(retrieval_cfg, 'query_rewrite_enabled', False))
+self._hyde_enabled = bool(getattr(retrieval_cfg, 'hyde_enabled', False))
+self._multi_query_enabled = bool(getattr(retrieval_cfg, 'multi_query_enabled', False))
+```
+
+### Q3: 对话上下文感知检索
+
+**问题**: 用户多轮对话中使用代词（"它"、"这个协议"），标准 rewrite 无法解析，检索质量下降。
+
+**修复**:
+
+新增文件:
+- `config/prompts/conversation_aware_rewrite.txt` — 对话感知改写 prompt 模板
+
+变更文件:
+- `src/core/query_engine/query_enhancer.py` — 新增 `conversation_aware_rewrite()` 方法，注入最近 6 条对话历史做指代消解
+- `src/agent/types.py` — `ToolContext` 新增 `recent_messages: list[dict[str, Any]]` 字段
+- `src/agent/agent.py` — `chat()` 中提取最近 6 条 user/assistant 消息注入 `ToolContext.recent_messages`
+- `src/agent/tools/knowledge_query.py` — `execute()` 中优先使用 `conversation_aware_rewrite()`，fallback 到标准 `rewrite()`
+
+```python
+if context.recent_messages and len(context.recent_messages) > 1:
+    effective_query = await self._query_enhancer.conversation_aware_rewrite(
+        args.query, context.recent_messages,
+    )
+else:
+    effective_query = await self._query_enhancer.rewrite(args.query)
+```
+
+### Q4: MMR 嵌入复用
+
+**问题**: `_apply_mmr()` 对每个候选 chunk 调用 `embedding_client.embed()`，但 dense retrieval 阶段已计算过这些向量，造成冗余 API 开销。
+
+**修复**:
+
+变更文件:
+- `src/core/types.py` — `RetrievalResult` 新增 `embedding: Optional[List[float]]` 字段（默认 None，repr=False）
+- `src/libs/vector_store/chroma_store.py` — `query()` 新增 `include_embeddings` kwargs，为 `True` 时在 ChromaDB include 列表中加入 `"embeddings"` 并写入 `record['embedding']`
+- `src/core/query_engine/dense_retriever.py` — `retrieve()` 传 `include_embeddings=True`；`_transform_results()` 映射 `raw.get('embedding')` 到 `RetrievalResult`
+- `src/core/query_engine/hybrid_search.py` — `_apply_mmr()` 先检查 `r.embedding is not None`，有缓存则直接复用；仅对无缓存的候选调用 `embed()`
+
+性能收益: 避免 N 次重复 embedding API 调用（N = 候选数量），MMR 阶段 embedding 调用降至 0（dense-only 路径）或极少。
+
+### Q5: 检索质量可观测性
+
+**修复**:
+
+变更文件:
+- `src/core/query_engine/hybrid_search.py` — `search()` 末尾新增 `retrieval_summary` trace 阶段，记录 total_results、score 分布（max/min/mean）、各组件启用状态（reranker/mmr/dedup）
+
+新增文件:
+- `scripts/eval_retrieval.py` — 离线评估 CLI 脚本，计算 Hit Rate、MRR、NDCG@k，支持 `--eval-file`、`--top-k`、`--collection` 参数
+- `data/eval/retrieval_eval_sample.jsonl` — 5 条示例评估数据（TCP 三次握手、HTTP/HTTPS、ARP、OSPF、DNS）
+
+```bash
+python scripts/eval_retrieval.py --eval-file data/eval/retrieval_eval_sample.jsonl --top-k 10
+```
+
+### settings.yaml 关键配置
+
+```yaml
+retrieval:
+  query_rewrite_enabled: true
+  hyde_enabled: false
+  multi_query_enabled: false
+
+rerank:
+  enabled: true
+  provider: "llm"
+  top_k: 5
+```
+
+### 测试: 35 项全部通过 ✅
+
+- 单元测试 (`tests/unit/test_phase_q.py`): 30 项
+  - Q1 Reranker 接入: 3 项
+  - Q2 配置驱动增强: 8 项
+  - Q3 对话感知重写: 8 项
+  - Q4 MMR 嵌入复用: 5 项
+  - Q5 检索可观测性: 6 项
+- 端到端测试 (`tests/e2e/test_phase_q_e2e.py`): 5 项
+  - Reranker 全链路管线
+  - 配置开关切换验证
+  - 对话感知检索全流程
+  - MMR 多样性验证
+  - KnowledgeQueryTool 完整管线
+
+详细复习文档: `docs/RAG_RECALL_OPTIMIZATION.md`

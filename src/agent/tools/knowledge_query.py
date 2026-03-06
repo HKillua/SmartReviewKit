@@ -40,6 +40,13 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
         self._current_collection: Optional[str] = None
         self._embedding_client: Any = None
 
+        retrieval_cfg = None
+        if settings and hasattr(settings, 'retrieval'):
+            retrieval_cfg = settings.retrieval
+        self._rewrite_enabled = bool(getattr(retrieval_cfg, 'query_rewrite_enabled', False))
+        self._hyde_enabled = bool(getattr(retrieval_cfg, 'hyde_enabled', False))
+        self._multi_query_enabled = bool(getattr(retrieval_cfg, 'multi_query_enabled', False))
+
     @property
     def name(self) -> str:
         return "knowledge_query"
@@ -107,14 +114,26 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
             hyde_vector = None
 
             if self._query_enhancer is not None:
-                try:
-                    effective_query = await self._query_enhancer.rewrite(args.query)
-                except Exception:
-                    logger.warning("Query rewrite failed, using original")
-                try:
-                    hyde_vector = await self._query_enhancer.hyde_embed(args.query)
-                except Exception:
-                    logger.warning("HyDE failed, using standard embedding")
+                if self._rewrite_enabled:
+                    try:
+                        if context.recent_messages and len(context.recent_messages) > 1:
+                            effective_query = await self._query_enhancer.conversation_aware_rewrite(
+                                args.query, context.recent_messages,
+                            )
+                            logger.info("Conv-aware rewrite: '%s' -> '%s'", args.query[:40], effective_query[:40])
+                        else:
+                            effective_query = await self._query_enhancer.rewrite(args.query)
+                            logger.info("Query rewrite: '%s' -> '%s'", args.query[:40], effective_query[:40])
+                    except Exception:
+                        logger.warning("Query rewrite failed, using original")
+
+                if self._hyde_enabled:
+                    try:
+                        hyde_vector = await self._query_enhancer.hyde_embed(args.query)
+                        if hyde_vector:
+                            logger.info("HyDE embedding generated for query")
+                    except Exception:
+                        logger.warning("HyDE failed, using standard embedding")
 
             search_kwargs: dict[str, Any] = {}
             if args.content_type:
@@ -123,11 +142,12 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                 search_kwargs["query_vector"] = hyde_vector
 
             queries = [effective_query]
-            if self._query_enhancer is not None:
+            if self._query_enhancer is not None and self._multi_query_enabled:
                 try:
                     sub_queries = await self._query_enhancer.decompose(args.query)
                     if len(sub_queries) > 1:
                         queries = sub_queries
+                        logger.info("Multi-query decomposed into %d sub-queries", len(queries))
                 except Exception:
                     logger.warning("Multi-query decompose failed")
 

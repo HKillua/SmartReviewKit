@@ -49,6 +49,18 @@ _DEFAULT_MULTI_QUERY_PROMPT = (
     "子查询："
 )
 
+_DEFAULT_CONV_REWRITE_PROMPT = (
+    "你是一个信息检索专家。请根据对话上下文，将用户最新的问题改写为一个完整、独立的检索查询。\n"
+    "要求：\n"
+    '1. 解析代词和省略语（如"它"、"这个"、"那个协议"），用对话中提到的具体概念替换\n'
+    "2. 如果用户的问题是前一个话题的延续，补充必要的上下文关键词\n"
+    "3. 保留原始查询意图，去掉口语化表述\n"
+    "4. 只输出改写后的查询，不要加任何解释\n\n"
+    "对话历史：\n{history}\n\n"
+    "用户最新问题：{query}\n"
+    "改写后的查询："
+)
+
 
 def _load_prompt(path: str, fallback: str) -> str:
     p = Path(path)
@@ -67,12 +79,14 @@ class QueryEnhancer:
         rewrite_prompt_path: str = "config/prompts/query_rewrite.txt",
         hyde_prompt_path: str = "config/prompts/hyde.txt",
         multi_query_prompt_path: str = "config/prompts/multi_query.txt",
+        conv_rewrite_prompt_path: str = "config/prompts/conversation_aware_rewrite.txt",
     ) -> None:
         self._llm = llm_service
         self._embed_fn = embedding_fn
         self._rewrite_prompt = _load_prompt(rewrite_prompt_path, _DEFAULT_REWRITE_PROMPT)
         self._hyde_prompt = _load_prompt(hyde_prompt_path, _DEFAULT_HYDE_PROMPT)
         self._multi_query_prompt = _load_prompt(multi_query_prompt_path, _DEFAULT_MULTI_QUERY_PROMPT)
+        self._conv_rewrite_prompt = _load_prompt(conv_rewrite_prompt_path, _DEFAULT_CONV_REWRITE_PROMPT)
 
     @property
     def llm_service(self) -> Any:
@@ -100,6 +114,44 @@ class QueryEnhancer:
                 return rewritten
         except Exception as exc:
             logger.warning("Query rewrite failed, using original: %s", exc)
+        return query
+
+    # ------------------------------------------------------------------
+    # Conversation-Aware Rewrite
+    # ------------------------------------------------------------------
+
+    async def conversation_aware_rewrite(
+        self, query: str, history: List[dict],
+    ) -> str:
+        """Rewrite *query* using recent conversation history for coreference resolution.
+
+        Resolves pronouns like "it", "this protocol" by examining prior turns.
+        Falls back to plain *query* when LLM is unavailable or history is empty.
+        """
+        if self._llm is None or not history:
+            return query
+        try:
+            turns: List[str] = []
+            for msg in history[-6:]:
+                role = msg.get("role", "user")
+                content = (msg.get("content") or "")[:200]
+                turns.append(f"{role}: {content}")
+            history_text = "\n".join(turns)
+            prompt = (
+                self._conv_rewrite_prompt
+                .replace("{history}", history_text)
+                .replace("{query}", query)
+            )
+            messages = [{"role": "user", "content": prompt}]
+            response = await self._llm.chat(messages)
+            rewritten = response.content.strip().strip('"').strip("'")
+            if rewritten:
+                logger.debug(
+                    "Conv-aware rewrite: '%s' -> '%s'", query[:40], rewritten[:40],
+                )
+                return rewritten
+        except Exception as exc:
+            logger.warning("Conversation-aware rewrite failed: %s", exc)
         return query
 
     # ------------------------------------------------------------------

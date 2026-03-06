@@ -324,6 +324,20 @@ class HybridSearch:
         
         # Step 10: Limit to top_k
         final_results = fused_results[:effective_top_k]
+
+        # Record retrieval quality summary for observability
+        if trace is not None and final_results:
+            scores = [r.score for r in final_results]
+            trace.record_stage("retrieval_summary", {
+                "total_results": len(final_results),
+                "score_max": round(max(scores), 4),
+                "score_min": round(min(scores), 4),
+                "score_mean": round(sum(scores) / len(scores), 4),
+                "reranker_used": self.config.rerank_enabled and self.reranker is not None,
+                "mmr_used": self.config.mmr_enabled,
+                "dedup_used": self.config.post_dedup_enabled,
+                "pipeline": "dense+sparse+rrf",
+            })
         
         logger.debug(f"HybridSearch: returning {len(final_results)} results")
         
@@ -742,15 +756,30 @@ class HybridSearch:
         top_k: int,
         trace: Optional[Any],
     ) -> List[RetrievalResult]:
-        """Apply MMR diversity reranking."""
+        """Apply MMR diversity reranking, reusing cached embeddings when available."""
         if not results or self.embedding_client is None:
             return results
         try:
             from src.core.query_engine.mmr import mmr_rerank
             _t0 = time.monotonic()
             q_vecs = self.embedding_client.embed([query])
-            c_texts = [r.text for r in results]
-            c_vecs = self.embedding_client.embed(c_texts) if c_texts else []
+
+            cached_count = 0
+            c_vecs: List[List[float]] = []
+            texts_to_embed: List[tuple[int, str]] = []
+            for i, r in enumerate(results):
+                if r.embedding is not None:
+                    c_vecs.append(r.embedding)
+                    cached_count += 1
+                else:
+                    c_vecs.append([])
+                    texts_to_embed.append((i, r.text))
+
+            if texts_to_embed:
+                new_vecs = self.embedding_client.embed([t for _, t in texts_to_embed])
+                for (idx, _), vec in zip(texts_to_embed, new_vecs):
+                    c_vecs[idx] = vec
+
             mmr_results = mmr_rerank(
                 query_embedding=q_vecs[0],
                 candidates=results,
@@ -764,8 +793,10 @@ class HybridSearch:
                     "lambda": self.config.mmr_lambda,
                     "input_count": len(results),
                     "output_count": len(mmr_results),
+                    "cached_embeddings": cached_count,
                 }, elapsed_ms=_elapsed)
-            logger.debug("MMR: %d -> %d results", len(results), len(mmr_results))
+            logger.debug("MMR: %d -> %d results (reused %d cached embeddings)",
+                         len(results), len(mmr_results), cached_count)
             return mmr_results
         except Exception as exc:
             logger.warning("MMR failed, returning original order: %s", exc)

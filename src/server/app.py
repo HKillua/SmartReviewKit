@@ -57,14 +57,16 @@ def _build_hybrid_search(collection: str = "computer_network") -> tuple:
     """Build a shared HybridSearch instance and return (hybrid, embedding, query_enhancer)."""
     from src.core.settings import load_settings as load_core_settings, resolve_path
     from src.core.query_engine.query_processor import QueryProcessor
-    from src.core.query_engine.hybrid_search import create_hybrid_search
+    from src.core.query_engine.hybrid_search import HybridSearch
     from src.core.query_engine.dense_retriever import create_dense_retriever
     from src.core.query_engine.sparse_retriever import create_sparse_retriever
+    from src.core.query_engine.fusion import RRFFusion
     from src.core.query_engine.query_enhancer import QueryEnhancer
     from src.ingestion.storage.bm25_indexer import BM25Indexer
     from src.libs.embedding.embedding_factory import EmbeddingFactory
     from src.libs.embedding.cached_embedding import CachedEmbedding
     from src.libs.vector_store.vector_store_factory import VectorStoreFactory
+    from src.libs.reranker.reranker_factory import RerankerFactory
 
     core_settings = load_core_settings()
     raw_embedding = EmbeddingFactory.create(core_settings)
@@ -89,11 +91,23 @@ def _build_hybrid_search(collection: str = "computer_network") -> tuple:
     )
     sparse.default_collection = collection
 
-    hybrid = create_hybrid_search(
+    rrf_k = getattr(retrieval_cfg, 'rrf_k', 60) if retrieval_cfg else 60
+    fusion = RRFFusion(k=rrf_k)
+
+    reranker = None
+    try:
+        reranker = RerankerFactory.create(core_settings)
+        logger.info("Reranker created: %s", type(reranker).__name__)
+    except Exception as exc:
+        logger.warning("Reranker creation failed, reranking disabled: %s", exc)
+
+    hybrid = HybridSearch(
         settings=core_settings,
         query_processor=QueryProcessor(),
         dense_retriever=dense,
         sparse_retriever=sparse,
+        fusion=fusion,
+        reranker=reranker,
     )
     hybrid.embedding_client = embedding
 
@@ -101,7 +115,8 @@ def _build_hybrid_search(collection: str = "computer_network") -> tuple:
         embedding_fn=lambda texts: embedding.embed(texts),
     )
 
-    logger.info("Shared HybridSearch built for collection: %s (embedding cache=%d)", collection, cache_size)
+    logger.info("Shared HybridSearch built for collection: %s (reranker=%s, embedding cache=%d)",
+                collection, type(reranker).__name__ if reranker else "None", cache_size)
     return hybrid, embedding, query_enhancer
 
 
