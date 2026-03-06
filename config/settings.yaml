@@ -174,6 +174,42 @@ memory:
   compaction_threshold_messages: 30  # 超过此消息数时触发压缩
 
 # =============================================================================
+# Routing Configuration (Adaptive Retrieval Router)
+# =============================================================================
+routing:
+  enabled: true
+  mode: "hybrid"          # rule / hybrid / embedding (hybrid = 规则优先 + embedding 兜底)
+  fallback_to_llm: true   # RAG 无结果时是否 fallback 到纯 LLM
+  embedding_threshold: 0.75  # Layer 2 embedding cosine 相似度阈值
+
+# =============================================================================
+# Semantic Cache Configuration
+# =============================================================================
+semantic_cache:
+  enabled: true
+  similarity_threshold: 0.92   # 余弦相似度阈值，越高越严格
+  ttl_seconds: 3600            # 缓存过期时间 (秒)
+  max_size: 500                # 最大缓存条目数 (LRU 淘汰)
+
+# =============================================================================
+# Self-Reflection (Anti-Hallucination)
+# =============================================================================
+reflection:
+  enabled: true
+  mode: "rule"                 # rule (词汇重叠) / llm (LLM 判断)
+  groundedness_threshold: 0.3  # 低于此值追加 warning
+  append_warning: true
+
+# =============================================================================
+# Security Guardrails
+# =============================================================================
+guardrails:
+  enabled: true
+  input_filtering: true        # 增强 prompt injection 检测
+  output_redaction: true       # 输出敏感信息脱敏
+  block_on_high_risk: true     # 高风险输入直接拦截
+
+# =============================================================================
 # Conflict Detection Configuration
 # =============================================================================
 conflict_detection:

@@ -14,6 +14,12 @@ _INJECTION_PATTERNS = [
     re.compile(r"you\s+are\s+now\s+a", re.IGNORECASE),
     re.compile(r"(act|pretend|roleplay)\s+(as|like)", re.IGNORECASE),
     re.compile(r"(输出|打印|显示|泄露).{0,10}(系统|system).{0,10}(提示|prompt)", re.IGNORECASE),
+    re.compile(r"DAN\s+mode|Do\s+Anything\s+Now", re.IGNORECASE),
+    re.compile(r"jailbreak|越狱|解除限制", re.IGNORECASE),
+    re.compile(r"developer\s+mode\s+(enabled|on|activate)", re.IGNORECASE),
+    re.compile(r"(?:from\s+now\s+on|以后).{0,20}(?:you\s+are|你是|act\s+as)", re.IGNORECASE),
+    re.compile(r"(?:base64|b64)\s*[:：(（]\s*[A-Za-z0-9+/=]{20,}", re.IGNORECASE),
+    re.compile(r"repeat\s+(?:the\s+)?(?:above|system|initial)\s+(?:text|prompt|instructions?)", re.IGNORECASE),
 ]
 
 

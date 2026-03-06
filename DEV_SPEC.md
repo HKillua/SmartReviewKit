@@ -3186,3 +3186,244 @@ if self._conflict_detector and len(results) > 1:
 **修改 (集成):**
 - `src/agent/tools/knowledge_query.py` — 集成 ConflictDetector
 - `config/settings.yaml` — 新增 conflict_detection 配置段
+
+---
+
+## Phase U: 多源文档支持 + 自适应检索路由
+
+### 目标
+
+支持三种文档类型（题库 / PPT 课件 / 讲义教材）的差异化入库和检索。入库时自动识别文档类型并使用对应分块策略；检索时根据用户意图路由到最优检索策略，QuizGenerator 支持题库直接复用 + LLM fallback。
+
+### 架构
+
+```
+IngestionPipeline.run(file_path, source_type="auto")
+  → 自动推断 source_type (slide / textbook / question_bank)
+  → question_bank → QuestionParser 原子分块
+  → slide        → 按页/slide 分块 (当前逻辑)
+  → textbook     → 增大 chunk_size 语义分块
+
+KnowledgeQueryTool / QuizGeneratorTool
+  → QueryRouter.route(query) → RoutingDecision
+  → 按 intent 选择 source_type filter + 检索策略
+  → QuizGenerator: 题库优先 → RAG 生成 → 纯 LLM fallback
+```
+
+### U1: Source-Aware Ingestion
+
+变更文件: `src/ingestion/pipeline.py`
+
+`IngestionPipeline.run()` 增加 `source_type` 参数 (`"auto"` | `"slide"` | `"textbook"` | `"question_bank"`)。`"auto"` 模式下根据文件名和扩展名推断类型。所有 chunk 的 metadata 统一注入 `source_type` 字段，用于后续检索过滤。
+
+### U2: QuestionParser 题库解析器
+
+新增文件: `src/ingestion/transform/question_parser.py`
+
+识别题目边界（"第X题"、序号、编号列表），将每道题解析为原子 chunk，提取结构化字段 (question, options, answer, explanation, difficulty) 到 metadata。跳过常规分块流程，避免题目被拆散。
+
+### U3: DocumentChunker 分块策略切换
+
+变更文件: `src/ingestion/chunking/document_chunker.py`
+
+`split_document()` 接受 `source_type` 参数，`question_bank` 类型跳过常规分块（由 QuestionParser 处理），`textbook` 类型使用更大的 chunk_size (1500) 和 overlap (300)。
+
+### U4: QueryRouter 自适应检索路由 (双层架构)
+
+新增文件: `src/core/query_engine/query_router.py`
+
+**双层意图分类架构:**
+
+```
+Layer 1 (Rule): 正则关键词快速匹配 (<1ms)
+  → 命中 → 直接返回 RoutingDecision (confidence=1.0, method="rule")
+  → 未命中 → 进入 Layer 2
+
+Layer 2 (Embedding): 向量 cosine 相似度分类 (+10-30ms)
+  → 预计算 32 条 prototype query 的 embedding (init 时一次性成本)
+  → 运行时: embed(query) → cosine(query_vec, prototypes) → 取 max
+  → max_sim >= threshold (0.75) → 返回 RoutingDecision (confidence=sim, method="embedding")
+  → max_sim < threshold → 回退默认 DEEP_UNDERSTANDING (method="default")
+```
+
+定义 `QueryIntent` 枚举 (QUIZ_REQUEST / CONCEPT_REVIEW / DEEP_UNDERSTANDING / GENERAL_CHAT) 和 `RoutingDecision` 数据类 (新增 `confidence` 和 `match_method` 字段)。
+
+**Embedding 层的 prototype 设计:** 每个意图预定义 8 条代表性查询作为 anchor，覆盖中英文、不同表述方式。`embedding_fn` 复用 `CachedEmbedding.embed`，零额外依赖。初始化失败时自动降级为纯规则模式。
+
+配置: `settings.yaml` → `routing.mode: "hybrid"`, `routing.embedding_threshold: 0.75`
+
+### U5: QuizGenerator 改造
+
+变更文件: `src/agent/tools/quiz_generator.py`
+
+三级检索策略：
+1. 先查题库 (`source_type=question_bank`)，有现成题则直接返回
+2. 查课件/讲义生成新题
+3. 无 RAG 结果时 fallback 到纯 LLM 出题（不再返回"未找到"）
+
+### U6: 配置与接入
+
+变更文件: `config/settings.yaml`, `src/server/app.py`
+
+新增 `routing` 配置段和 `ingestion.source_type_map` 目录映射。`app.py` 中创建 `QueryRouter` 并注入到 `KnowledgeQueryTool` 和 `QuizGeneratorTool`。`_auto_ingest()` 支持按目录名推断 source_type。
+
+### 文件清单
+
+**新增:**
+- `src/ingestion/transform/question_parser.py` — QuestionParser 题库解析器
+- `src/core/query_engine/query_router.py` — QueryRouter 自适应路由
+
+**修改:**
+- `src/ingestion/pipeline.py` — run() 增加 source_type + metadata 注入
+- `src/ingestion/chunking/document_chunker.py` — 按 source_type 切换策略
+- `src/agent/tools/quiz_generator.py` — 题库优先 + LLM fallback
+- `src/agent/tools/knowledge_query.py` — 集成 QueryRouter
+- `src/server/app.py` — 创建注入 QueryRouter
+- `config/settings.yaml` — routing + source_type_map 配置
+
+---
+
+## Phase V: 语义缓存 (Semantic Cache)
+
+### 目标
+
+基于查询嵌入的语义缓存，相似查询直接返回缓存结果，减少重复 RAG 检索和 LLM 调用。新文档入库时自动失效对应缓存。
+
+### 架构
+
+```
+KnowledgeQueryTool.execute()
+  → SemanticCache.get(query)        ← 命中则直接返回
+  → HybridSearch.search(...)        ← 未命中走正常流程
+  → SemanticCache.put(query, result) ← 缓存结果
+
+DocumentIngestTool.execute()
+  → pipeline.run(...)
+  → SemanticCache.invalidate_by_collection(collection)  ← 新文档入库失效缓存
+```
+
+### 文件清单
+
+**新增:**
+- `src/core/cache/__init__.py`
+- `src/core/cache/semantic_cache.py` — SemanticCache (cosine 相似度 + TTL + LRU)
+
+**修改:**
+- `src/agent/tools/knowledge_query.py` — 检索前查缓存 / 检索后写缓存
+- `src/agent/tools/document_ingest.py` — 入库后失效缓存
+- `src/server/app.py` — 创建注入 SemanticCache
+- `config/settings.yaml` — semantic_cache 配置段
+
+---
+
+## Phase W: 自我反思 (Self-Reflection Anti-Hallucination)
+
+### 目标
+
+作为 LlmMiddleware，在 LLM 响应后检查回答是否有 RAG 上下文支撑。如果检测到可能的幻觉（回答和检索内容重叠度低），自动追加不确定性提示。
+
+### 架构
+
+```
+Agent._tool_loop()
+  → LLM 返回 response
+  → ReflectionMiddleware.after_llm_response(request, response)
+    → 提取 request.messages 中最近的 tool result (RAG 上下文)
+    → 计算 response 与 RAG 上下文的 groundedness 分数
+    → 低于阈值 → 追加 warning 提示到 response.content
+```
+
+### 文件清单
+
+**新增:**
+- `src/agent/hooks/reflection.py` — ReflectionMiddleware
+
+**修改:**
+- `src/server/app.py` — 注册到 llm_middlewares 列表
+- `config/settings.yaml` — reflection 配置段
+
+---
+
+## Phase X: 安全防护增强 (Security Guardrails)
+
+### 目标
+
+强化输入输出安全防护，增加 DAN/jailbreak/base64 注入检测，输出端敏感信息脱敏。作为 LifecycleHook 在 hooks 链最前端运行。
+
+### 架构
+
+```
+GuardrailsHook (LifecycleHook)
+  → before_message: 增强 prompt injection 检测 + 风险评估
+  → after_message: 输出敏感信息脱敏 (API key / 密码 / 个人信息)
+```
+
+### 文件清单
+
+**新增:**
+- `src/agent/hooks/guardrails.py` — GuardrailsHook
+
+**修改:**
+- `src/agent/utils/sanitizer.py` — 扩展注入检测模式
+- `src/server/app.py` — 注册到 hooks 列表最前端
+- `config/settings.yaml` — guardrails 配置段
+
+---
+
+## Phase U-X 实施记录
+
+### 测试统计
+
+| 类别 | 文件 | 测试数 | 状态 |
+|------|------|--------|------|
+| Phase U 单元测试 | `tests/unit/test_phase_u.py` | 30 | ✅ PASS |
+| Phase V 单元测试 | `tests/unit/test_phase_v.py` | 9 | ✅ PASS |
+| Phase W 单元测试 | `tests/unit/test_phase_w.py` | 8 | ✅ PASS |
+| Phase X 单元测试 | `tests/unit/test_phase_x.py` | 15 | ✅ PASS |
+| Phase U-X E2E 测试 | `tests/e2e/test_phase_uvwx_e2e.py` | 7 | ✅ PASS |
+| **合计** | | **69** | **✅ 全部通过** |
+
+### 新增文件清单
+
+- `src/ingestion/transform/question_parser.py` — 题库解析器 (QuestionParser)，支持中/英文题目边界识别，结构化字段提取 (question/options/answer/explanation/difficulty)
+- `src/core/query_engine/query_router.py` — 自适应检索路由 (QueryRouter)，双层架构 (规则快速路径 + Embedding 向量分类)，4 种意图 + 32 条 prototype embedding + cosine 匹配
+- `src/core/cache/__init__.py` — 缓存模块初始化
+- `src/core/cache/semantic_cache.py` — 语义缓存 (SemanticCache)，cosine 相似度 + TTL + LRU + 按 collection 失效
+- `src/agent/hooks/reflection.py` — 自我反思中间件 (ReflectionMiddleware)，词汇重叠 groundedness 检查
+- `src/agent/hooks/guardrails.py` — 安全防护 Hook (GuardrailsHook)，DAN/jailbreak/base64 注入检测 + 输出脱敏
+- `tests/unit/test_phase_u.py` — Phase U 单元测试 (30 cases，含 10 条 Embedding Router 测试)
+- `tests/unit/test_phase_v.py` — Phase V 单元测试 (9 cases)
+- `tests/unit/test_phase_w.py` — Phase W 单元测试 (8 cases)
+- `tests/unit/test_phase_x.py` — Phase X 单元测试 (15 cases)
+- `tests/e2e/test_phase_uvwx_e2e.py` — Phase U-X E2E 测试 (7 cases)
+
+### 修改文件清单
+
+- `src/ingestion/pipeline.py` — 新增 `infer_source_type()` 类方法，`run()` 增加 `source_type` 参数，question_bank 走 QuestionParser 分支，所有 chunk 注入 source_type metadata
+- `src/ingestion/chunking/document_chunker.py` — `split_document()` 增加 `source_type` 参数，新增 `_split_textbook()` 方法 (chunk_size=1500, overlap=300)
+- `src/agent/tools/quiz_generator.py` — 三级检索策略 (题库优先 → RAG 生成 → 纯 LLM fallback)，接受 `query_router` 注入
+- `src/agent/tools/knowledge_query.py` — 集成 QueryRouter (意图路由 + source_type 过滤) + SemanticCache (读/写)
+- `src/agent/tools/document_ingest.py` — 入库成功后调用 `SemanticCache.invalidate_by_collection()`
+- `src/agent/utils/sanitizer.py` — 新增 6 条注入检测模式 (DAN/jailbreak/base64/role chain/repeat system)
+- `src/server/app.py` — 创建并注入 QueryRouter、SemanticCache、ReflectionMiddleware、GuardrailsHook；auto_ingest 按 source_type 推断
+- `config/settings.yaml` — 新增 routing / semantic_cache / reflection / guardrails 四个配置段
+
+### 集成验证
+
+所有新模块均已在 `app.py` 中完成注入，不存在"做了模块但没用到"的情况：
+
+| 模块 | 注入位置 | 被谁使用 |
+|------|----------|----------|
+| QueryRouter | `app.py` → `KnowledgeQueryTool`, `QuizGeneratorTool` | 双层意图路由 (rule + embedding) + source_type 过滤 |
+| SemanticCache | `app.py` → `KnowledgeQueryTool`, `DocumentIngestTool` | 缓存读写 + 入库失效 |
+| ReflectionMiddleware | `app.py` → `llm_middlewares` 列表 | LLM 响应后 groundedness 检查 |
+| GuardrailsHook | `app.py` → `hooks` 列表 (首位) | 输入注入检测 + 输出脱敏 |
+| QuestionParser | `pipeline.py` 内部调用 | question_bank 类型文档原子分块 |
+
+### 冲突防护
+
+- 所有新参数均使用可选 + 默认值设计 (如 `source_type="auto"`, `query_router=None`)，不影响已有调用
+- 配置项全部有 `enabled` 开关，可通过 YAML 快速禁用
+- SemanticCache 和 QueryRouter 的 None 检查确保未启用时零影响
+- QueryRouter Embedding 层初始化失败时自动降级为纯规则模式，不影响系统可用性
+- `routing.mode` 支持 `"hybrid"` (规则 + embedding) / `"rule"` (纯规则)，`embedding_threshold` 控制分类严格度

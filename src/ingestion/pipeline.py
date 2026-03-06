@@ -220,11 +220,31 @@ class IngestionPipeline:
         
         logger.info("Pipeline initialization complete!")
     
+    # ------------------------------------------------------------------
+    # source_type inference
+    # ------------------------------------------------------------------
+
+    _QB_KEYWORDS = {"题", "习题", "exercise", "exam", "quiz", "test", "题库", "练习"}
+
+    @classmethod
+    def infer_source_type(cls, file_path: Path) -> str:
+        """Infer ``source_type`` from file name and extension.
+
+        Returns one of ``"slide"`` | ``"textbook"`` | ``"question_bank"``.
+        """
+        name_lower = file_path.stem.lower()
+        if any(kw in name_lower for kw in cls._QB_KEYWORDS):
+            return "question_bank"
+        if file_path.suffix.lower() == ".pptx":
+            return "slide"
+        return "textbook"
+
     def run(
         self,
         file_path: str,
         trace: Optional[TraceContext] = None,
         on_progress: Optional[Callable[[str, int, int], None]] = None,
+        source_type: str = "auto",
     ) -> PipelineResult:
         """Execute the full ingestion pipeline on a file.
         
@@ -243,13 +263,16 @@ class IngestionPipeline:
         stages: Dict[str, Any] = {}
         _total_stages = 6
 
+        if source_type == "auto":
+            source_type = self.infer_source_type(file_path)
+
         def _notify(stage_name: str, step: int) -> None:
             if on_progress is not None:
                 on_progress(stage_name, step, _total_stages)
         
         logger.info(f"=" * 60)
         logger.info(f"Starting Ingestion Pipeline for: {file_path}")
-        logger.info(f"Collection: {self.collection}")
+        logger.info(f"Collection: {self.collection} | source_type: {source_type}")
         logger.info(f"=" * 60)
         
         try:
@@ -324,7 +347,23 @@ class IngestionPipeline:
             _notify("split", 3)
             
             _t0 = time.monotonic()
-            chunks = self.chunker.split_document(document)
+
+            if source_type == "question_bank":
+                from src.ingestion.transform.question_parser import QuestionParser
+                qp = QuestionParser()
+                parsed = qp.parse(document.text)
+                if parsed:
+                    chunks = qp.to_chunks(parsed, source_path=str(file_path), doc_id=document.id)
+                    logger.info(f"  QuestionParser: {len(chunks)} questions extracted")
+                else:
+                    chunks = self.chunker.split_document(document, source_type=source_type)
+                    logger.info("  QuestionParser found no questions, falling back to chunker")
+            else:
+                chunks = self.chunker.split_document(document, source_type=source_type)
+
+            for c in chunks:
+                c.metadata.setdefault("source_type", source_type)
+
             _elapsed = (time.monotonic() - _t0) * 1000.0
             
             logger.info(f"  Chunks generated: {len(chunks)}")

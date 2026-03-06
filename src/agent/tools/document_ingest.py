@@ -23,10 +23,17 @@ class DocumentIngestArgs(BaseModel):
 class DocumentIngestTool(Tool[DocumentIngestArgs]):
     """Ingest a PDF or PPTX file into the knowledge base via IngestionPipeline."""
 
-    def __init__(self, settings: Any = None, pipeline: Any = None, allowed_dirs: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        settings: Any = None,
+        pipeline: Any = None,
+        allowed_dirs: list[str] | None = None,
+        semantic_cache: Any = None,
+    ) -> None:
         self._settings = settings
         self._pipeline = pipeline
         self._allowed_dirs = allowed_dirs or ["data/uploads", "docs"]
+        self._semantic_cache = semantic_cache
 
     @property
     def name(self) -> str:
@@ -75,6 +82,12 @@ class DocumentIngestTool(Tool[DocumentIngestArgs]):
             result = await asyncio.to_thread(pipeline.run, str(path))
 
             if result.success:
+                if self._semantic_cache is not None:
+                    try:
+                        self._semantic_cache.invalidate_by_collection(args.collection)
+                    except Exception:
+                        logger.debug("Semantic cache invalidation failed", exc_info=True)
+
                 return ToolResult(
                     success=True,
                     result_for_llm=(

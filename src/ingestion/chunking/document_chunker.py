@@ -37,14 +37,46 @@ class DocumentChunker:
             self._parent_size = int(raw.get("parent_chunk_size", 2400))
             self._parent_overlap = int(raw.get("parent_chunk_overlap", 200))
 
-    def split_document(self, document: Document) -> List[Chunk]:
+    def split_document(
+        self, document: Document, source_type: str = "slide",
+    ) -> List[Chunk]:
         if not document.text or not document.text.strip():
             raise ValueError(f"Document {document.id} has no text content to split")
+
+        if source_type == "textbook":
+            return self._split_textbook(document)
 
         if self._parent_child:
             return self._split_with_parent_child(document)
 
         return self._split_flat(document)
+
+    # ------------------------------------------------------------------
+    # Textbook splitting (larger chunks for dense lecture notes)
+    # ------------------------------------------------------------------
+
+    def _split_textbook(self, document: Document) -> List[Chunk]:
+        try:
+            from langchain_text_splitters import RecursiveCharacterTextSplitter
+            tb_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1500,
+                chunk_overlap=300,
+                separators=["\n\n---\n\n", "\n\n", "\n", ". ", " "],
+            )
+            text_fragments = tb_splitter.split_text(document.text)
+        except ImportError:
+            text_fragments = self._splitter.split_text(document.text)
+
+        if not text_fragments:
+            raise ValueError(f"Splitter returned no chunks for document {document.id}")
+
+        chunks: List[Chunk] = []
+        for index, text in enumerate(text_fragments):
+            chunk_id = self._generate_chunk_id(document.id, index, text)
+            chunk_metadata = self._inherit_metadata(document, index, text)
+            chunk_metadata["source_type"] = "textbook"
+            chunks.append(Chunk(id=chunk_id, text=text, metadata=chunk_metadata))
+        return chunks
 
     # ------------------------------------------------------------------
     # Flat splitting (original behaviour)

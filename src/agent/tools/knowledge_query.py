@@ -32,12 +32,16 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
         reranker: Any = None,
         query_enhancer: Any = None,
         conflict_detector: Any = None,
+        query_router: Any = None,
+        semantic_cache: Any = None,
     ) -> None:
         self._settings = settings
         self._hybrid_search = hybrid_search
         self._reranker = reranker
         self._query_enhancer = query_enhancer
         self._conflict_detector = conflict_detector
+        self._query_router = query_router
+        self._semantic_cache = semantic_cache
         self._initialized = hybrid_search is not None
         self._current_collection: Optional[str] = None
         self._embedding_client: Any = None
@@ -111,6 +115,33 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
 
     async def execute(self, context: ToolContext, args: KnowledgeQueryArgs) -> ToolResult:
         try:
+            # --- Adaptive routing ---
+            routing = None
+            if self._query_router is not None:
+                try:
+                    routing = self._query_router.route(args.query, context.recent_messages)
+                    if not routing.need_rag:
+                        return ToolResult(
+                            success=True,
+                            result_for_llm="该问题不需要知识库检索，请直接回答用户。",
+                            metadata={"routed_intent": routing.intent.value},
+                        )
+                except Exception:
+                    logger.warning("QueryRouter failed, using default retrieval", exc_info=True)
+
+            # --- Semantic cache lookup ---
+            if self._semantic_cache is not None:
+                try:
+                    cached = await self._semantic_cache.get(args.query)
+                    if cached is not None:
+                        return ToolResult(
+                            success=True,
+                            result_for_llm=cached.result + "\n\n_(来自语义缓存)_",
+                            metadata={"cache_hit": True},
+                        )
+                except Exception:
+                    logger.debug("Semantic cache lookup failed", exc_info=True)
+
             async with self._init_lock:
                 self._ensure_initialized(args.collection)
 
@@ -142,6 +173,10 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
             search_kwargs: dict[str, Any] = {}
             if args.content_type:
                 search_kwargs["filters"] = {"content_type": args.content_type}
+            elif routing is not None and routing.preferred_sources:
+                route_filter = routing.to_metadata_filter()
+                if route_filter:
+                    search_kwargs.setdefault("filters", {}).update(route_filter)
             if hyde_vector is not None:
                 search_kwargs["query_vector"] = hyde_vector
 
@@ -217,6 +252,15 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
             result_text = "\n".join(lines)
             if conflict_section:
                 result_text += "\n" + conflict_section
+
+            if self._semantic_cache is not None:
+                try:
+                    await self._semantic_cache.put(
+                        args.query, result_text, {"collection": args.collection},
+                    )
+                except Exception:
+                    logger.debug("Semantic cache write failed", exc_info=True)
+
             return ToolResult(success=True, result_for_llm=result_text)
 
         except Exception as exc:

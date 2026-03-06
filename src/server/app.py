@@ -145,12 +145,14 @@ def _auto_ingest(ingest_dir: str, collection: str) -> None:
 
     try:
         for f in files:
-            result = pipeline.run(str(f))
+            from src.ingestion.pipeline import IngestionPipeline as _IP
+            src_type = _IP.infer_source_type(f)
+            result = pipeline.run(str(f), source_type=src_type)
             if result.success:
                 if result.stages.get("integrity", {}).get("skipped"):
                     logger.info("  ⏭ %s — already ingested", f.name)
                 else:
-                    logger.info("  ✓ %s — %d chunks", f.name, result.chunk_count)
+                    logger.info("  ✓ %s — %d chunks (source_type=%s)", f.name, result.chunk_count, src_type)
             else:
                 logger.error("  ✗ %s — %s", f.name, result.error)
     finally:
@@ -216,14 +218,50 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
     hybrid_search, cached_embedding, query_enhancer = _build_hybrid_search(collection)
     query_enhancer.llm_service = llm
 
+    # --- Query Router (dual-layer: rule + embedding) ---
+    from src.core.query_engine.query_router import QueryRouter
+    routing_cfg = settings.get("routing", {})
+    if routing_cfg.get("enabled", True):
+        query_router = QueryRouter(
+            fallback_to_llm=routing_cfg.get("fallback_to_llm", True),
+            embedding_fn=cached_embedding.embed if cached_embedding is not None else None,
+            similarity_threshold=routing_cfg.get("embedding_threshold", 0.75),
+        )
+        if query_router.embedding_ready:
+            logger.info("QueryRouter: dual-layer mode (rule + embedding, %d prototypes)", query_router.prototype_count)
+        else:
+            logger.info("QueryRouter: rule-only mode (no embedding_fn)")
+    else:
+        query_router = None
+
+    # --- Semantic Cache ---
+    semantic_cache = None
+    cache_cfg = settings.get("semantic_cache", {})
+    if cache_cfg.get("enabled", False) and cached_embedding is not None:
+        from src.core.cache.semantic_cache import SemanticCache
+        semantic_cache = SemanticCache(
+            embedding_fn=lambda texts: cached_embedding.embed(texts),
+            similarity_threshold=cache_cfg.get("similarity_threshold", 0.92),
+            ttl_seconds=cache_cfg.get("ttl_seconds", 3600),
+            max_size=cache_cfg.get("max_size", 500),
+        )
+        logger.info("SemanticCache enabled (threshold=%.2f, ttl=%ds)",
+                     cache_cfg.get("similarity_threshold", 0.92),
+                     cache_cfg.get("ttl_seconds", 3600))
+
     # --- Tools ---
     tool_registry = ToolRegistry()
     tool_registry.register(KnowledgeQueryTool(
         settings=settings,
         hybrid_search=hybrid_search,
         query_enhancer=query_enhancer,
+        query_router=query_router,
+        semantic_cache=semantic_cache,
     ))
-    tool_registry.register(DocumentIngestTool(settings=settings))
+    tool_registry.register(DocumentIngestTool(
+        settings=settings,
+        semantic_cache=semantic_cache,
+    ))
     tool_registry.register(ReviewSummaryTool(
         hybrid_search=hybrid_search,
         llm_service=llm,
@@ -235,6 +273,7 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         llm_service=llm,
         error_memory=error_mem,
         knowledge_map=kmap_mem,
+        query_router=query_router,
     ))
     tool_registry.register(QuizEvaluatorTool(
         llm_service=llm,
@@ -255,8 +294,29 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
     if review_hook:
         hooks.insert(0, review_hook)
 
-    # --- LLM Middlewares (retry + circuit breaker) ---
+    # --- Guardrails Hook (runs first in chain) ---
+    guardrails_cfg = settings.get("guardrails", {})
+    if guardrails_cfg.get("enabled", True):
+        from src.agent.hooks.guardrails import GuardrailsHook
+        guardrails_hook = GuardrailsHook(
+            input_filtering=guardrails_cfg.get("input_filtering", True),
+            output_redaction=guardrails_cfg.get("output_redaction", True),
+            block_on_high_risk=guardrails_cfg.get("block_on_high_risk", True),
+        )
+        hooks.insert(0, guardrails_hook)
+
+    # --- LLM Middlewares (retry + circuit breaker + reflection) ---
     retry_middleware = RetryWithBackoffMiddleware(llm_service=llm)
+    llm_middlewares: list = [retry_middleware]
+
+    reflection_cfg = settings.get("reflection", {})
+    if reflection_cfg.get("enabled", True):
+        from src.agent.hooks.reflection import ReflectionMiddleware
+        reflection_mw = ReflectionMiddleware(
+            groundedness_threshold=reflection_cfg.get("groundedness_threshold", 0.3),
+            append_warning=reflection_cfg.get("append_warning", True),
+        )
+        llm_middlewares.append(reflection_mw)
 
     agent = Agent(
         llm_service=llm,
@@ -265,7 +325,7 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         config=agent_cfg,
         prompt_builder=SystemPromptBuilder(agent_cfg.system_prompt_path),
         lifecycle_hooks=hooks,
-        llm_middlewares=[retry_middleware],
+        llm_middlewares=llm_middlewares,
         memory_enhancer=memory_enhancer,
         skill_workflow=skill_workflow,
         context_filter=context_filter,
