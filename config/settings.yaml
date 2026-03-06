@@ -150,4 +150,10 @@ memory:
   error_memory_enabled: true
   knowledge_map_enabled: true
   skill_memory_enabled: true
+  session_memory_enabled: true
   decay_interval_hours: 24
+  extraction_mode: "both"        # llm / rule / both (LLM优先，失败回退rule)
+  review_schedule_enabled: true  # 启用主动复习推荐
+  decay_on_session_start: true   # 新会话开始时触发 Ebbinghaus 衰减
+  compaction_enabled: true       # 启用上下文压缩 (CoPaw-style Compaction)
+  compaction_threshold_messages: 30  # 超过此消息数时触发压缩

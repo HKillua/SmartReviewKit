@@ -329,6 +329,7 @@ markers = [
 | H | Server 与前端 | 3 | 1.5 天 | D |
 | I | 稳定性与可观测 | 3 | 1 天 | D |
 | J | RAG 深度优化 | 19 | 4 天 | A-I |
+| K | 记忆系统深度升级（个性化复习助手） | 9 | 3 天 | D, F, J |
 
 ### 4.2 进度跟踪
 
@@ -430,6 +431,20 @@ markers = [
 | J18 | 重新入库课件并端到端测试检索效果 | [ ] | - | |
 | J19 | 系统设计文档补充向量存储设计决策说明 | [ ] | - | |
 
+#### 阶段 K：记忆系统深度升级（个性化复习助手）
+
+| 任务编号 | 任务名称 | 状态 | 完成日期 | 备注 |
+|---------|---------|------|---------|------|
+| K1 | SessionMemory 会话摘要存储 | [x] | 2026-03-04 | 借鉴 CoPaw ReMe 每日日志理念 |
+| K2 | MemoryRecordHook 增强：LLM/Rule 双模式学习数据提取 | [x] | 2026-03-04 | |
+| K3 | StudentProfile preferences 结构化 + 偏好提取 | [x] | 2026-03-04 | |
+| K4 | ReviewScheduleHook 主动复习推荐 | [x] | 2026-03-04 | Ebbinghaus 衰减调度 |
+| K5 | StudentProfile 自动同步 weak/strong/accuracy | [x] | 2026-03-04 | 修复 total_sessions 覆写 bug |
+| K6 | get_memory_summary 注入优化 | [x] | 2026-03-04 | 更结构化、更个性化 |
+| K7 | ContextEngineeringFilter 接入 Agent + Level 3 LLM 压缩 | [x] | 2026-03-04 | 借鉴 CoPaw Compaction |
+| K8 | 服务端接线 + settings.yaml 更新 | [x] | 2026-03-04 | |
+| K9 | 端到端测试 | [x] | 2026-03-04 | 多轮对话验证记忆持久化 |
+
 #### 总体进度
 
 | 阶段 | 总任务 | 已完成 | 进度 |
@@ -444,7 +459,8 @@ markers = [
 | H Server | 3 | 0 | 0% |
 | I 稳定性 | 3 | 0 | 0% |
 | J RAG 深度优化 | 19 | 0 | 0% |
-| **总计** | **48** | **0** | **0%** |
+| K 记忆系统升级 | 9 | 9 | 100% |
+| **总计** | **57** | **9** | **16%** |
 
 ---
 
@@ -1823,6 +1839,250 @@ markers = [
   - **内容类型标注**：规则引擎 vs LLM 标注的 trade-off
 - **验收标准**：文档清晰、面试可直接引用
 - **测试方法**：人工审查
+
+---
+
+### 阶段 K：记忆系统深度升级（个性化复习助手）
+
+> 借鉴阿里 CoPaw ReMe (Remember Me, Refine Me) 记忆框架理念，将 Agent 从"无状态问答机器人"升级为"有长期记忆的个性化复习助手"。
+
+---
+
+### K1：SessionMemory 会话摘要存储
+
+- **目标**：新建 `SessionMemory` 组件，为每次会话存储结构化摘要，实现"你上次问过 TCP"的能力。
+- **新建文件**：
+  - `src/agent/memory/session_memory.py`
+- **实现类/函数**：
+  - `SessionSummary(BaseModel)`：
+    - `session_id: str` — 关联 Conversation ID
+    - `user_id: str`
+    - `timestamp: datetime`
+    - `topics: list[str]` — 讨论的知识点
+    - `key_questions: list[str]` — 用户问的关键问题
+    - `mastery_observations: dict[str, str]` — {"TCP": "weak", "IP": "strong"}
+    - `preference_snapshot: dict` — 本次偏好快照
+    - `summary_text: str` — 一句话摘要
+  - `SessionMemory`：
+    - `__init__(db_dir)` — SQLite: `session_summaries(id, user_id, data, created_at)`
+    - `async save_session(user_id, summary: SessionSummary)`
+    - `async get_recent_sessions(user_id, limit=5) -> list[SessionSummary]`
+    - `async get_topic_history(user_id, topic) -> list[SessionSummary]` — 搜索包含特定话题的会话
+    - `async search_sessions(user_id, query) -> list[SessionSummary]` — 关键词匹配
+- **设计理念**：借鉴 CoPaw 的 `memory/YYYY-MM-DD.md` 每日日志，但使用 SQLite 结构化存储，支持快速查询。
+- **验收标准**：
+  - 会话摘要可正确存取
+  - 可按话题、时间查询历史会话
+- **测试方法**：单元测试
+
+---
+
+### K2：MemoryRecordHook 增强 — LLM/Rule 双模式学习数据提取
+
+- **目标**：增强 `MemoryRecordHook.after_message()`，从对话中自动提取学习数据并分发到各记忆存储。
+- **修改文件**：
+  - `src/agent/memory/enhancer.py`
+- **实现内容**：
+  - 给 `MemoryRecordHook` 注入 `error_memory`、`knowledge_map`、`session_memory`（当前只有 `student_profile` 和 `skill_memory`）
+  - **LLM 提取模式** (`extraction_mode: "llm"`)：
+    - 将对话摘要发给 LLM，返回结构化 JSON：
+      ```json
+      {
+        "topics_discussed": ["TCP三次握手", "拥塞控制"],
+        "weak_points_observed": ["不理解慢启动阈值"],
+        "strong_points_observed": ["TCP报文格式熟练"],
+        "user_preference": {"detail_level": "concise", "style": "exam_focused"},
+        "key_questions": ["TCP为什么需要三次握手？"],
+        "quiz_accuracy": 0.6,
+        "summary": "本次主要复习了TCP运输层协议"
+      }
+      ```
+  - **Rule 提取模式** (`extraction_mode: "rule"`)：
+    - 用正则提取话题（匹配章节名、协议名等关键词）
+    - 偏好检测：匹配"简洁点"→concise，"详细讲一下"→detailed，"考点"→exam_focused
+    - 从 QuizEvaluatorTool 结果中提取正确率
+  - **Both 模式** (`extraction_mode: "both"`)：LLM 优先，失败回退到 Rule
+  - 提取后分发更新：
+    - → `SessionMemory.save_session()` — 存储本次会话摘要
+    - → `StudentProfile.update_profile()` — 更新偏好、弱点
+    - → `KnowledgeMapMemory.update_mastery()` — 同步掌握度
+- **验收标准**：
+  - 会话结束后自动提取学习数据
+  - LLM 失败时回退到 Rule 模式
+  - 提取结果正确分发到各存储
+- **测试方法**：构造模拟对话数据进行测试
+
+---
+
+### K3：StudentProfile preferences 结构化 + 偏好学习
+
+- **目标**：结构化用户偏好字段，使系统能记住并应用"要简洁 / 要详细 / 要考点版"。
+- **修改文件**：
+  - `src/agent/memory/student_profile.py`
+- **实现内容**：
+  - 扩展 `StudentProfile.preferences` 默认结构：
+    ```python
+    preferences: dict = {
+        "detail_level": "normal",    # concise / normal / detailed
+        "style": "default",          # default / exam_focused / example_heavy
+        "quiz_difficulty": "medium", # easy / medium / hard
+    }
+    ```
+  - 在 K2 的提取逻辑中填充偏好值
+  - 在 K6 的注入逻辑中将偏好翻译为 system prompt 指令
+- **验收标准**：
+  - 用户说"简洁点"后偏好被更新
+  - 后续对话中 system prompt 包含偏好信息
+- **测试方法**：单元测试
+
+---
+
+### K4：ReviewScheduleHook — 主动复习推荐
+
+- **目标**：新建 `before_message` 钩子，在新会话开始时主动推荐复习内容，实现"你上次 TCP 掌握不好，今天复习一下"。
+- **新建文件**：
+  - `src/agent/hooks/review_schedule.py`
+- **实现类/函数**：
+  - `ReviewScheduleHook(LifecycleHook)`：
+    - `__init__(knowledge_map, error_memory, session_memory)`
+    - `async before_message(user_id, message) -> Optional[str]`
+      1. 检测是否为新会话（conversation.messages 为空时首次触发）
+      2. 调用 `knowledge_map.apply_decay(user_id)` — Ebbinghaus 衰减（K5 防重复机制）
+      3. 调用 `knowledge_map.get_due_for_review(user_id)` — 到期复习节点
+      4. 调用 `error_memory.get_errors(user_id, mastered=False, limit=3)` — 未掌握错题
+      5. 调用 `session_memory.get_recent_sessions(user_id, limit=2)` — 上次话题
+      6. 构建推荐文本注入 system prompt（不修改用户消息，通过新的机制传给 prompt_builder）
+- **推荐文本格式**：
+  ```
+  ### 主动复习建议
+  - 上次你学习了"TCP三次握手"，掌握度 0.3（薄弱），建议今天复习
+  - 错题提醒：你在"计算子网掩码"上连续错了2次，需要巩固
+  - 到期复习："ICMP协议"已3天未复习，掌握度可能衰减
+  ```
+- **验收标准**：
+  - 新会话开始时自动检查并生成复习建议
+  - 复习建议出现在 system prompt 中引导 Agent 行为
+  - 没有到期项时不产生噪音
+- **测试方法**：单元测试 + 手动多轮对话验证
+
+---
+
+### K5：StudentProfile 自动同步 + 修复
+
+- **目标**：修复 `total_sessions` 覆写 bug，实现 `weak_topics`、`strong_topics`、`overall_accuracy` 自动同步。
+- **修改文件**：
+  - `src/agent/memory/enhancer.py`（`MemoryRecordHook.after_message`）
+- **实现内容**：
+  - **修复 total_sessions**：改为 `total_sessions: profile.total_sessions + 1` 累加
+  - **同步 weak_topics**：从 `KnowledgeMapMemory.get_weak_nodes()` + `ErrorMemory.get_weak_concepts()` 合并去重
+  - **同步 strong_topics**：从 `KnowledgeMapMemory` 中 mastery_level >= 0.8 的节点提取
+  - **同步 overall_accuracy**：从 `KnowledgeMapMemory` 的 correct_count / quiz_count 加权平均
+- **验收标准**：
+  - `total_sessions` 正确累加
+  - `weak_topics` 和 `strong_topics` 反映真实学习状态
+- **测试方法**：单元测试
+
+---
+
+### K6：get_memory_summary 注入优化
+
+- **目标**：优化 `MemoryContextEnhancer.get_memory_summary()` 的输出格式，使 system prompt 更聚焦、更个性化。
+- **修改文件**：
+  - `src/agent/memory/enhancer.py`
+- **实现内容**：
+  - 新增 `session_memory` 引用
+  - 输出格式优化为分节结构：
+    ```
+    ## 学生记忆上下文
+    ### 学习偏好
+    - 回答风格: 简洁考点版
+    - 难度偏好: 中等
+
+    ### 上次学习
+    - 话题: TCP三次握手, 拥塞控制
+    - 关键问题: "TCP为什么需要三次握手？"
+    - 掌握情况: TCP报文格式(强), 慢启动(弱)
+
+    ### 需要复习的知识点
+    - 慢启动阈值 (掌握度: 0.3, 已到复习时间)
+    - ICMP协议 (掌握度: 0.4, 3天未复习)
+
+    ### 错题提醒
+    - 计算子网掩码 (错2次, 未掌握)
+    ```
+  - 加入 `session_memory.get_recent_sessions()` 信息
+- **验收标准**：
+  - system prompt 中的记忆上下文信息丰富、格式清晰
+  - Agent 回答时能引用上次学习话题
+- **测试方法**：打印 system prompt 检查
+
+---
+
+### K7：ContextEngineeringFilter 接入 Agent + Level 3 压缩
+
+- **目标**：将已实现的 `ContextEngineeringFilter` 接入 Agent 的 `_build_llm_messages`，并实现 Level 3 LLM 压缩。
+- **修改文件**：
+  - `src/agent/agent.py`（`_build_llm_messages`）
+  - `src/agent/memory/context_filter.py`（Level 3）
+- **实现内容**：
+  - **Agent 接入**：在 `_build_llm_messages` 中用 `ContextEngineeringFilter.filter_messages()` 替代简单的 `[-max_context_messages:]` 切片
+  - **Level 3 LLM 压缩**（借鉴 CoPaw Compaction）：
+    - 当消息数超过 `compaction_threshold_messages`（默认 30）时触发
+    - 将旧消息压缩为一条 `[COMPACTED_SUMMARY]` 摘要
+    - 保留最近 N 条消息原文
+    - 摘要内容包含：学习目标、已解决问题、关键发现、下一步
+  - 给 `ContextEngineeringFilter` 注入可选的 `LlmService` 用于 Level 3
+- **验收标准**：
+  - 短对话（< 30 条消息）不做任何处理
+  - 长对话自动压缩，不丢失关键上下文
+  - LLM 不可用时 fallback 到 Level 1-2
+- **测试方法**：构造长对话消息列表进行测试
+
+---
+
+### K8：服务端接线 + 配置更新
+
+- **目标**：将所有新组件注册到 FastAPI 应用中，更新配置文件。
+- **修改文件**：
+  - `src/server/app.py`
+  - `config/settings.yaml`
+- **实现内容**：
+  - 初始化 `SessionMemory` 并注入到 `MemoryContextEnhancer` 和 `MemoryRecordHook`
+  - 给 `MemoryRecordHook` 传入 `error_memory`、`knowledge_map`、`session_memory`、`llm_service`
+  - 初始化 `ReviewScheduleHook` 并添加到 Agent 的 `hooks` 列表
+  - 初始化 `ContextEngineeringFilter` 并注入到 Agent
+  - settings.yaml 新增：
+    ```yaml
+    memory:
+      extraction_mode: "both"  # llm / rule / both
+      session_memory_enabled: true
+      review_schedule_enabled: true
+      decay_on_session_start: true
+      compaction_enabled: true
+      compaction_threshold_messages: 30
+    ```
+- **验收标准**：
+  - 系统正常启动，所有新组件初始化成功
+  - 配置项生效
+- **测试方法**：启动服务器检查日志
+
+---
+
+### K9：端到端测试
+
+- **目标**：验证记忆系统升级的完整效果。
+- **测试流程**：
+  1. 启动系统，进行第一轮对话：问 TCP 相关问题 + 做几道题
+  2. 检查 `data/memory/` 下各 SQLite 数据库更新
+  3. 开始第二轮对话（新会话）：观察是否出现主动复习建议
+  4. 测试偏好记忆：在对话中说"简洁点"，检查后续是否生效
+  5. 测试长对话压缩：发送 30+ 条消息，检查上下文压缩
+- **验收标准**：
+  - 新会话能看到"你上次学习了 TCP"的提示
+  - 薄弱知识点被正确识别和推荐
+  - 用户偏好被记住并影响回答风格
+  - 长对话不丢失关键上下文
+- **测试方法**：手动端到端测试 + 检查 SQLite 数据
 
 ---
 

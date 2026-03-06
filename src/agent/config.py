@@ -47,7 +47,13 @@ class MemoryConfig(BaseModel):
     error_memory_enabled: bool = True
     knowledge_map_enabled: bool = True
     skill_memory_enabled: bool = True
+    session_memory_enabled: bool = True
     decay_interval_hours: int = Field(default=24, ge=1)
+    extraction_mode: str = Field(default="both", pattern=r"^(llm|rule|both)$")
+    review_schedule_enabled: bool = True
+    decay_on_session_start: bool = True
+    compaction_enabled: bool = True
+    compaction_threshold_messages: int = Field(default=30, ge=10)
 
 
 def load_agent_config(settings: dict[str, Any]) -> AgentConfig:

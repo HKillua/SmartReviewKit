@@ -78,6 +78,8 @@ class Agent:
         llm_middlewares: list[LlmMiddleware] | None = None,
         memory_enhancer: object | None = None,
         skill_workflow: object | None = None,
+        context_filter: object | None = None,
+        review_hook: object | None = None,
     ) -> None:
         self.llm = llm_service
         self.tools = tool_registry
@@ -88,6 +90,8 @@ class Agent:
         self.middlewares = llm_middlewares or []
         self.memory_enhancer = memory_enhancer
         self.skill_workflow = skill_workflow
+        self.context_filter = context_filter
+        self.review_hook = review_hook
 
     async def chat(
         self,
@@ -127,6 +131,16 @@ class Agent:
                 memory_ctx = await self.memory_enhancer.get_memory_summary(user_id)
             except Exception:
                 logger.exception("Memory enhancer failed")
+
+        # Proactive review recommendations (K4)
+        review_ctx = ""
+        if self.review_hook and hasattr(self.review_hook, "get_review_context"):
+            try:
+                review_ctx = await self.review_hook.get_review_context(user_id)
+            except Exception:
+                logger.exception("Review hook failed")
+        if review_ctx:
+            memory_ctx = (memory_ctx + "\n\n" + review_ctx).strip() if memory_ctx else review_ctx
 
         skill_ctx = ""
         if self.skill_workflow and hasattr(self.skill_workflow, "try_handle"):
@@ -183,7 +197,7 @@ class Agent:
         """Inner ReAct loop: call LLM → execute tools → repeat."""
         for iteration in range(self.config.max_tool_iterations):
             # Build messages
-            llm_messages = self._build_llm_messages(conversation, system_prompt)
+            llm_messages = await self._build_llm_messages(conversation, system_prompt)
 
             request = LlmRequest(
                 messages=llm_messages,
@@ -312,14 +326,21 @@ class Agent:
 
         return LlmResponse(content=full_content, tool_calls=tool_calls), events
 
-    def _build_llm_messages(
+    async def _build_llm_messages(
         self, conversation: Conversation, system_prompt: str
     ) -> list[LlmMessage]:
         """Convert conversation history into LlmMessage list with system prompt."""
         messages = [LlmMessage(role="system", content=system_prompt)]
 
-        recent = conversation.messages[-self.config.max_context_messages:]
-        for m in recent:
+        # Apply context filter if available; otherwise simple sliding window
+        if self.context_filter and hasattr(self.context_filter, "filter_messages_async"):
+            filtered = await self.context_filter.filter_messages_async(conversation.messages)
+        elif self.context_filter and hasattr(self.context_filter, "filter_messages"):
+            filtered = self.context_filter.filter_messages(conversation.messages)
+        else:
+            filtered = conversation.messages[-self.config.max_context_messages:]
+
+        for m in filtered:
             messages.append(
                 LlmMessage(
                     role=m.role,

@@ -22,9 +22,12 @@ from src.agent.config import (
 )
 from src.agent.conversation import FileConversationStore
 from src.agent.llm.factory import create_llm_service
+from src.agent.hooks.review_schedule import ReviewScheduleHook
+from src.agent.memory.context_filter import ContextEngineeringFilter
 from src.agent.memory.enhancer import MemoryContextEnhancer, MemoryRecordHook
 from src.agent.memory.error_memory import ErrorMemory
 from src.agent.memory.knowledge_map import KnowledgeMapMemory
+from src.agent.memory.session_memory import SessionMemory
 from src.agent.memory.skill_memory import SkillMemory
 from src.agent.memory.student_profile import StudentProfileMemory
 from src.agent.prompt_builder import SystemPromptBuilder
@@ -136,14 +139,43 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
     error_mem = ErrorMemory(memory_cfg.db_dir) if memory_cfg.error_memory_enabled else None
     kmap_mem = KnowledgeMapMemory(memory_cfg.db_dir) if memory_cfg.knowledge_map_enabled else None
     skill_mem = SkillMemory(memory_cfg.db_dir) if memory_cfg.skill_memory_enabled else None
+    session_mem = SessionMemory(memory_cfg.db_dir) if memory_cfg.session_memory_enabled else None
 
     memory_enhancer = MemoryContextEnhancer(
         student_profile=profile_mem,
         error_memory=error_mem,
         knowledge_map=kmap_mem,
         skill_memory=skill_mem,
+        session_memory=session_mem,
     )
-    memory_hook = MemoryRecordHook(student_profile=profile_mem, skill_memory=skill_mem)
+    memory_hook = MemoryRecordHook(
+        student_profile=profile_mem,
+        skill_memory=skill_mem,
+        error_memory=error_mem,
+        knowledge_map=kmap_mem,
+        session_memory=session_mem,
+        llm_service=llm,
+        extraction_mode=memory_cfg.extraction_mode,
+    )
+
+    # --- Review schedule hook ---
+    review_hook = None
+    if memory_cfg.review_schedule_enabled:
+        review_hook = ReviewScheduleHook(
+            knowledge_map=kmap_mem,
+            error_memory=error_mem,
+            session_memory=session_mem,
+            enable_decay=memory_cfg.decay_on_session_start,
+        )
+
+    # --- Context filter ---
+    context_filter = None
+    if memory_cfg.compaction_enabled:
+        context_filter = ContextEngineeringFilter(
+            max_messages=agent_cfg.max_context_messages,
+            llm_service=llm,
+            compaction_threshold=memory_cfg.compaction_threshold_messages,
+        )
 
     # --- Shared HybridSearch ---
     collection = agent_cfg.default_collection
@@ -179,15 +211,21 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
     conv_store = FileConversationStore(agent_cfg.conversation_store_dir)
 
     # --- Agent ---
+    hooks: list = [memory_hook]
+    if review_hook:
+        hooks.insert(0, review_hook)
+
     agent = Agent(
         llm_service=llm,
         tool_registry=tool_registry,
         conversation_store=conv_store,
         config=agent_cfg,
         prompt_builder=SystemPromptBuilder(agent_cfg.system_prompt_path),
-        lifecycle_hooks=[memory_hook],
+        lifecycle_hooks=hooks,
         memory_enhancer=memory_enhancer,
         skill_workflow=skill_workflow,
+        context_filter=context_filter,
+        review_hook=review_hook,
     )
 
     chat_handler = ChatHandler(agent)

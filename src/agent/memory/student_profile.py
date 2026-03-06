@@ -14,9 +14,17 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 
+def _default_preferences() -> dict:
+    return {
+        "detail_level": "normal",    # concise / normal / detailed
+        "style": "default",          # default / exam_focused / example_heavy
+        "quiz_difficulty": "medium", # easy / medium / hard
+    }
+
+
 class StudentProfile(BaseModel):
     user_id: str
-    preferences: dict = Field(default_factory=dict)
+    preferences: dict = Field(default_factory=_default_preferences)
     weak_topics: list[str] = Field(default_factory=list)
     strong_topics: list[str] = Field(default_factory=list)
     learning_pace: str = "medium"

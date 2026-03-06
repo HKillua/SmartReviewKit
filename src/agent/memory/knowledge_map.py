@@ -76,6 +76,13 @@ class KnowledgeMapMemory:
                 (user_id, concept, node.model_dump_json()),
             )
 
+    async def _get_all_nodes(self, user_id: str) -> list[KnowledgeNode]:
+        with sqlite3.connect(self._db_path) as conn:
+            rows = conn.execute(
+                "SELECT data FROM knowledge_nodes WHERE user_id = ?", (user_id,)
+            ).fetchall()
+        return [KnowledgeNode.model_validate_json(r[0]) for r in rows]
+
     async def get_weak_nodes(self, user_id: str, threshold: float = 0.5) -> list[KnowledgeNode]:
         with sqlite3.connect(self._db_path) as conn:
             rows = conn.execute(
