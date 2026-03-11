@@ -177,6 +177,7 @@ def _render_case_details(report: Dict[str, Any]) -> None:
                         "iterations": result.get("iterations", 0),
                         "actual_planner_intent": result.get("actual_planner_intent", ""),
                         "actual_control_mode": result.get("actual_control_mode", ""),
+                        "linked_query_trace_ids": result.get("linked_query_trace_ids", []),
                         "grounding_score": result.get("grounding_score", 0.0),
                         "grounding_policy_action": result.get("grounding_policy_action", ""),
                         "generation_mode": result.get("generation_mode", ""),

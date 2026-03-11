@@ -82,6 +82,7 @@ async def test_agent_eval_runner_reconstructs_case_outputs(tmp_path: Path) -> No
                 type=StreamEventType.DONE,
                 metadata={
                     "trace_id": "agent-trace-1",
+                    "query_trace_ids": ["query-trace-1"],
                     "citations": [
                         {
                             "index": 1,
@@ -109,6 +110,7 @@ async def test_agent_eval_runner_reconstructs_case_outputs(tmp_path: Path) -> No
     assert case.iterations == 2
     assert case.actual_planner_intent == "knowledge_query"
     assert case.actual_control_mode == "advisory"
+    assert case.linked_query_trace_ids == ["query-trace-1"]
     assert case.grounding_policy_action == "normal"
     assert case.grounding_score == 0.88
     assert case.actual_evaluation_mode == "evidence_enhanced"

@@ -1,7 +1,7 @@
 """Trace context for observability across pipeline stages.
 
-    Provides trace_id, trace_type (agent/query/ingestion), per-stage timing,
-finish() lifecycle, and to_dict() serialisation for JSON Lines output.
+    Provides trace_id, trace_type (agent/query/ingestion/memory), per-stage
+timing, finish() lifecycle, and to_dict() serialisation for JSON Lines output.
 """
 
 import time
@@ -17,14 +17,14 @@ class TraceContext:
 
     Attributes:
         trace_id: Unique identifier for this trace.
-        trace_type: Either ``"agent"``, ``"query"`` or ``"ingestion"``.
+        trace_type: Either ``"agent"``, ``"query"``, ``"ingestion"`` or ``"memory"``.
         started_at: ISO-8601 timestamp when the trace was created.
         finished_at: ISO-8601 timestamp when ``finish()`` was called, or None.
         stages: Ordered list of recorded stage dicts.
         metadata: Arbitrary key/value pairs attached to the trace.
     """
 
-    trace_type: Literal["agent", "query", "ingestion"] = "query"
+    trace_type: Literal["agent", "query", "ingestion", "memory"] = "query"
     trace_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     started_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     finished_at: Optional[str] = field(default=None)

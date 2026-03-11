@@ -4,6 +4,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from src.core.trace.trace_collector import TraceCollector
+from src.observability.dashboard.services.trace_service import TraceService
+
 
 @pytest.mark.asyncio
 async def test_conflicting_preferences_do_not_update_profile(tmp_path) -> None:
@@ -147,6 +150,82 @@ async def test_llm_fallback_records_actual_rule_mode(tmp_path) -> None:
     sessions = await session_mem.get_recent_sessions("u1")
     assert len(sessions) == 1
     assert sessions[0].extraction_metadata["mode"] == "rule"
+
+
+@pytest.mark.asyncio
+async def test_memory_trace_is_recorded_even_when_session_write_is_skipped(tmp_path) -> None:
+    from src.agent.memory.enhancer import MemoryRecordHook
+    from src.agent.memory.session_memory import SessionMemory
+    from src.agent.memory.student_profile import StudentProfileMemory
+    from src.agent.types import Conversation, Message
+
+    trace_path = tmp_path / "traces.jsonl"
+    collector = TraceCollector(traces_path=trace_path)
+    profile_mem = StudentProfileMemory(str(tmp_path))
+    session_mem = SessionMemory(str(tmp_path))
+    hook = MemoryRecordHook(
+        student_profile=profile_mem,
+        session_memory=session_mem,
+        extraction_mode="rule",
+        trace_enabled=True,
+        trace_collector=collector,
+    )
+    conversation = Conversation(
+        id="conv_trace_skip",
+        user_id="u1",
+        messages=[
+            Message(role="user", content="好的"),
+            Message(role="assistant", content="好的"),
+        ],
+    )
+
+    await hook.after_message(conversation)
+
+    traces = TraceService(trace_path).list_traces(trace_type="memory")
+    assert len(traces) == 1
+    assert traces[0]["metadata"]["conversation_id"] == "conv_trace_skip"
+    session_stage = next(
+        stage for stage in traces[0]["stages"] if stage["stage"] == "session_memory_write"
+    )
+    assert session_stage["data"]["status"] == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_memory_trace_records_preference_conflict_reason(tmp_path) -> None:
+    from src.agent.memory.enhancer import MemoryRecordHook
+    from src.agent.memory.session_memory import SessionMemory
+    from src.agent.memory.student_profile import StudentProfileMemory
+    from src.agent.types import Conversation, Message
+
+    trace_path = tmp_path / "traces_conflict.jsonl"
+    collector = TraceCollector(traces_path=trace_path)
+    profile_mem = StudentProfileMemory(str(tmp_path))
+    session_mem = SessionMemory(str(tmp_path))
+    hook = MemoryRecordHook(
+        student_profile=profile_mem,
+        session_memory=session_mem,
+        extraction_mode="rule",
+        trace_enabled=True,
+        trace_collector=collector,
+    )
+    conversation = Conversation(
+        id="conv_trace_conflict",
+        user_id="u1",
+        messages=[
+            Message(role="user", content="请简洁一点讲 TCP。"),
+            Message(role="assistant", content="好的。"),
+            Message(role="user", content="也请详细一点讲 TCP。"),
+        ],
+    )
+
+    await hook.after_message(conversation)
+
+    trace = TraceService(trace_path).list_traces(trace_type="memory")[0]
+    gate_stage = next(stage for stage in trace["stages"] if stage["stage"] == "memory_quality_gate")
+    profile_stage = next(stage for stage in trace["stages"] if stage["stage"] == "profile_update")
+    assert gate_stage["data"]["profile_preferences_reason"] == "preference_conflict"
+    assert profile_stage["data"]["status"] == "skipped"
+    assert profile_stage["data"]["reason"] == "preference_conflict"
 
 
 @pytest.mark.asyncio

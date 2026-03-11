@@ -12,11 +12,45 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
-import streamlit as st
+try:
+    import streamlit as st
+except ModuleNotFoundError:  # pragma: no cover - optional UI dependency
+    class _StreamlitStub:
+        def __getattr__(self, name: str):
+            def _missing(*args, **kwargs):
+                raise ModuleNotFoundError(
+                    "streamlit is required to render the Query Traces page"
+                )
+
+            return _missing
+
+    st = _StreamlitStub()
 
 from src.observability.dashboard.services.trace_service import TraceService
 
 logger = logging.getLogger(__name__)
+
+
+def _filter_query_traces(
+    traces: List[Dict[str, Any]],
+    *,
+    keyword: str = "",
+    source: str = "all",
+) -> List[Dict[str, Any]]:
+    keyword_norm = keyword.strip().lower()
+    source_norm = source.strip().lower()
+    filtered: List[Dict[str, Any]] = []
+    for trace in traces:
+        metadata = trace.get("metadata", {})
+        if keyword_norm:
+            haystack = f"{metadata} {trace.get('stages', [])}".lower()
+            if keyword_norm not in haystack:
+                continue
+        trace_source = str(metadata.get("source", "") or "").lower()
+        if source_norm != "all" and trace_source != source_norm:
+            continue
+        filtered.append(trace)
+    return filtered
 
 
 def render() -> None:
@@ -31,26 +65,39 @@ def render() -> None:
         return
 
     # ── Keyword filter ─────────────────────────────────────────────
-    keyword = st.text_input(
-        "Search by query keyword",
-        value="",
-        key="qt_keyword",
+    filter_cols = st.columns([2, 1])
+    with filter_cols[0]:
+        keyword = st.text_input(
+            "Search by query keyword",
+            value="",
+            key="qt_keyword",
+        )
+    sources = sorted(
+        {
+            str(trace.get("metadata", {}).get("source", "") or "").strip()
+            for trace in traces
+            if str(trace.get("metadata", {}).get("source", "") or "").strip()
+        }
     )
-    if keyword.strip():
-        kw = keyword.strip().lower()
-        traces = [
-            t
-            for t in traces
-            if kw in str(t.get("metadata", {})).lower()
-            or kw in str(t.get("stages", [])).lower()
-        ]
+    with filter_cols[1]:
+        selected_source = st.selectbox(
+            "Source",
+            options=["all", *sources],
+            index=0,
+            key="qt_source_filter",
+        )
+    traces = _filter_query_traces(
+        traces,
+        keyword=keyword,
+        source=selected_source,
+    )
 
     st.subheader(f"📋 Query History ({len(traces)})")
 
     for idx, trace in enumerate(traces):
         trace_id = trace.get("trace_id", "unknown")
         started = trace.get("started_at", "—")
-        total_ms = trace.get("elapsed_ms")
+        total_ms = trace.get("total_elapsed_ms", trace.get("elapsed_ms"))
         total_label = f"{total_ms:.0f} ms" if total_ms is not None else "—"
         meta = trace.get("metadata", {})
         query_text = meta.get("query", "")

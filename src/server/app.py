@@ -197,6 +197,7 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         session_write_min_confidence=memory_cfg.session_write_min_confidence,
         preference_write_min_confidence=memory_cfg.preference_write_min_confidence,
         preference_conflict_guard=memory_cfg.preference_conflict_guard,
+        trace_enabled=bool(settings.get("observability", {}).get("trace_enabled", False)),
     )
 
     # --- Review schedule hook ---
@@ -273,6 +274,7 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         llm_service=llm,
         error_memory=error_mem,
         knowledge_map=kmap_mem,
+        trace_enabled=bool(settings.get("observability", {}).get("trace_enabled", False)),
     ))
     tool_registry.register(QuizGeneratorTool(
         hybrid_search=hybrid_search,
@@ -286,6 +288,7 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         error_memory=error_mem,
         knowledge_map=kmap_mem,
         hybrid_search=hybrid_search,
+        trace_enabled=bool(settings.get("observability", {}).get("trace_enabled", False)),
     ))
 
     # --- Skills ---

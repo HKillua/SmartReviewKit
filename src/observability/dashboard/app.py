@@ -60,6 +60,11 @@ def _page_agent_traces() -> None:
     render()
 
 
+def _page_memory_traces() -> None:
+    from src.observability.dashboard.pages.memory_traces import render
+    render()
+
+
 def _page_evaluation_panel() -> None:
     from src.observability.dashboard.pages.evaluation_panel import render
     render()
@@ -81,6 +86,7 @@ if STREAMLIT_AVAILABLE:
         st.Page(_page_ingestion_traces, title="Ingestion Traces", icon="🔬"),
         st.Page(_page_query_traces, title="Query Traces", icon="🔎"),
         st.Page(_page_agent_traces, title="Agent Traces", icon="🤖"),
+        st.Page(_page_memory_traces, title="Memory Traces", icon="🧠"),
         st.Page(_page_evaluation_panel, title="Evaluation Panel", icon="📏"),
         st.Page(_page_agent_evaluation_panel, title="Agent Evaluation", icon="🧪"),
     ]

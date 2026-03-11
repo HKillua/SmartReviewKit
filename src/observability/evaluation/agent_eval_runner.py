@@ -80,6 +80,7 @@ class AgentEvalCaseResult:
     trace_id: str = ""
     actual_planner_intent: str = ""
     actual_control_mode: str = ""
+    linked_query_trace_ids: List[str] = field(default_factory=list)
     citations: List[Dict[str, Any]] = field(default_factory=list)
     grounding_score: float = 0.0
     grounding_policy_action: str = ""
@@ -133,6 +134,7 @@ class AgentEvalReport:
                     "trace_id": result.trace_id,
                     "actual_planner_intent": result.actual_planner_intent,
                     "actual_control_mode": result.actual_control_mode,
+                    "linked_query_trace_ids": list(result.linked_query_trace_ids),
                     "citations": list(result.citations),
                     "grounding_score": round(result.grounding_score, 4),
                     "grounding_policy_action": result.grounding_policy_action,
@@ -235,6 +237,13 @@ class AgentEvalRunner:
             for citation in done_metadata.get("citations", [])
             if isinstance(citation, dict)
         ]
+        linked_query_trace_ids = [
+            str(value)
+            for value in done_metadata.get("query_trace_ids", [])
+            if str(value)
+        ]
+        if not linked_query_trace_ids and trace_id:
+            linked_query_trace_ids = self._lookup_linked_query_traces(trace_id)
         grounding_score = float(done_metadata.get("grounding_score", 0.0) or 0.0)
         grounding_policy_action = str(done_metadata.get("grounding_policy_action", "") or "")
         generation_mode = str(done_metadata.get("generation_mode", "") or "")
@@ -276,6 +285,7 @@ class AgentEvalRunner:
             trace_id=trace_id,
             actual_planner_intent=planner_intent,
             actual_control_mode=control_mode,
+            linked_query_trace_ids=linked_query_trace_ids,
             citations=citations,
             grounding_score=grounding_score,
             grounding_policy_action=grounding_policy_action,
@@ -319,6 +329,23 @@ class AgentEvalRunner:
                 data = stage.get("data", {})
                 return str(data.get("task_intent", "")), str(data.get("control_mode", ""))
         return "", ""
+
+    def _lookup_linked_query_traces(self, trace_id: str) -> List[str]:
+        if not trace_id:
+            return []
+        trace = self.trace_service.get_trace(trace_id)
+        if not trace:
+            return []
+        linked: List[str] = []
+        seen: set[str] = set()
+        for stage in trace.get("stages", []):
+            if stage.get("stage") != "tool_execution":
+                continue
+            query_trace_id = str(stage.get("data", {}).get("query_trace_id", "") or "")
+            if query_trace_id and query_trace_id not in seen:
+                seen.add(query_trace_id)
+                linked.append(query_trace_id)
+        return linked
 
     def _score_case(
         self,

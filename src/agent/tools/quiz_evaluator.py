@@ -13,8 +13,15 @@ from src.agent.tools.base import Tool
 from src.agent.types import ToolContext, ToolResult
 from src.agent.utils.sanitizer import sanitize_user_input
 from src.core.response.citation_generator import CitationGenerator
+from src.core.trace.trace_collector import TraceCollector
+from src.core.trace.trace_context import TraceContext
 
 logger = logging.getLogger(__name__)
+
+
+def _collection_name(search: Any) -> str:
+    value = getattr(search, "default_collection", "")
+    return value if isinstance(value, str) else ""
 
 EVAL_PROMPT_TEMPLATE = """请评判以下题目的用户答案。
 
@@ -70,12 +77,16 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
         error_memory: Any = None,
         knowledge_map: Any = None,
         hybrid_search: Any = None,
+        trace_enabled: bool = False,
+        trace_collector: TraceCollector | None = None,
     ) -> None:
         self._llm = llm_service
         self._error_memory = error_memory
         self._knowledge_map = knowledge_map
         self._search = hybrid_search
         self._citation_generator = CitationGenerator(snippet_max_length=220)
+        self._trace_enabled = trace_enabled
+        self._trace_collector = trace_collector or (TraceCollector() if trace_enabled else None)
 
     @property
     def name(self) -> str:
@@ -106,6 +117,8 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
                     "citations": [],
                     "evidence_summary": "",
                     "source_count": 0,
+                    "query_trace_id": "",
+                    "query_trace_ids": [],
                     "final_response_preferred": True,
                     "grounding_passthrough": True,
                 },
@@ -145,8 +158,13 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
             citations: list[dict] = []
             evidence_summary = ""
             evaluation_mode = "direct_no_evidence"
+            query_trace: TraceContext | None = None
 
-            evidence_results = await self._retrieve_supporting_evidence(args, concepts)
+            evidence_results, query_trace = await self._retrieve_supporting_evidence(
+                context,
+                args,
+                concepts,
+            )
             if evidence_results:
                 citations = [
                     citation.to_dict()
@@ -188,6 +206,8 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
                     "citations": citations,
                     "evidence_summary": evidence_summary,
                     "source_count": len(citations),
+                    "query_trace_id": query_trace.trace_id if query_trace is not None else "",
+                    "query_trace_ids": [query_trace.trace_id] if query_trace is not None else [],
                     "final_response_preferred": True,
                     "grounding_passthrough": True,
                 },
@@ -198,26 +218,53 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
 
     async def _retrieve_supporting_evidence(
         self,
+        context: ToolContext,
         args: QuizEvaluatorArgs,
         concepts: list[str],
-    ) -> list:
+    ) -> tuple[list, TraceContext | None]:
         if self._search is None:
-            return []
+            return [], None
         search_query = " ".join(
             part for part in [args.topic, " ".join(concepts[:4]), args.question[:120]] if part
         ).strip()
         if not search_query:
-            return []
+            return [], None
+        query_trace: TraceContext | None = None
+        if self._trace_enabled and self._trace_collector is not None:
+            query_trace = TraceContext(trace_type="query")
+            query_trace.metadata.update(
+                {
+                    "query": search_query[:200],
+                    "top_k": 4,
+                    "collection": _collection_name(self._search),
+                    "source": "quiz_evaluator",
+                    "parent_agent_trace_id": context.metadata.get("agent_trace_id", ""),
+                    "topic": args.topic[:120],
+                    "concept_count": len(concepts),
+                    "evaluation_mode_candidate": "evidence_enhanced",
+                }
+            )
         try:
             results = await asyncio.to_thread(
                 self._search.search,
                 query=search_query,
                 top_k=4,
+                trace=query_trace,
             )
-            return results if isinstance(results, list) else []
-        except Exception:
+            result_list = results if isinstance(results, list) else []
+            if query_trace is not None:
+                query_trace.metadata["result_count"] = len(result_list)
+                self._trace_collector.collect(query_trace)
+            return result_list, query_trace
+        except Exception as exc:
             logger.warning("QuizEvaluator evidence retrieval failed", exc_info=True)
-            return []
+            if query_trace is not None:
+                query_trace.record_stage(
+                    "error",
+                    {"phase": "search", "error": str(exc)[:300]},
+                )
+                self._trace_collector.collect(query_trace)
+            return [], query_trace
 
     async def _enhance_explanation_with_evidence(
         self,

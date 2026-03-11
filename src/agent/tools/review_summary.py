@@ -13,8 +13,15 @@ from src.agent.tools.base import Tool
 from src.agent.types import ToolContext, ToolResult
 from src.agent.utils.sanitizer import sanitize_user_input
 from src.core.response.citation_generator import CitationGenerator
+from src.core.trace.trace_collector import TraceCollector
+from src.core.trace.trace_context import TraceContext
 
 logger = logging.getLogger(__name__)
+
+
+def _collection_name(search: Any) -> str:
+    value = getattr(search, "default_collection", "")
+    return value if isinstance(value, str) else ""
 
 REVIEW_PROMPT_TEMPLATE = """请根据以下知识库检索内容，生成一份结构化的考点复习摘要。
 
@@ -52,12 +59,16 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
         llm_service: Any = None,
         error_memory: Any = None,
         knowledge_map: Any = None,
+        trace_enabled: bool = False,
+        trace_collector: TraceCollector | None = None,
     ) -> None:
         self._search = hybrid_search
         self._llm = llm_service
         self._error_memory = error_memory
         self._knowledge_map = knowledge_map
         self._citation_generator = CitationGenerator(snippet_max_length=220)
+        self._trace_enabled = trace_enabled
+        self._trace_collector = trace_collector or (TraceCollector() if trace_enabled else None)
 
     @property
     def name(self) -> str:
@@ -71,17 +82,46 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
         return ReviewSummaryArgs
 
     async def execute(self, context: ToolContext, args: ReviewSummaryArgs) -> ToolResult:
+        query_trace: TraceContext | None = None
         # Step 1: retrieve knowledge
         if self._search is None:
             return ToolResult(success=False, error="知识检索服务未初始化")
 
+        if self._trace_enabled and self._trace_collector is not None:
+            query_trace = TraceContext(trace_type="query")
+            query_trace.metadata.update(
+                {
+                    "query": args.topic[:200],
+                    "top_k": 8,
+                    "collection": _collection_name(self._search),
+                    "source": "review_summary",
+                    "parent_agent_trace_id": context.metadata.get("agent_trace_id", ""),
+                    "topic": args.topic[:120],
+                    "chapter": (args.chapter or "")[:120],
+                }
+            )
+
         try:
-            results = await asyncio.to_thread(self._search.search, query=args.topic, top_k=8)
+            results = await asyncio.to_thread(
+                self._search.search,
+                query=args.topic,
+                top_k=8,
+                trace=query_trace,
+            )
         except Exception as exc:
             logger.exception("HybridSearch failed in ReviewSummaryTool")
+            if query_trace is not None:
+                query_trace.record_stage(
+                    "error",
+                    {"phase": "search", "error": str(exc)[:300]},
+                )
+                self._trace_collector.collect(query_trace)
             return ToolResult(success=False, error=f"知识检索失败: {exc}")
 
         if not results:
+            if query_trace is not None:
+                query_trace.metadata["result_count"] = 0
+                self._trace_collector.collect(query_trace)
             return ToolResult(
                 success=True,
                 result_for_llm="未找到与该主题相关的知识库内容，请确认主题名称。",
@@ -90,11 +130,16 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
                     "citations": [],
                     "evidence_summary": "",
                     "source_count": 0,
-                    "query_trace_ids": [],
+                    "query_trace_id": query_trace.trace_id if query_trace is not None else "",
+                    "query_trace_ids": [query_trace.trace_id] if query_trace is not None else [],
                     "final_response_preferred": True,
                     "grounding_passthrough": True,
                 },
             )
+
+        if query_trace is not None:
+            query_trace.metadata["result_count"] = len(results)
+            self._trace_collector.collect(query_trace)
 
         citations = [
             citation.to_dict()
@@ -135,7 +180,8 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
                     "citations": citations,
                     "evidence_summary": evidence_summary,
                     "source_count": len(citations),
-                    "query_trace_ids": [],
+                    "query_trace_id": query_trace.trace_id if query_trace is not None else "",
+                    "query_trace_ids": [query_trace.trace_id] if query_trace is not None else [],
                     "final_response_preferred": True,
                     "grounding_passthrough": True,
                 },
@@ -160,7 +206,8 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
                         "citations": citations,
                         "evidence_summary": evidence_summary,
                         "source_count": len(citations),
-                        "query_trace_ids": [],
+                        "query_trace_id": query_trace.trace_id if query_trace is not None else "",
+                        "query_trace_ids": [query_trace.trace_id] if query_trace is not None else [],
                         "final_response_preferred": True,
                         "grounding_passthrough": True,
                     },
@@ -173,7 +220,8 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
                     "citations": citations,
                     "evidence_summary": evidence_summary,
                     "source_count": len(citations),
-                    "query_trace_ids": [],
+                    "query_trace_id": query_trace.trace_id if query_trace is not None else "",
+                    "query_trace_ids": [query_trace.trace_id] if query_trace is not None else [],
                     "final_response_preferred": True,
                     "grounding_passthrough": True,
                 },
@@ -188,7 +236,8 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
                     "citations": citations,
                     "evidence_summary": evidence_summary,
                     "source_count": len(citations),
-                    "query_trace_ids": [],
+                    "query_trace_id": query_trace.trace_id if query_trace is not None else "",
+                    "query_trace_ids": [query_trace.trace_id] if query_trace is not None else [],
                     "final_response_preferred": True,
                     "grounding_passthrough": True,
                 },

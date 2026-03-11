@@ -8,6 +8,7 @@ Provides two core components:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import re
 from datetime import datetime, timezone
@@ -15,6 +16,8 @@ from typing import Any, Optional
 
 from src.agent.hooks.lifecycle import LifecycleHook
 from src.agent.types import Conversation
+from src.core.trace.trace_collector import TraceCollector
+from src.core.trace.trace_context import TraceContext
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +29,10 @@ _PREF_EXAMPLE_RE = re.compile(r"举例|例子|示例|example|举个", re.I)
 
 _VALID_DETAIL_LEVELS = {"concise", "normal", "detailed"}
 _VALID_STYLE_VALUES = {"default", "exam_focused", "example_heavy"}
+
+
+def _hash_user_id(user_id: str) -> str:
+    return hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:12]
 
 # ── topic extraction patterns ──
 _TOPIC_PATTERNS = [
@@ -233,6 +240,8 @@ class MemoryRecordHook(LifecycleHook):
         session_write_min_confidence: float = 0.2,
         preference_write_min_confidence: float = 0.65,
         preference_conflict_guard: bool = True,
+        trace_enabled: bool = False,
+        trace_collector: TraceCollector | None = None,
     ) -> None:
         self._profile = student_profile
         self._skills = skill_memory
@@ -245,115 +254,276 @@ class MemoryRecordHook(LifecycleHook):
         self._session_write_min_confidence = session_write_min_confidence
         self._preference_write_min_confidence = preference_write_min_confidence
         self._preference_conflict_guard = preference_conflict_guard
+        self._trace_enabled = trace_enabled
+        self._trace_collector = trace_collector or (TraceCollector() if trace_enabled else None)
 
     async def after_message(self, conversation: Conversation) -> None:
         user_id = conversation.user_id
-
-        # Step 1: Extract learning data from conversation
-        extracted = await self._extract_learning_data(conversation)
-        extraction_meta = dict(extracted.get("extraction_metadata", {}))
-        preference_updates = dict(extracted.get("user_preference", {}))
-        should_save_session, session_reason = self._should_save_session(extracted)
-        should_update_preferences, preference_reason = self._should_update_preferences(extracted)
-        write_decisions = {
-            "session_saved": should_save_session,
-            "session_reason": session_reason,
-            "profile_preferences_updated": bool(preference_updates) and should_update_preferences,
-            "profile_preferences_reason": preference_reason,
-        }
-        extraction_meta["write_decisions"] = write_decisions
-        extracted["extraction_metadata"] = extraction_meta
-
-        # Step 2: Save session summary (K1)
-        if self._sessions and should_save_session:
-            try:
-                from src.agent.memory.session_memory import SessionSummary
-
-                summary = SessionSummary(
-                    session_id=conversation.id,
-                    topics=extracted.get("topics_discussed", []),
-                    key_questions=extracted.get("key_questions", []),
-                    mastery_observations=self._build_mastery_obs(extracted),
-                    preference_snapshot=preference_updates,
-                    summary_text=extracted.get("summary", ""),
-                    extraction_metadata=extraction_meta,
-                )
-                await self._sessions.save_session(user_id, summary)
-            except Exception:
-                logger.warning("Failed to save session summary", exc_info=True)
-        elif self._sessions:
-            logger.info(
-                "Skipped session memory write for %s (%s, confidence=%.2f)",
-                conversation.id,
-                session_reason,
-                float(extraction_meta.get("confidence", 0.0) or 0.0),
+        memory_trace: TraceContext | None = None
+        if self._trace_enabled and self._trace_collector is not None:
+            memory_trace = TraceContext(trace_type="memory")
+            memory_trace.metadata.update(
+                {
+                    "conversation_id": conversation.id,
+                    "user_id_hash": _hash_user_id(user_id),
+                    "configured_extraction_mode": self._mode,
+                    "write_gating_enabled": self._write_gating_enabled,
+                    "session_write_min_confidence": self._session_write_min_confidence,
+                    "preference_write_min_confidence": self._preference_write_min_confidence,
+                }
+            )
+            memory_trace.record_stage(
+                "conversation_scan",
+                {
+                    "message_count": len(conversation.messages),
+                    "user_message_count": sum(1 for msg in conversation.messages if msg.role == "user"),
+                    "assistant_message_count": sum(
+                        1 for msg in conversation.messages if msg.role == "assistant"
+                    ),
+                    "user_text_length": len(self._format_user_text(conversation, max_chars=4000)),
+                },
             )
 
-        # Step 3: Update student profile (K5 — fix total_sessions, sync topics)
-        if self._profile:
-            try:
-                profile = await self._profile.get_profile(user_id)
-                updates: dict[str, Any] = {
-                    "total_sessions": profile.total_sessions + 1,
-                    "last_active": datetime.now(timezone.utc),
-                }
+        try:
+            # Step 1: Extract learning data from conversation
+            extracted = await self._extract_learning_data(conversation)
+            extraction_meta = dict(extracted.get("extraction_metadata", {}))
+            preference_updates = dict(extracted.get("user_preference", {}))
+            should_save_session, session_reason = self._should_save_session(extracted)
+            should_update_preferences, preference_reason = self._should_update_preferences(extracted)
+            write_decisions = {
+                "session_saved": should_save_session,
+                "session_reason": session_reason,
+                "profile_preferences_updated": bool(preference_updates) and should_update_preferences,
+                "profile_preferences_reason": preference_reason,
+            }
+            extraction_meta["write_decisions"] = write_decisions
+            extracted["extraction_metadata"] = extraction_meta
 
-                # Merge preference updates
-                if preference_updates and should_update_preferences:
-                    merged_prefs = dict(profile.preferences or {})
-                    merged_prefs.update(
+            if memory_trace is not None:
+                memory_trace.metadata["extraction_mode_used"] = extraction_meta.get("mode", "none")
+                memory_trace.metadata["write_decisions"] = write_decisions
+                memory_trace.metadata["preference_conflicts"] = extraction_meta.get(
+                    "preference_conflicts", []
+                )
+                memory_trace.metadata["confidence"] = float(
+                    extraction_meta.get("confidence", 0.0) or 0.0
+                )
+                memory_trace.record_stage(
+                    "memory_extraction",
+                    {
+                        "confidence": float(extraction_meta.get("confidence", 0.0) or 0.0),
+                        "signal_counts": extraction_meta.get("signal_counts", {}),
+                        "preference_conflicts": extraction_meta.get("preference_conflicts", []),
+                        "topics_count": len(extracted.get("topics_discussed", [])),
+                        "summary_present": bool(extracted.get("summary", "")),
+                    },
+                )
+                memory_trace.record_stage(
+                    "memory_quality_gate",
+                    {
+                        "write_decisions": write_decisions,
+                        "session_reason": session_reason,
+                        "profile_preferences_reason": preference_reason,
+                    },
+                )
+
+            # Step 2: Save session summary (K1)
+            if self._sessions and should_save_session:
+                try:
+                    from src.agent.memory.session_memory import SessionSummary
+
+                    summary = SessionSummary(
+                        session_id=conversation.id,
+                        topics=extracted.get("topics_discussed", []),
+                        key_questions=extracted.get("key_questions", []),
+                        mastery_observations=self._build_mastery_obs(extracted),
+                        preference_snapshot=preference_updates,
+                        summary_text=extracted.get("summary", ""),
+                        extraction_metadata=extraction_meta,
+                    )
+                    await self._sessions.save_session(user_id, summary)
+                    if memory_trace is not None:
+                        memory_trace.record_stage(
+                            "session_memory_write",
+                            {
+                                "status": "saved",
+                                "reason": session_reason,
+                                "topics_count": len(summary.topics),
+                                "question_count": len(summary.key_questions),
+                            },
+                        )
+                except Exception as exc:
+                    logger.warning("Failed to save session summary", exc_info=True)
+                    if memory_trace is not None:
+                        memory_trace.record_stage(
+                            "session_memory_write",
+                            {
+                                "status": "failed",
+                                "reason": "exception",
+                                "error": str(exc)[:300],
+                            },
+                        )
+            elif self._sessions:
+                logger.info(
+                    "Skipped session memory write for %s (%s, confidence=%.2f)",
+                    conversation.id,
+                    session_reason,
+                    float(extraction_meta.get("confidence", 0.0) or 0.0),
+                )
+                if memory_trace is not None:
+                    memory_trace.record_stage(
+                        "session_memory_write",
                         {
-                            k: v
-                            for k, v in preference_updates.items()
-                            if v and v != "default" and v != "normal"
-                        }
+                            "status": "skipped",
+                            "reason": session_reason,
+                        },
                     )
-                    updates["preferences"] = merged_prefs
-                elif preference_updates:
-                    logger.info(
-                        "Skipped preference update for %s (%s, confidence=%.2f)",
-                        conversation.id,
-                        preference_reason,
-                        float(extraction_meta.get("confidence", 0.0) or 0.0),
-                    )
+            elif memory_trace is not None:
+                memory_trace.record_stage(
+                    "session_memory_write",
+                    {
+                        "status": "skipped",
+                        "reason": "session_memory_disabled",
+                    },
+                )
 
-                # Sync weak/strong from knowledge map
-                if self._kmap:
-                    try:
-                        weak_nodes = await self._kmap.get_weak_nodes(user_id)
-                        weak_from_kmap = [n.concept for n in weak_nodes[:10]]
-                        if self._errors:
-                            weak_from_err = await self._errors.get_weak_concepts(user_id)
-                            weak_merged = list(dict.fromkeys(weak_from_kmap + weak_from_err[:10]))
-                        else:
-                            weak_merged = weak_from_kmap
-                        if weak_merged:
-                            updates["weak_topics"] = weak_merged[:15]
+            # Step 3: Update student profile (K5 — fix total_sessions, sync topics)
+            if self._profile:
+                try:
+                    profile = await self._profile.get_profile(user_id)
+                    updates: dict[str, Any] = {
+                        "total_sessions": profile.total_sessions + 1,
+                        "last_active": datetime.now(timezone.utc),
+                    }
 
-                        all_rows = await self._kmap._get_all_nodes(user_id)
-                        strong = [n.concept for n in all_rows if n.mastery_level >= 0.8]
-                        if strong:
-                            updates["strong_topics"] = strong[:15]
+                    # Merge preference updates
+                    if preference_updates and should_update_preferences:
+                        merged_prefs = dict(profile.preferences or {})
+                        merged_prefs.update(
+                            {
+                                k: v
+                                for k, v in preference_updates.items()
+                                if v and v != "default" and v != "normal"
+                            }
+                        )
+                        updates["preferences"] = merged_prefs
+                    elif preference_updates:
+                        logger.info(
+                            "Skipped preference update for %s (%s, confidence=%.2f)",
+                            conversation.id,
+                            preference_reason,
+                            float(extraction_meta.get("confidence", 0.0) or 0.0),
+                        )
 
-                        # Compute overall accuracy
-                        total_q = sum(n.quiz_count for n in all_rows)
-                        total_c = sum(n.correct_count for n in all_rows)
-                        if total_q > 0:
-                            updates["overall_accuracy"] = round(total_c / total_q, 3)
-                            updates["total_quizzes"] = total_q
-                    except Exception:
-                        logger.debug("Could not sync knowledge map to profile")
+                    # Sync weak/strong from knowledge map
+                    if self._kmap:
+                        try:
+                            weak_nodes = await self._kmap.get_weak_nodes(user_id)
+                            weak_from_kmap = [n.concept for n in weak_nodes[:10]]
+                            if self._errors:
+                                weak_from_err = await self._errors.get_weak_concepts(user_id)
+                                weak_merged = list(
+                                    dict.fromkeys(weak_from_kmap + weak_from_err[:10])
+                                )
+                            else:
+                                weak_merged = weak_from_kmap
+                            if weak_merged:
+                                updates["weak_topics"] = weak_merged[:15]
 
-                await self._profile.update_profile(user_id, updates)
-            except Exception:
-                logger.warning("Failed to update student profile", exc_info=True)
+                            all_rows = await self._kmap._get_all_nodes(user_id)
+                            strong = [n.concept for n in all_rows if n.mastery_level >= 0.8]
+                            if strong:
+                                updates["strong_topics"] = strong[:15]
 
-        # Step 4: Save tool chains to skill memory (existing logic)
-        if self._skills:
-            try:
-                await self._save_tool_chains(conversation)
-            except Exception:
-                logger.warning("Failed to save tool chains")
+                            total_q = sum(n.quiz_count for n in all_rows)
+                            total_c = sum(n.correct_count for n in all_rows)
+                            if total_q > 0:
+                                updates["overall_accuracy"] = round(total_c / total_q, 3)
+                                updates["total_quizzes"] = total_q
+                        except Exception:
+                            logger.debug("Could not sync knowledge map to profile")
+
+                    await self._profile.update_profile(user_id, updates)
+                    if memory_trace is not None:
+                        profile_status = (
+                            "updated" if bool(preference_updates) and should_update_preferences else "skipped"
+                        )
+                        profile_reason = "stats_only"
+                        if preference_reason != "no_preference_signal":
+                            profile_reason = preference_reason
+                        memory_trace.record_stage(
+                            "profile_update",
+                            {
+                                "status": profile_status,
+                                "reason": profile_reason,
+                                "updated_fields": sorted(updates.keys()),
+                            },
+                        )
+                except Exception as exc:
+                    logger.warning("Failed to update student profile", exc_info=True)
+                    if memory_trace is not None:
+                        memory_trace.record_stage(
+                            "profile_update",
+                            {
+                                "status": "failed",
+                                "reason": "exception",
+                                "error": str(exc)[:300],
+                            },
+                        )
+            elif memory_trace is not None:
+                memory_trace.record_stage(
+                    "profile_update",
+                    {
+                        "status": "skipped",
+                        "reason": "student_profile_disabled",
+                    },
+                )
+
+            # Step 4: Save tool chains to skill memory (existing logic)
+            if self._skills:
+                try:
+                    saved = await self._save_tool_chains(conversation)
+                    if memory_trace is not None:
+                        memory_trace.record_stage(
+                            "skill_memory_write",
+                            {
+                                "status": "saved" if saved else "skipped",
+                                "reason": "tool_chain_present" if saved else "no_tool_chain",
+                            },
+                        )
+                except Exception as exc:
+                    logger.warning("Failed to save tool chains")
+                    if memory_trace is not None:
+                        memory_trace.record_stage(
+                            "skill_memory_write",
+                            {
+                                "status": "failed",
+                                "reason": "exception",
+                                "error": str(exc)[:300],
+                            },
+                        )
+            elif memory_trace is not None:
+                memory_trace.record_stage(
+                    "skill_memory_write",
+                    {
+                        "status": "skipped",
+                        "reason": "skill_memory_disabled",
+                    },
+                )
+        except Exception as exc:
+            if memory_trace is not None:
+                memory_trace.record_stage(
+                    "error",
+                    {
+                        "phase": "after_message",
+                        "error": str(exc)[:300],
+                    },
+                )
+            raise
+        finally:
+            if memory_trace is not None and self._trace_collector is not None:
+                self._trace_collector.collect(memory_trace)
 
     # ── Extraction engines ──
 
@@ -631,7 +801,7 @@ class MemoryRecordHook(LifecycleHook):
             obs[t] = "strong"
         return obs
 
-    async def _save_tool_chains(self, conversation: Conversation) -> None:
+    async def _save_tool_chains(self, conversation: Conversation) -> bool:
         tool_chain: list[str] = []
         for m in conversation.messages:
             if m.tool_calls:
@@ -652,5 +822,7 @@ class MemoryRecordHook(LifecycleHook):
                 )
                 try:
                     await self._skills.save_usage(conversation.user_id, record)
+                    return True
                 except Exception:
                     logger.warning("Failed to save tool usage record")
+        return False

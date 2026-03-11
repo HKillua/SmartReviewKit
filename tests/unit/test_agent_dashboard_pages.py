@@ -104,11 +104,64 @@ class TestAgentTracesHelpers:
         assert len(filtered) == 1
         assert filtered[0]["metadata"]["message_preview"] == "TCP handshake"
 
+    def test_filter_query_traces_by_source(self) -> None:
+        from src.observability.dashboard.pages.query_traces import _filter_query_traces
+
+        traces = [
+            {"metadata": {"source": "knowledge_query", "query": "TCP"}},
+            {"metadata": {"source": "review_summary", "query": "DNS"}},
+        ]
+
+        filtered = _filter_query_traces(traces, source="review_summary")
+        assert len(filtered) == 1
+        assert filtered[0]["metadata"]["source"] == "review_summary"
+
+    def test_extract_memory_trace_overview(self) -> None:
+        from src.observability.dashboard.pages.memory_traces import _extract_memory_overview
+
+        trace = {
+            "metadata": {
+                "conversation_id": "conv_1",
+                "user_id_hash": "abc123",
+                "configured_extraction_mode": "both",
+                "extraction_mode_used": "rule",
+                "confidence": 0.72,
+                "preference_conflicts": ["detail_level"],
+                "write_decisions": {"session_saved": False},
+            },
+            "stages": [
+                {
+                    "stage": "memory_extraction",
+                    "data": {
+                        "confidence": 0.72,
+                        "signal_counts": {"topics": 1},
+                        "preference_conflicts": ["detail_level"],
+                    },
+                },
+                {
+                    "stage": "session_memory_write",
+                    "data": {"status": "skipped", "reason": "low_confidence"},
+                },
+                {
+                    "stage": "profile_update",
+                    "data": {"status": "skipped", "reason": "preference_conflict"},
+                },
+            ],
+        }
+
+        overview = _extract_memory_overview(trace)
+        assert overview["mode"] == "rule"
+        assert overview["session_status"] == "skipped"
+        assert overview["profile_reason"] == "preference_conflict"
+        assert overview["preference_conflicts"] == ["detail_level"]
+
     def test_agent_page_modules_import(self) -> None:
         from src.observability.dashboard.pages import (
             agent_evaluation_panel,
             agent_traces,
+            memory_traces,
         )
 
         assert hasattr(agent_traces, "render")
         assert hasattr(agent_evaluation_panel, "render")
+        assert hasattr(memory_traces, "render")
