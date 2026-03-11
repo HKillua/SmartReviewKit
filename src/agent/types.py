@@ -47,6 +47,15 @@ class ToolCallData(BaseModel):
     arguments: dict[str, Any] = Field(default_factory=dict)
 
 
+class ToolErrorType(str, Enum):
+    UNKNOWN_TOOL = "unknown_tool"
+    INVALID_ARGUMENTS = "invalid_arguments"
+    BLOCKED_BY_HOOK = "blocked_by_hook"
+    TIMEOUT = "timeout"
+    EXECUTION_ERROR = "execution_error"
+    TOOL_REPORTED_ERROR = "tool_reported_error"
+
+
 class ToolContext(BaseModel):
     user_id: str
     conversation_id: str

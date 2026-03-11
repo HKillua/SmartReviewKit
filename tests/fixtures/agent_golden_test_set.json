@@ -1,0 +1,61 @@
+{
+  "description": "Agent runtime golden test set for course-learning workflows",
+  "version": "1.0",
+  "test_cases": [
+    {
+      "id": "knowledge_query_tcp_handshake",
+      "message": "请结合知识库讲一下 TCP 三次握手的过程。",
+      "user_id": "agent_eval_user",
+      "conversation_id": "agent_eval_conv_001",
+      "expected_tools": ["knowledge_query"],
+      "forbidden_tools": ["document_ingest"],
+      "expected_answer_substrings": ["TCP", "三次握手"],
+      "forbidden_answer_substrings": ["无法回答"],
+      "notes": "基础知识问答，应该走 knowledge_query。"
+    },
+    {
+      "id": "review_summary_dns",
+      "message": "帮我总结一下 DNS 解析流程的复习要点。",
+      "user_id": "agent_eval_user",
+      "conversation_id": "agent_eval_conv_002",
+      "expected_tools": ["review_summary"],
+      "forbidden_tools": ["document_ingest"],
+      "expected_answer_substrings": ["DNS", "复习"],
+      "forbidden_answer_substrings": [],
+      "notes": "复习类问题优先走 review_summary。"
+    },
+    {
+      "id": "quiz_generator_udp",
+      "message": "围绕 UDP 给我出 3 道练习题。",
+      "user_id": "agent_eval_user",
+      "conversation_id": "agent_eval_conv_003",
+      "expected_tools": ["quiz_generator"],
+      "forbidden_tools": ["document_ingest"],
+      "expected_answer_substrings": ["UDP"],
+      "forbidden_answer_substrings": [],
+      "notes": "练习题生成应命中 quiz_generator。"
+    },
+    {
+      "id": "quiz_evaluator_basic",
+      "message": "我回答一道题：题目是 TCP 为什么需要三次握手？我的答案是为了确保双方收发能力正常。请帮我判分。",
+      "user_id": "agent_eval_user",
+      "conversation_id": "agent_eval_conv_004",
+      "expected_tools": ["quiz_evaluator"],
+      "forbidden_tools": ["document_ingest"],
+      "expected_answer_substrings": [],
+      "forbidden_answer_substrings": [],
+      "notes": "判题类请求应命中 quiz_evaluator。"
+    },
+    {
+      "id": "document_ingest_upload",
+      "message": "请把 /tmp/network_notes.pdf 导入知识库。",
+      "user_id": "agent_eval_user",
+      "conversation_id": "agent_eval_conv_005",
+      "expected_tools": ["document_ingest"],
+      "forbidden_tools": [],
+      "expected_answer_substrings": [],
+      "forbidden_answer_substrings": [],
+      "notes": "文档导入请求应命中 document_ingest。"
+    }
+  ]
+}

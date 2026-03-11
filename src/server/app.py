@@ -42,6 +42,7 @@ from src.agent.tools.knowledge_query import KnowledgeQueryTool
 from src.agent.tools.quiz_evaluator import QuizEvaluatorTool
 from src.agent.tools.quiz_generator import QuizGeneratorTool
 from src.agent.tools.review_summary import ReviewSummaryTool
+from src.core.trace.trace_collector import TraceCollector
 from src.server.chat_handler import ChatHandler
 from src.server.routes import configure_routes, router
 
@@ -330,12 +331,17 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         skill_workflow=skill_workflow,
         context_filter=context_filter,
         review_hook=review_hook,
+        trace_enabled=bool(settings.get("observability", {}).get("trace_enabled", False)),
+        trace_collector=TraceCollector(),
     )
 
     chat_handler = ChatHandler(agent)
 
     # --- FastAPI ---
     app = FastAPI(title="Course Learning Agent", version="0.1.0")
+    app.state.agent = agent
+    app.state.chat_handler = chat_handler
+    app.state.settings_path = settings_path
 
     app.add_middleware(
         CORSMiddleware,

@@ -15,7 +15,19 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import streamlit as st
+try:
+    import streamlit as st
+except ModuleNotFoundError:  # pragma: no cover - optional UI dependency
+    class _StreamlitStub:
+        def __getattr__(self, name: str):
+            def _missing(*args, **kwargs):
+                raise ModuleNotFoundError(
+                    "streamlit is required to render the Evaluation Panel page"
+                )
+
+            return _missing
+
+    st = _StreamlitStub()
 
 logger = logging.getLogger(__name__)
 

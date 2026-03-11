@@ -6,7 +6,7 @@ import pytest
 from pydantic import BaseModel
 
 from src.agent.tools.base import Tool, ToolRegistry
-from src.agent.types import ToolCallData, ToolContext, ToolResult
+from src.agent.types import ToolCallData, ToolContext, ToolErrorType, ToolResult
 
 
 class MockArgs(BaseModel):
@@ -103,6 +103,8 @@ class TestToolRegistry:
         result = await reg.execute(tc, ctx)
         assert result.success is False
         assert "Invalid arguments" in result.error
+        assert result.metadata["error_type"] == ToolErrorType.INVALID_ARGUMENTS.value
+        assert result.metadata["retryable"] is False
 
     @pytest.mark.asyncio
     async def test_execute_unknown_tool(self, ctx):
@@ -110,6 +112,7 @@ class TestToolRegistry:
         tc = ToolCallData(id="tc1", name="nope", arguments={})
         result = await reg.execute(tc, ctx)
         assert result.success is False
+        assert result.metadata["error_type"] == ToolErrorType.UNKNOWN_TOOL.value
 
     @pytest.mark.asyncio
     async def test_execute_exception(self, ctx):
@@ -119,3 +122,30 @@ class TestToolRegistry:
         result = await reg.execute(tc, ctx)
         assert result.success is False
         assert "Boom!" in result.error
+        assert result.metadata["error_type"] == ToolErrorType.EXECUTION_ERROR.value
+        assert result.metadata["tool_name"] == "failing_tool"
+
+    @pytest.mark.asyncio
+    async def test_execute_normalizes_tool_reported_error(self, ctx):
+        class ReturningFailureTool(Tool[MockArgs]):
+            @property
+            def name(self) -> str:
+                return "returning_failure"
+
+            @property
+            def description(self) -> str:
+                return "Returns a structured tool failure"
+
+            def get_args_schema(self) -> type[MockArgs]:
+                return MockArgs
+
+            async def execute(self, context: ToolContext, args: MockArgs) -> ToolResult:
+                return ToolResult(success=False, error="bad downstream state")
+
+        reg = ToolRegistry()
+        reg.register(ReturningFailureTool())
+        tc = ToolCallData(id="tc1", name="returning_failure", arguments={"query": "x"})
+        result = await reg.execute(tc, ctx)
+        assert result.success is False
+        assert result.metadata["error_type"] == ToolErrorType.TOOL_REPORTED_ERROR.value
+        assert result.metadata["retryable"] is False

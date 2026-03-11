@@ -80,15 +80,20 @@ class TraceService:
         timings: List[Dict[str, Any]] = []
         for s in stages:
             # The raw stage dict has: stage, timestamp, data (dict), elapsed_ms
-            # Extract the inner 'data' dict directly rather than flattening
             stage_data = s.get("data", {})
-            if not isinstance(stage_data, dict):
-                stage_data = {}
+            if isinstance(stage_data, dict) and stage_data:
+                normalized_data = stage_data
+            else:
+                normalized_data = {
+                    key: value
+                    for key, value in s.items()
+                    if key not in {"stage", "timestamp", "elapsed_ms", "data"}
+                }
             timings.append(
                 {
                     "stage_name": s.get("stage"),
                     "elapsed_ms": s.get("elapsed_ms", 0),
-                    "data": stage_data,
+                    "data": normalized_data,
                 }
             )
         return timings

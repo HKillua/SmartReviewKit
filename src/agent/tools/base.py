@@ -15,11 +15,38 @@ from typing import Any, Generic, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
-from src.agent.types import ToolCallData, ToolContext, ToolResult
+from src.agent.types import ToolCallData, ToolContext, ToolErrorType, ToolResult
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
+
+
+def _tool_error_result(
+    tool_name: str,
+    error: str,
+    *,
+    error_type: ToolErrorType,
+    retryable: bool = False,
+    details: dict[str, Any] | None = None,
+) -> ToolResult:
+    metadata: dict[str, Any] = {
+        "tool_name": tool_name,
+        "error_type": error_type.value,
+        "retryable": retryable,
+    }
+    if details:
+        metadata["error_details"] = details
+    return ToolResult(success=False, error=error, metadata=metadata)
+
+
+def _normalize_tool_result(tool_name: str, result: ToolResult) -> ToolResult:
+    metadata = dict(result.metadata)
+    metadata.setdefault("tool_name", tool_name)
+    metadata.setdefault("retryable", False)
+    if not result.success:
+        metadata.setdefault("error_type", ToolErrorType.TOOL_REPORTED_ERROR.value)
+    return result.model_copy(update={"metadata": metadata})
 
 
 class Tool(ABC, Generic[T]):
@@ -98,27 +125,46 @@ class ToolRegistry:
         try:
             tool = self.get_tool(tool_call.name)
         except KeyError as exc:
-            return ToolResult(success=False, error=str(exc))
+            return _tool_error_result(
+                tool_call.name,
+                str(exc),
+                error_type=ToolErrorType.UNKNOWN_TOOL,
+                retryable=False,
+            )
 
         try:
             schema_cls = tool.get_args_schema()
             args = schema_cls.model_validate(tool_call.arguments)
         except ValidationError as exc:
-            return ToolResult(
-                success=False,
-                error=f"Invalid arguments for '{tool_call.name}': {exc}",
+            return _tool_error_result(
+                tool_call.name,
+                f"Invalid arguments for '{tool_call.name}': {exc}",
+                error_type=ToolErrorType.INVALID_ARGUMENTS,
+                retryable=False,
+                details={
+                    "validation_errors": exc.errors()[:5],
+                },
             )
 
         try:
-            return await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 tool.execute(context, args),
                 timeout=timeout,
             )
+            return _normalize_tool_result(tool_call.name, result)
         except asyncio.TimeoutError:
-            return ToolResult(
-                success=False,
-                error=f"Tool '{tool_call.name}' timed out after {timeout}s",
+            return _tool_error_result(
+                tool_call.name,
+                f"Tool '{tool_call.name}' timed out after {timeout}s",
+                error_type=ToolErrorType.TIMEOUT,
+                retryable=True,
+                details={"timeout_seconds": timeout},
             )
         except Exception as exc:
             logger.exception("Tool '%s' execution failed", tool_call.name)
-            return ToolResult(success=False, error=f"Tool execution error: {exc}")
+            return _tool_error_result(
+                tool_call.name,
+                f"Tool execution error: {exc}",
+                error_type=ToolErrorType.EXECUTION_ERROR,
+                retryable=False,
+            )

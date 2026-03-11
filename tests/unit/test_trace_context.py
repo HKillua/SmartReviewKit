@@ -22,6 +22,10 @@ class TestTraceContextInit:
         tc = TraceContext(trace_type="ingestion")
         assert tc.trace_type == "ingestion"
 
+    def test_agent_trace_type(self) -> None:
+        tc = TraceContext(trace_type="agent")
+        assert tc.trace_type == "agent"
+
     def test_trace_id_is_uuid(self) -> None:
         tc = TraceContext()
         assert len(tc.trace_id) == 36  # UUID-4 length with dashes
@@ -160,6 +164,11 @@ class TestToDict:
         tc = TraceContext(trace_type="query")
         tc.finish()
         assert tc.to_dict()["trace_type"] == "query"
+
+    def test_agent_trace_type_in_output(self) -> None:
+        tc = TraceContext(trace_type="agent")
+        tc.finish()
+        assert tc.to_dict()["trace_type"] == "agent"
 
     def test_json_serialisable(self) -> None:
         tc = TraceContext(trace_type="ingestion")

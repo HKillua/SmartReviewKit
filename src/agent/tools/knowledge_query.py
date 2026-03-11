@@ -10,6 +10,8 @@ from pydantic import BaseModel, Field
 
 from src.agent.tools.base import Tool
 from src.agent.types import ToolContext, ToolResult
+from src.core.trace.trace_collector import TraceCollector
+from src.core.trace.trace_context import TraceContext
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +48,7 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
         self._current_collection: Optional[str] = None
         self._embedding_client: Any = None
         self._init_lock = asyncio.Lock()
+        self._trace_collector = TraceCollector()
 
         retrieval_cfg = None
         if settings and hasattr(settings, 'retrieval'):
@@ -64,6 +67,16 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
 
     def get_args_schema(self) -> type[KnowledgeQueryArgs]:
         return KnowledgeQueryArgs
+
+    def _trace_enabled(self) -> bool:
+        observability = {}
+        if isinstance(self._settings, dict):
+            observability = self._settings.get("observability", {}) or {}
+        elif self._settings is not None and hasattr(self._settings, "observability"):
+            observability = getattr(self._settings, "observability") or {}
+        if isinstance(observability, dict):
+            return bool(observability.get("trace_enabled", False))
+        return bool(getattr(observability, "trace_enabled", False))
 
     def _ensure_initialized(self, collection: str = "computer_network") -> None:
         if self._initialized and self._current_collection == collection:
@@ -114,6 +127,7 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
         logger.info("KnowledgeQueryTool initialized for collection: %s", collection)
 
     async def execute(self, context: ToolContext, args: KnowledgeQueryArgs) -> ToolResult:
+        query_trace: TraceContext | None = None
         try:
             # --- Adaptive routing ---
             routing = None
@@ -145,6 +159,18 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
             async with self._init_lock:
                 self._ensure_initialized(args.collection)
 
+            if self._trace_enabled():
+                query_trace = TraceContext(trace_type="query")
+                query_trace.metadata.update(
+                    {
+                        "query": args.query[:200],
+                        "top_k": args.top_k,
+                        "collection": args.collection,
+                        "source": "agent",
+                        "parent_agent_trace_id": context.metadata.get("agent_trace_id", ""),
+                    }
+                )
+
             effective_query = args.query
             hyde_vector = None
 
@@ -170,6 +196,18 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                     except Exception:
                         logger.warning("HyDE failed, using standard embedding")
 
+            if query_trace is not None:
+                query_trace.metadata["effective_query"] = effective_query[:200]
+                query_trace.record_stage(
+                    "agent_query_setup",
+                    {
+                        "rewrite_enabled": self._rewrite_enabled,
+                        "hyde_enabled": self._hyde_enabled,
+                        "multi_query_enabled": self._multi_query_enabled,
+                        "used_hyde_vector": hyde_vector is not None,
+                    },
+                )
+
             search_kwargs: dict[str, Any] = {}
             if args.content_type:
                 search_kwargs["filters"] = {"content_type": args.content_type}
@@ -190,13 +228,18 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                 except Exception:
                     logger.warning("Multi-query decompose failed")
 
+            if query_trace is not None:
+                query_trace.metadata["sub_query_count"] = len(queries)
+
             # P3+P6: run searches via asyncio.to_thread to avoid blocking
             # the event loop, and run sub-queries in parallel.
             async def _search_one(q: str) -> list:
+                trace_arg = query_trace if len(queries) == 1 else None
                 r = await asyncio.to_thread(
                     self._hybrid_search.search,
                     query=q,
                     top_k=args.top_k,
+                    trace=trace_arg,
                     **search_kwargs,
                 )
                 return r if isinstance(r, list) else []
@@ -217,6 +260,7 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                 return ToolResult(
                     success=True,
                     result_for_llm="未找到与查询相关的知识库内容。请尝试换一种表述重新提问。",
+                    metadata={"query_trace_id": query_trace.trace_id} if query_trace is not None else {},
                 )
 
             if args.use_parent:
@@ -261,11 +305,24 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                 except Exception:
                     logger.debug("Semantic cache write failed", exc_info=True)
 
-            return ToolResult(success=True, result_for_llm=result_text)
+            metadata = {}
+            if query_trace is not None:
+                metadata["query_trace_id"] = query_trace.trace_id
+            return ToolResult(success=True, result_for_llm=result_text, metadata=metadata)
 
         except Exception as exc:
             logger.exception("KnowledgeQueryTool failed")
-            return ToolResult(success=False, error=f"知识检索失败: {exc}")
+            metadata = {}
+            if query_trace is not None:
+                metadata["query_trace_id"] = query_trace.trace_id
+                query_trace.record_stage(
+                    "error",
+                    {"phase": "knowledge_query", "error": str(exc)[:300]},
+                )
+            return ToolResult(success=False, error=f"知识检索失败: {exc}", metadata=metadata)
+        finally:
+            if query_trace is not None:
+                self._trace_collector.collect(query_trace)
 
     def _resolve_parents(self, results: list, collection: str) -> list:
         """Replace child chunks with their parent chunks for richer context."""
