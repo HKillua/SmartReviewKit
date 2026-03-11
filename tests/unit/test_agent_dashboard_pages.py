@@ -57,6 +57,7 @@ class TestAgentTracesHelpers:
                 "grounding_score": 0.81,
                 "grounding_policy_action": "normal",
                 "citations": [{"index": 1, "source": "network.md"}],
+                "evaluation_mode": "evidence_enhanced",
             },
             "stages": [
                 {
@@ -74,6 +75,7 @@ class TestAgentTracesHelpers:
         assert _extract_linked_query_trace_ids(trace) == ["q1"]
         assert _extract_planner_info(trace)["task_intent"] == "review_summary"
         assert _extract_grounding_info(trace)["citation_count"] == 1
+        assert _extract_grounding_info(trace)["evaluation_mode"] == "evidence_enhanced"
 
     def test_filter_agent_traces_by_keyword_tool_and_status(self) -> None:
         from src.observability.dashboard.pages.agent_traces import _filter_agent_traces

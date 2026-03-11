@@ -281,6 +281,7 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         llm_service=llm,
         error_memory=error_mem,
         knowledge_map=kmap_mem,
+        hybrid_search=hybrid_search,
     ))
 
     # --- Skills ---

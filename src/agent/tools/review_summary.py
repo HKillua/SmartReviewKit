@@ -8,9 +8,11 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
+from src.agent.grounding import build_evidence_summary
 from src.agent.tools.base import Tool
 from src.agent.types import ToolContext, ToolResult
 from src.agent.utils.sanitizer import sanitize_user_input
+from src.core.response.citation_generator import CitationGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +31,8 @@ REVIEW_PROMPT_TEMPLATE = """请根据以下知识库检索内容，生成一份�
 2. 每个考点配一句简短解释
 3. 用 ⚠️ 标注薄弱知识点（如果有的话）
 4. 使用 Markdown 格式输出
+5. 尽量在关键结论后保留 `[1]`、`[2]` 这类来源编号
+6. 只总结证据覆盖到的知识点；如果当前资料只覆盖了部分内容，要明确说明
 
 请生成考点复习摘要："""
 
@@ -53,6 +57,7 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
         self._llm = llm_service
         self._error_memory = error_memory
         self._knowledge_map = knowledge_map
+        self._citation_generator = CitationGenerator(snippet_max_length=220)
 
     @property
     def name(self) -> str:
@@ -77,7 +82,25 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
             return ToolResult(success=False, error=f"知识检索失败: {exc}")
 
         if not results:
-            return ToolResult(success=True, result_for_llm="未找到与该主题相关的知识库内容，请确认主题名称。")
+            return ToolResult(
+                success=True,
+                result_for_llm="未找到与该主题相关的知识库内容，请确认主题名称。",
+                metadata={
+                    "grounding_capable": True,
+                    "citations": [],
+                    "evidence_summary": "",
+                    "source_count": 0,
+                    "query_trace_ids": [],
+                    "final_response_preferred": True,
+                    "grounding_passthrough": True,
+                },
+            )
+
+        citations = [
+            citation.to_dict()
+            for citation in self._citation_generator.generate(results)
+        ]
+        evidence_summary = build_evidence_summary(citations)
 
         knowledge_text = "\n\n".join(
             f"[{i}] {r.text[:600]}" for i, r in enumerate(results, 1)
@@ -107,6 +130,15 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
             return ToolResult(
                 success=True,
                 result_for_llm=f"[LLM 不可用，返回原始检索结果]\n\n{knowledge_text}",
+                metadata={
+                    "grounding_capable": True,
+                    "citations": citations,
+                    "evidence_summary": evidence_summary,
+                    "source_count": len(citations),
+                    "query_trace_ids": [],
+                    "final_response_preferred": True,
+                    "grounding_passthrough": True,
+                },
             )
 
         try:
@@ -123,11 +155,41 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
                 return ToolResult(
                     success=True,
                     result_for_llm=f"[LLM 调用失败，返回原始检索结果]\n\n{knowledge_text}",
+                    metadata={
+                        "grounding_capable": True,
+                        "citations": citations,
+                        "evidence_summary": evidence_summary,
+                        "source_count": len(citations),
+                        "query_trace_ids": [],
+                        "final_response_preferred": True,
+                        "grounding_passthrough": True,
+                    },
                 )
-            return ToolResult(success=True, result_for_llm=resp.content or "")
+            return ToolResult(
+                success=True,
+                result_for_llm=resp.content or "",
+                metadata={
+                    "grounding_capable": True,
+                    "citations": citations,
+                    "evidence_summary": evidence_summary,
+                    "source_count": len(citations),
+                    "query_trace_ids": [],
+                    "final_response_preferred": True,
+                    "grounding_passthrough": True,
+                },
+            )
         except Exception as exc:
             logger.exception("LLM call failed in ReviewSummaryTool")
             return ToolResult(
                 success=True,
                 result_for_llm=f"[LLM 降级，返回原始检索结果]\n\n{knowledge_text}",
+                metadata={
+                    "grounding_capable": True,
+                    "citations": citations,
+                    "evidence_summary": evidence_summary,
+                    "source_count": len(citations),
+                    "query_trace_ids": [],
+                    "final_response_preferred": True,
+                    "grounding_passthrough": True,
+                },
             )

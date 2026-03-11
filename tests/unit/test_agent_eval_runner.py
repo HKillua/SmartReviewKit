@@ -40,6 +40,7 @@ async def test_agent_eval_runner_reconstructs_case_outputs(tmp_path: Path) -> No
                         "expected_control_mode": "advisory",
                         "require_citations": True,
                         "expected_grounding_action": "normal",
+                        "expected_evaluation_mode": "evidence_enhanced",
                     }
                 ]
             }
@@ -91,6 +92,7 @@ async def test_agent_eval_runner_reconstructs_case_outputs(tmp_path: Path) -> No
                     "grounding_score": 0.88,
                     "grounding_policy_action": "normal",
                     "has_evidence": True,
+                    "evaluation_mode": "evidence_enhanced",
                 },
             ),
         ]
@@ -109,6 +111,7 @@ async def test_agent_eval_runner_reconstructs_case_outputs(tmp_path: Path) -> No
     assert case.actual_control_mode == "advisory"
     assert case.grounding_policy_action == "normal"
     assert case.grounding_score == 0.88
+    assert case.actual_evaluation_mode == "evidence_enhanced"
     assert len(case.citations) == 1
     assert case.tool_errors == [
         {
@@ -124,8 +127,10 @@ async def test_agent_eval_runner_reconstructs_case_outputs(tmp_path: Path) -> No
     assert case.metrics["planner_control_mode_hit_rate"] == 1.0
     assert case.metrics["citation_presence_rate"] == 1.0
     assert case.metrics["grounding_action_hit_rate"] == 1.0
+    assert case.metrics["evaluation_mode_hit_rate"] == 1.0
     assert report.aggregate_metrics["success_rate"] == 1.0
     assert report.aggregate_metrics["citation_presence_rate"] == 1.0
+    assert report.aggregate_metrics["evaluation_mode_hit_rate"] == 1.0
     assert report.aggregate_metrics["avg_iterations"] == 2.0
 
 

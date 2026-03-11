@@ -30,6 +30,7 @@ class EvidenceBundle:
     query_trace_ids: list[str] = field(default_factory=list)
     evidence_tool: str = ""
     generation_mode: str = ""
+    evaluation_mode: str = ""
 
     @property
     def has_evidence(self) -> bool:
@@ -42,6 +43,7 @@ class EvidenceBundle:
             "query_trace_ids": list(self.query_trace_ids),
             "evidence_tool": self.evidence_tool,
             "generation_mode": self.generation_mode,
+            "evaluation_mode": self.evaluation_mode,
         }
 
 
@@ -122,6 +124,7 @@ def build_evidence_bundle(tool_name: str, metadata: dict[str, Any] | None) -> Ev
         query_trace_ids=query_trace_ids,
         evidence_tool=tool_name,
         generation_mode=str(metadata.get("generation_mode", "") or ""),
+        evaluation_mode=str(metadata.get("evaluation_mode", "") or ""),
     )
 
 

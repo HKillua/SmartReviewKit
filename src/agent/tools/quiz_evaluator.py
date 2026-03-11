@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import logging
+import asyncio
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
+from src.agent.grounding import build_evidence_summary
 from src.agent.tools.base import Tool
 from src.agent.types import ToolContext, ToolResult
 from src.agent.utils.sanitizer import sanitize_user_input
+from src.core.response.citation_generator import CitationGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +30,26 @@ EVAL_PROMPT_TEMPLATE = """请评判以下题目的用户答案。
   "explanation": "详细解析",
   "key_concepts": ["涉及的核心知识点"]
 }}"""
+
+EXPLANATION_ENHANCEMENT_PROMPT = """你已经完成了题目评分，请基于课程证据增强解析。
+
+题目: {question}
+正确答案: {correct_answer}
+用户答案: {user_answer}
+判定: {verdict}
+得分: {score}
+原始解析: {base_explanation}
+涉及知识点: {key_concepts}
+
+课程证据:
+{evidence_summary}
+
+要求:
+1. 在不改变 verdict 和 score 的前提下，重写更具体、可追溯的解析
+2. 尽量在关键句后保留 `[1]`、`[2]` 这类来源编号
+3. 只能基于给定证据增强解释，不要编造课程资料之外的新结论
+4. 直接输出解析正文，不要输出 JSON
+"""
 
 
 class QuizEvaluatorArgs(BaseModel):
@@ -46,10 +69,13 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
         llm_service: Any = None,
         error_memory: Any = None,
         knowledge_map: Any = None,
+        hybrid_search: Any = None,
     ) -> None:
         self._llm = llm_service
         self._error_memory = error_memory
         self._knowledge_map = knowledge_map
+        self._search = hybrid_search
+        self._citation_generator = CitationGenerator(snippet_max_length=220)
 
     @property
     def name(self) -> str:
@@ -73,6 +99,16 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
                     f"正确答案: {args.correct_answer}\n"
                     "(LLM 不可用，无法提供详细解析)"
                 ),
+                metadata={
+                    "verdict": verdict,
+                    "evaluation_mode": "direct_no_evidence",
+                    "grounding_capable": True,
+                    "citations": [],
+                    "evidence_summary": "",
+                    "source_count": 0,
+                    "final_response_preferred": True,
+                    "grounding_passthrough": True,
+                },
             )
 
         try:
@@ -104,6 +140,33 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
             verdict = result.get("verdict", "unknown").lower().strip()
             result["verdict"] = verdict
             is_correct = verdict == "correct"
+            concepts = result.get("key_concepts", args.concepts) or args.concepts
+            explanation = str(result.get("explanation", "") or "")
+            citations: list[dict] = []
+            evidence_summary = ""
+            evaluation_mode = "direct_no_evidence"
+
+            evidence_results = await self._retrieve_supporting_evidence(args, concepts)
+            if evidence_results:
+                citations = [
+                    citation.to_dict()
+                    for citation in self._citation_generator.generate(evidence_results)
+                ]
+                evidence_summary = build_evidence_summary(citations)
+                enhanced = await self._enhance_explanation_with_evidence(
+                    args=args,
+                    verdict=verdict,
+                    score=result.get("score"),
+                    base_explanation=explanation,
+                    key_concepts=concepts,
+                    evidence_summary=evidence_summary,
+                )
+                if enhanced:
+                    explanation = enhanced
+                    evaluation_mode = "evidence_enhanced"
+            elif explanation:
+                explanation += "\n\n> 说明：以上解析未绑定课程资料证据，请结合课件复核。"
+            result["explanation"] = explanation
 
             # Update memory
             await self._update_memory(context, args, result, is_correct)
@@ -115,13 +178,86 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
                     f"判定: {icons.get(verdict, verdict)}\n"
                     f"得分: {result.get('score', 'N/A')}/100\n\n"
                     f"**解析**: {result.get('explanation', '')}\n\n"
-                    f"**涉及知识点**: {', '.join(result.get('key_concepts', args.concepts))}"
+                    f"**涉及知识点**: {', '.join(concepts)}"
                 ),
-                metadata={"verdict": verdict, "score": result.get("score")},
+                metadata={
+                    "verdict": verdict,
+                    "score": result.get("score"),
+                    "evaluation_mode": evaluation_mode,
+                    "grounding_capable": True,
+                    "citations": citations,
+                    "evidence_summary": evidence_summary,
+                    "source_count": len(citations),
+                    "final_response_preferred": True,
+                    "grounding_passthrough": True,
+                },
             )
         except Exception as exc:
             logger.exception("QuizEvaluatorTool failed")
             return ToolResult(success=False, error=f"评判异常: {exc}")
+
+    async def _retrieve_supporting_evidence(
+        self,
+        args: QuizEvaluatorArgs,
+        concepts: list[str],
+    ) -> list:
+        if self._search is None:
+            return []
+        search_query = " ".join(
+            part for part in [args.topic, " ".join(concepts[:4]), args.question[:120]] if part
+        ).strip()
+        if not search_query:
+            return []
+        try:
+            results = await asyncio.to_thread(
+                self._search.search,
+                query=search_query,
+                top_k=4,
+            )
+            return results if isinstance(results, list) else []
+        except Exception:
+            logger.warning("QuizEvaluator evidence retrieval failed", exc_info=True)
+            return []
+
+    async def _enhance_explanation_with_evidence(
+        self,
+        *,
+        args: QuizEvaluatorArgs,
+        verdict: str,
+        score: Any,
+        base_explanation: str,
+        key_concepts: list[str],
+        evidence_summary: str,
+    ) -> str:
+        if self._llm is None or not evidence_summary:
+            return ""
+        try:
+            from src.agent.types import LlmMessage, LlmRequest
+
+            prompt = EXPLANATION_ENHANCEMENT_PROMPT.format(
+                question=sanitize_user_input(args.question),
+                correct_answer=sanitize_user_input(args.correct_answer),
+                user_answer=sanitize_user_input(args.user_answer),
+                verdict=verdict,
+                score=score,
+                base_explanation=sanitize_user_input(base_explanation, max_length=1200),
+                key_concepts=", ".join(key_concepts),
+                evidence_summary=evidence_summary,
+            )
+            req = LlmRequest(
+                messages=[
+                    LlmMessage(role="system", content="你是一位严谨的课程助教，只增强解析，不改变判分结论。"),
+                    LlmMessage(role="user", content=prompt),
+                ],
+                temperature=0.2,
+            )
+            resp = await self._llm.send_request(req)
+            if resp.error:
+                return ""
+            return (resp.content or "").strip()
+        except Exception:
+            logger.warning("QuizEvaluator evidence enhancement failed", exc_info=True)
+            return ""
 
     async def _update_memory(
         self, context: ToolContext, args: QuizEvaluatorArgs, result: dict, is_correct: bool

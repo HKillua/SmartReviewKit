@@ -748,6 +748,7 @@ class Agent:
                                 "retryable": bool(tool_result_obj.metadata.get("retryable", False)),
                                 "query_trace_id": tool_result_obj.metadata.get("query_trace_id"),
                                 "generation_mode": tool_result_obj.metadata.get("generation_mode", ""),
+                                "evaluation_mode": tool_result_obj.metadata.get("evaluation_mode", ""),
                                 "source_count": int(tool_result_obj.metadata.get("source_count", 0) or 0),
                                 "error_summary": _truncate_text(tool_result_obj.error),
                                 "result_summary": _truncate_text(tool_result_obj.result_for_llm),
@@ -757,6 +758,10 @@ class Agent:
 
                 if passthrough_payload is not None:
                     generation_mode = str(passthrough_payload[1].get("generation_mode", "") or "")
+                    evaluation_mode = str(passthrough_payload[1].get("evaluation_mode", "") or "")
+                    grounding_passthrough = bool(
+                        passthrough_payload[1].get("grounding_passthrough", False)
+                    )
                     if generation_mode in {"question_bank", "rag_backed"}:
                         final_text = passthrough_payload[0]
                         grounding_assessment = GroundingAssessment(
@@ -764,6 +769,12 @@ class Agent:
                             has_evidence=bool(evidence_bundle and evidence_bundle.has_evidence),
                             citation_count=0,
                             source_count=evidence_bundle.source_count if evidence_bundle is not None else 0,
+                        )
+                    elif grounding_passthrough:
+                        final_text = passthrough_payload[0]
+                        grounding_assessment = self._grounding_evaluator.assess(
+                            final_text,
+                            evidence_bundle,
                         )
                     else:
                         final_text, grounding_assessment = await self._finalize_answer(
@@ -775,7 +786,11 @@ class Agent:
                     if trace is not None and grounding_assessment is not None:
                         trace.record_stage(
                             "answer_grounding",
-                            grounding_assessment.to_metadata(),
+                            {
+                                **grounding_assessment.to_metadata(),
+                                "generation_mode": generation_mode,
+                                "evaluation_mode": evaluation_mode,
+                            },
                         )
                     if response_state is not None:
                         response_state.update(
@@ -785,6 +800,10 @@ class Agent:
                         response_state["generation_mode"] = generation_mode
                     if trace is not None and generation_mode:
                         trace.metadata["generation_mode"] = generation_mode
+                    if response_state is not None and evaluation_mode:
+                        response_state["evaluation_mode"] = evaluation_mode
+                    if trace is not None and evaluation_mode:
+                        trace.metadata["evaluation_mode"] = evaluation_mode
                     if final_text:
                         yield StreamEvent(type=StreamEventType.TEXT_DELTA, content=final_text)
                     if trace is not None:
@@ -795,6 +814,7 @@ class Agent:
                                 "content_length": len(final_text or ""),
                                 "content_preview": _truncate_text(final_text),
                                 "generation_mode": generation_mode,
+                                "evaluation_mode": evaluation_mode,
                             },
                         )
                     conversation.messages.append(Message(role="assistant", content=final_text or ""))
@@ -853,7 +873,15 @@ class Agent:
             if trace is not None and grounding_assessment is not None:
                 trace.record_stage(
                     "answer_grounding",
-                    grounding_assessment.to_metadata(),
+                    {
+                        **grounding_assessment.to_metadata(),
+                        "generation_mode": (
+                            evidence_bundle.generation_mode if evidence_bundle is not None else ""
+                        ),
+                        "evaluation_mode": (
+                            evidence_bundle.evaluation_mode if evidence_bundle is not None else ""
+                        ),
+                    },
                 )
             if response_state is not None:
                 response_state.update(_build_evidence_metadata(evidence_bundle, grounding_assessment))
@@ -866,6 +894,9 @@ class Agent:
                         "content_preview": _truncate_text(final_content),
                         "generation_mode": (
                             evidence_bundle.generation_mode if evidence_bundle is not None else ""
+                        ),
+                        "evaluation_mode": (
+                            evidence_bundle.evaluation_mode if evidence_bundle is not None else ""
                         ),
                     },
                 )

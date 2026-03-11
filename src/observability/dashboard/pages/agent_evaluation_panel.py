@@ -166,6 +166,7 @@ def _render_case_details(report: Dict[str, Any]) -> None:
                         "require_citations": result.get("require_citations", False),
                         "expected_grounding_action": result.get("expected_grounding_action", ""),
                         "expected_generation_mode": result.get("expected_generation_mode", ""),
+                        "expected_evaluation_mode": result.get("expected_evaluation_mode", ""),
                     }
                 )
             with compare_cols[1]:
@@ -179,6 +180,7 @@ def _render_case_details(report: Dict[str, Any]) -> None:
                         "grounding_score": result.get("grounding_score", 0.0),
                         "grounding_policy_action": result.get("grounding_policy_action", ""),
                         "generation_mode": result.get("generation_mode", ""),
+                        "actual_evaluation_mode": result.get("actual_evaluation_mode", ""),
                         "citation_count": len(result.get("citations", [])),
                         "final_answer": result.get("final_answer", ""),
                     }

@@ -28,6 +28,8 @@
       "forbidden_answer_substrings": [],
       "expected_planner_intent": "review_summary",
       "expected_control_mode": "force_tool",
+      "require_citations": true,
+      "expected_grounding_action": "normal",
       "notes": "复习类问题优先走 review_summary。"
     },
     {
@@ -55,6 +57,7 @@
       "forbidden_answer_substrings": [],
       "expected_planner_intent": "quiz_evaluator",
       "expected_control_mode": "force_tool",
+      "expected_evaluation_mode": "evidence_enhanced",
       "notes": "判题类请求应命中 quiz_evaluator。"
     },
     {

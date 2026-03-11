@@ -30,6 +30,7 @@ class AgentGoldenTestCase:
     require_citations: bool = False
     expected_grounding_action: str = ""
     expected_generation_mode: str = ""
+    expected_evaluation_mode: str = ""
     notes: str = ""
 
     @classmethod
@@ -52,6 +53,7 @@ class AgentGoldenTestCase:
             require_citations=bool(data.get("require_citations", False)),
             expected_grounding_action=str(data.get("expected_grounding_action", "")),
             expected_generation_mode=str(data.get("expected_generation_mode", "")),
+            expected_evaluation_mode=str(data.get("expected_evaluation_mode", "")),
             notes=str(data.get("notes", "")),
         )
 
@@ -71,6 +73,7 @@ class AgentEvalCaseResult:
     require_citations: bool = False
     expected_grounding_action: str = ""
     expected_generation_mode: str = ""
+    expected_evaluation_mode: str = ""
     notes: str = ""
     actual_tool_chain: List[str] = field(default_factory=list)
     final_answer: str = ""
@@ -81,6 +84,7 @@ class AgentEvalCaseResult:
     grounding_score: float = 0.0
     grounding_policy_action: str = ""
     generation_mode: str = ""
+    actual_evaluation_mode: str = ""
     has_evidence: bool = False
     error: str = ""
     tool_errors: List[Dict[str, Any]] = field(default_factory=list)
@@ -122,6 +126,7 @@ class AgentEvalReport:
                     "require_citations": result.require_citations,
                     "expected_grounding_action": result.expected_grounding_action,
                     "expected_generation_mode": result.expected_generation_mode,
+                    "expected_evaluation_mode": result.expected_evaluation_mode,
                     "notes": result.notes,
                     "actual_tool_chain": list(result.actual_tool_chain),
                     "final_answer": result.final_answer,
@@ -132,6 +137,7 @@ class AgentEvalReport:
                     "grounding_score": round(result.grounding_score, 4),
                     "grounding_policy_action": result.grounding_policy_action,
                     "generation_mode": result.generation_mode,
+                    "actual_evaluation_mode": result.actual_evaluation_mode,
                     "has_evidence": result.has_evidence,
                     "error": result.error,
                     "tool_errors": list(result.tool_errors),
@@ -232,6 +238,7 @@ class AgentEvalRunner:
         grounding_score = float(done_metadata.get("grounding_score", 0.0) or 0.0)
         grounding_policy_action = str(done_metadata.get("grounding_policy_action", "") or "")
         generation_mode = str(done_metadata.get("generation_mode", "") or "")
+        evaluation_mode = str(done_metadata.get("evaluation_mode", "") or "")
         has_evidence = bool(done_metadata.get("has_evidence", False))
         elapsed_ms = (time.monotonic() - started) * 1000.0
         metrics = self._score_case(
@@ -247,6 +254,7 @@ class AgentEvalRunner:
             grounding_score,
             grounding_policy_action,
             generation_mode,
+            evaluation_mode,
         )
 
         return AgentEvalCaseResult(
@@ -261,6 +269,7 @@ class AgentEvalRunner:
             require_citations=case.require_citations,
             expected_grounding_action=case.expected_grounding_action,
             expected_generation_mode=case.expected_generation_mode,
+            expected_evaluation_mode=case.expected_evaluation_mode,
             notes=case.notes,
             actual_tool_chain=tool_chain,
             final_answer=final_answer,
@@ -271,6 +280,7 @@ class AgentEvalRunner:
             grounding_score=grounding_score,
             grounding_policy_action=grounding_policy_action,
             generation_mode=generation_mode,
+            actual_evaluation_mode=evaluation_mode,
             has_evidence=has_evidence,
             error=error,
             tool_errors=tool_errors,
@@ -324,6 +334,7 @@ class AgentEvalRunner:
         grounding_score: float,
         grounding_policy_action: str,
         generation_mode: str,
+        evaluation_mode: str,
     ) -> Dict[str, float]:
         expected_hit_count = sum(1 for tool in case.expected_tools if tool in tool_chain)
         forbidden_tool_violations = sum(
@@ -360,11 +371,19 @@ class AgentEvalRunner:
             if not case.expected_generation_mode
             else float(case.expected_generation_mode == generation_mode)
         )
+        evaluation_mode_hit = (
+            1.0
+            if not case.expected_evaluation_mode
+            else float(case.expected_evaluation_mode == evaluation_mode)
+        )
         quiz_grounded_success = 1.0
         quiz_insufficient_evidence = 0.0
+        quiz_evaluator_evidence = 1.0
         if case.expected_tools == ["quiz_generator"] or case.expected_planner_intent == "quiz_generator":
             quiz_grounded_success = float(generation_mode in {"question_bank", "rag_backed"})
             quiz_insufficient_evidence = float(generation_mode == "insufficient_evidence")
+        if case.expected_tools == ["quiz_evaluator"] or case.expected_planner_intent == "quiz_evaluator":
+            quiz_evaluator_evidence = float(evaluation_mode == "evidence_enhanced")
 
         return {
             "success": 0.0 if error else 1.0,
@@ -386,8 +405,10 @@ class AgentEvalRunner:
             "grounding_score": grounding_score,
             "grounding_action_hit_rate": grounding_action_hit,
             "generation_mode_hit_rate": generation_mode_hit,
+            "evaluation_mode_hit_rate": evaluation_mode_hit,
             "quiz_grounded_success_rate": quiz_grounded_success,
             "quiz_insufficient_evidence_rate": quiz_insufficient_evidence,
+            "quiz_evaluator_evidence_rate": quiz_evaluator_evidence,
             "tool_calls": float(len(tool_chain)),
             "iterations": float(iterations),
             "latency_ms": elapsed_ms,
@@ -438,6 +459,12 @@ class AgentEvalRunner:
         quiz_insufficient_evidence_rate = sum(
             result.metrics.get("quiz_insufficient_evidence_rate", 0.0) for result in results
         ) / len(results)
+        evaluation_mode_hit_rate = sum(
+            result.metrics.get("evaluation_mode_hit_rate", 0.0) for result in results
+        ) / len(results)
+        quiz_evaluator_evidence_rate = sum(
+            result.metrics.get("quiz_evaluator_evidence_rate", 0.0) for result in results
+        ) / len(results)
         avg_tool_calls = sum(len(result.actual_tool_chain) for result in results) / len(results)
         avg_iterations = sum(result.iterations for result in results) / len(results)
         avg_latency_ms = sum(result.elapsed_ms for result in results) / len(results)
@@ -456,6 +483,8 @@ class AgentEvalRunner:
             "conservative_rewrite_rate": conservative_rewrite_rate,
             "quiz_grounded_success_rate": quiz_grounded_success_rate,
             "quiz_insufficient_evidence_rate": quiz_insufficient_evidence_rate,
+            "evaluation_mode_hit_rate": evaluation_mode_hit_rate,
+            "quiz_evaluator_evidence_rate": quiz_evaluator_evidence_rate,
             "avg_tool_calls": avg_tool_calls,
             "avg_iterations": avg_iterations,
             "avg_latency_ms": avg_latency_ms,

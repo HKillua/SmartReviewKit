@@ -97,6 +97,7 @@ def _extract_grounding_info(trace: Dict[str, Any]) -> Dict[str, Any]:
         "grounding_policy_action": metadata.get("grounding_policy_action", ""),
         "source_count": metadata.get("source_count", 0),
         "generation_mode": metadata.get("generation_mode", ""),
+        "evaluation_mode": metadata.get("evaluation_mode", ""),
         "has_evidence": metadata.get("has_evidence", False),
         "citation_count": len(metadata.get("citations", [])),
     }
@@ -112,6 +113,7 @@ def _extract_grounding_info(trace: Dict[str, Any]) -> Dict[str, Any]:
                     "source_count": data.get("source_count", 0),
                     "citation_count": data.get("citation_count", 0),
                     "has_evidence": data.get("has_evidence", False),
+                    "evaluation_mode": data.get("evaluation_mode", ""),
                 }
             )
             break
@@ -302,6 +304,8 @@ def render() -> None:
                 st.caption(f"content_length={final_data.get('content_length', 0)}")
                 if final_data.get("generation_mode"):
                     st.caption(f"generation_mode={final_data.get('generation_mode', '')}")
+                if final_data.get("evaluation_mode"):
+                    st.caption(f"evaluation_mode={final_data.get('evaluation_mode', '')}")
                 preview = final_data.get("content_preview", "")
                 if preview:
                     st.text(preview)

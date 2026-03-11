@@ -226,6 +226,82 @@ class _GroundedAnswerLlm(_ToolThenAnswerLlm):
         return LlmResponse(content="TCP 通过三次握手建立连接 [1]。")
 
 
+class _ReviewPassthroughTool:
+    @property
+    def name(self) -> str:
+        return "review_summary"
+
+    @property
+    def description(self) -> str:
+        return "review summary passthrough tool"
+
+    def get_args_schema(self):
+        class _Args(BaseModel):
+            topic: str = Field(default="")
+
+        return _Args
+
+    async def execute(self, context, args):
+        from src.agent.types import ToolResult
+
+        return ToolResult(
+            success=True,
+            result_for_llm="### 复习摘要\n- DNS 解析包含递归查询 [1]。",
+            metadata={
+                "grounding_capable": True,
+                "grounding_passthrough": True,
+                "final_response_preferred": True,
+                "source_count": 1,
+                "citations": [
+                    {"index": 1, "source": "dns.pdf", "text_snippet": "DNS 解析包含递归查询。"}
+                ],
+                "evidence_summary": "[1] `dns.pdf`: DNS 解析包含递归查询。",
+            },
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.get_args_schema().model_json_schema(),
+            },
+        }
+
+
+class _ReviewPlanner:
+    def plan(self, message, matched_skill=None):
+        from src.agent.planner import ControlMode, PlannerDecision, TaskIntent
+
+        return PlannerDecision(
+            task_intent=TaskIntent.REVIEW_SUMMARY,
+            confidence=1.0,
+            match_method="rule",
+            control_mode=ControlMode.FORCE_TOOL,
+            selected_tool="review_summary",
+            planner_hint="Use review summary first.",
+        )
+
+
+class _ReviewOnlyLlm:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def send_request(self, request):
+        self.calls += 1
+        return LlmResponse(
+            content="Need summary",
+            tool_calls=[
+                ToolCallData(
+                    id="tc_1",
+                    name="review_summary",
+                    arguments={"topic": "DNS"},
+                )
+            ],
+        )
+
+
 @pytest.mark.asyncio
 async def test_agent_done_event_contains_trace_id_and_agent_trace(tmp_path: Path) -> None:
     from src.agent.agent import Agent
@@ -317,6 +393,46 @@ async def test_agent_done_event_contains_grounding_metadata(tmp_path: Path) -> N
     assert trace is not None
     stage_names = [stage["stage"] for stage in trace["stages"]]
     assert "answer_grounding" in stage_names
+
+
+@pytest.mark.asyncio
+async def test_grounding_passthrough_tool_skips_conservative_rewrite(tmp_path: Path) -> None:
+    from src.agent.agent import Agent
+    from src.agent.config import AgentConfig
+    from src.agent.conversation import ConversationStore
+    from src.agent.tools.base import ToolRegistry
+
+    trace_path = tmp_path / "review_passthrough.jsonl"
+    collector = TraceCollector(traces_path=trace_path)
+
+    conversation = Conversation(id="conv_review", user_id="u1", messages=[])
+    store = AsyncMock(spec=ConversationStore)
+    store.get.return_value = conversation
+    store.create.return_value = conversation
+    store.update.return_value = None
+
+    registry = ToolRegistry()
+    registry.register(_ReviewPassthroughTool())
+
+    llm = _ReviewOnlyLlm()
+    agent = Agent(
+        llm_service=llm,
+        tool_registry=registry,
+        conversation_store=store,
+        config=AgentConfig(stream_responses=False, max_tool_iterations=2),
+        task_planner=_ReviewPlanner(),
+        trace_enabled=True,
+        trace_collector=collector,
+    )
+
+    events = [event async for event in agent.chat("帮我总结 DNS", "u1", "conv_review")]
+
+    done_event = next(event for event in events if event.type.value == "done")
+    final_text = "".join(event.content or "" for event in events if event.type.value == "text_delta")
+    assert llm.calls == 1
+    assert "DNS 解析包含递归查询" in final_text
+    assert done_event.metadata["grounding_score"] >= 0.4
+    assert done_event.metadata["grounding_policy_action"] == "normal"
 
 
 @pytest.mark.asyncio
