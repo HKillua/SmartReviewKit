@@ -8,7 +8,6 @@ Provides two core components:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 from datetime import datetime, timezone
@@ -24,6 +23,9 @@ _PREF_CONCISE_RE = re.compile(r"简洁|简单|简短|brief|concise|不用太详�
 _PREF_DETAILED_RE = re.compile(r"详细|详尽|展开|细致|detailed|elaborate|深入", re.I)
 _PREF_EXAM_RE = re.compile(r"考点|考试|重点|要点|exam|key.?point|应试", re.I)
 _PREF_EXAMPLE_RE = re.compile(r"举例|例子|示例|example|举个", re.I)
+
+_VALID_DETAIL_LEVELS = {"concise", "normal", "detailed"}
+_VALID_STYLE_VALUES = {"default", "exam_focused", "example_heavy"}
 
 # ── topic extraction patterns ──
 _TOPIC_PATTERNS = [
@@ -227,6 +229,10 @@ class MemoryRecordHook(LifecycleHook):
         session_memory: object | None = None,
         llm_service: object | None = None,
         extraction_mode: str = "both",
+        write_gating_enabled: bool = True,
+        session_write_min_confidence: float = 0.2,
+        preference_write_min_confidence: float = 0.65,
+        preference_conflict_guard: bool = True,
     ) -> None:
         self._profile = student_profile
         self._skills = skill_memory
@@ -235,15 +241,31 @@ class MemoryRecordHook(LifecycleHook):
         self._sessions = session_memory
         self._llm = llm_service
         self._mode = extraction_mode
+        self._write_gating_enabled = write_gating_enabled
+        self._session_write_min_confidence = session_write_min_confidence
+        self._preference_write_min_confidence = preference_write_min_confidence
+        self._preference_conflict_guard = preference_conflict_guard
 
     async def after_message(self, conversation: Conversation) -> None:
         user_id = conversation.user_id
 
         # Step 1: Extract learning data from conversation
         extracted = await self._extract_learning_data(conversation)
+        extraction_meta = dict(extracted.get("extraction_metadata", {}))
+        preference_updates = dict(extracted.get("user_preference", {}))
+        should_save_session, session_reason = self._should_save_session(extracted)
+        should_update_preferences, preference_reason = self._should_update_preferences(extracted)
+        write_decisions = {
+            "session_saved": should_save_session,
+            "session_reason": session_reason,
+            "profile_preferences_updated": bool(preference_updates) and should_update_preferences,
+            "profile_preferences_reason": preference_reason,
+        }
+        extraction_meta["write_decisions"] = write_decisions
+        extracted["extraction_metadata"] = extraction_meta
 
         # Step 2: Save session summary (K1)
-        if self._sessions and extracted:
+        if self._sessions and should_save_session:
             try:
                 from src.agent.memory.session_memory import SessionSummary
 
@@ -252,12 +274,20 @@ class MemoryRecordHook(LifecycleHook):
                     topics=extracted.get("topics_discussed", []),
                     key_questions=extracted.get("key_questions", []),
                     mastery_observations=self._build_mastery_obs(extracted),
-                    preference_snapshot=extracted.get("user_preference", {}),
+                    preference_snapshot=preference_updates,
                     summary_text=extracted.get("summary", ""),
+                    extraction_metadata=extraction_meta,
                 )
                 await self._sessions.save_session(user_id, summary)
             except Exception:
                 logger.warning("Failed to save session summary", exc_info=True)
+        elif self._sessions:
+            logger.info(
+                "Skipped session memory write for %s (%s, confidence=%.2f)",
+                conversation.id,
+                session_reason,
+                float(extraction_meta.get("confidence", 0.0) or 0.0),
+            )
 
         # Step 3: Update student profile (K5 — fix total_sessions, sync topics)
         if self._profile:
@@ -269,11 +299,23 @@ class MemoryRecordHook(LifecycleHook):
                 }
 
                 # Merge preference updates
-                pref = extracted.get("user_preference", {})
-                if pref:
+                if preference_updates and should_update_preferences:
                     merged_prefs = dict(profile.preferences or {})
-                    merged_prefs.update({k: v for k, v in pref.items() if v and v != "default" and v != "normal"})
+                    merged_prefs.update(
+                        {
+                            k: v
+                            for k, v in preference_updates.items()
+                            if v and v != "default" and v != "normal"
+                        }
+                    )
                     updates["preferences"] = merged_prefs
+                elif preference_updates:
+                    logger.info(
+                        "Skipped preference update for %s (%s, confidence=%.2f)",
+                        conversation.id,
+                        preference_reason,
+                        float(extraction_meta.get("confidence", 0.0) or 0.0),
+                    )
 
                 # Sync weak/strong from knowledge map
                 if self._kmap:
@@ -321,14 +363,18 @@ class MemoryRecordHook(LifecycleHook):
             try:
                 result = await self._extract_via_llm(conversation)
                 if result:
-                    return result
+                    return self._postprocess_extraction(result, conversation, mode_used="llm")
             except Exception:
                 logger.info("LLM extraction failed, falling back to rule-based")
 
         if self._mode in ("rule", "both"):
-            return self._extract_via_rules(conversation)
+            return self._postprocess_extraction(
+                self._extract_via_rules(conversation),
+                conversation,
+                mode_used="rule",
+            )
 
-        return {}
+        return self._postprocess_extraction({}, conversation, mode_used="none")
 
     async def _extract_via_llm(self, conversation: Conversation) -> dict | None:
         """Use LLM to extract structured learning data."""
@@ -350,7 +396,7 @@ class MemoryRecordHook(LifecycleHook):
 
         from src.agent.utils.json_helpers import safe_parse_json
         result = safe_parse_json(response.content)
-        return result
+        return result if isinstance(result, dict) else None
 
     def _extract_via_rules(self, conversation: Conversation) -> dict:
         """Heuristic rule-based extraction from conversation messages."""
@@ -404,7 +450,147 @@ class MemoryRecordHook(LifecycleHook):
             "summary": summary,
         }
 
+    def _postprocess_extraction(
+        self,
+        extracted: dict[str, Any] | None,
+        conversation: Conversation,
+        *,
+        mode_used: str,
+    ) -> dict[str, Any]:
+        payload = extracted if isinstance(extracted, dict) else {}
+        user_text = self._format_user_text(conversation, max_chars=2000)
+
+        topics = self._normalize_list(payload.get("topics_discussed"), limit=10, max_len=48)
+        weak_points = self._normalize_list(payload.get("weak_points_observed"), limit=10, max_len=48)
+        strong_points = self._normalize_list(payload.get("strong_points_observed"), limit=10, max_len=48)
+        key_questions = self._normalize_list(payload.get("key_questions"), limit=3, max_len=100)
+        summary = self._normalize_text(payload.get("summary"), max_len=220)
+        preferences = self._normalize_preferences(payload.get("user_preference"))
+        conflicts = self._detect_preference_conflicts(user_text)
+        if self._preference_conflict_guard:
+            for key in conflicts:
+                preferences.pop(key, None)
+
+        signal_counts = {
+            "topics": len(topics),
+            "weak_points": len(weak_points),
+            "strong_points": len(strong_points),
+            "key_questions": len(key_questions),
+            "has_summary": int(bool(summary)),
+            "preference_fields": len(preferences),
+        }
+        confidence = self._compute_extraction_confidence(
+            signal_counts,
+            mode_used=mode_used,
+            conflict_count=len(conflicts),
+        )
+        return {
+            "topics_discussed": topics,
+            "weak_points_observed": weak_points,
+            "strong_points_observed": strong_points,
+            "user_preference": preferences,
+            "key_questions": key_questions,
+            "summary": summary,
+            "extraction_metadata": {
+                "mode": mode_used,
+                "confidence": confidence,
+                "signal_counts": signal_counts,
+                "preference_conflicts": conflicts,
+                "write_decisions": {},
+            },
+        }
+
     # ── Helpers ──
+
+    def _should_save_session(self, extracted: dict[str, Any]) -> tuple[bool, str]:
+        meta = extracted.get("extraction_metadata", {})
+        signal_counts = meta.get("signal_counts", {})
+        has_signal = any(int(signal_counts.get(key, 0) or 0) > 0 for key in signal_counts)
+        confidence = float(meta.get("confidence", 0.0) or 0.0)
+        if not has_signal:
+            return False, "no_meaningful_signal"
+        if self._write_gating_enabled and confidence < self._session_write_min_confidence:
+            return False, "low_confidence"
+        return True, "saved"
+
+    def _should_update_preferences(self, extracted: dict[str, Any]) -> tuple[bool, str]:
+        meta = extracted.get("extraction_metadata", {})
+        conflicts = meta.get("preference_conflicts", [])
+        if self._preference_conflict_guard and conflicts:
+            return False, "preference_conflict"
+        preferences = extracted.get("user_preference", {})
+        if not preferences:
+            return False, "no_preference_signal"
+        confidence = float(meta.get("confidence", 0.0) or 0.0)
+        if self._write_gating_enabled and confidence < self._preference_write_min_confidence:
+            return False, "low_confidence"
+        return True, "updated"
+
+    @staticmethod
+    def _normalize_list(value: Any, *, limit: int, max_len: int) -> list[str]:
+        items = value if isinstance(value, list) else []
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in items:
+            text = MemoryRecordHook._normalize_text(raw, max_len=max_len)
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(text)
+            if len(normalized) >= limit:
+                break
+        return normalized
+
+    @staticmethod
+    def _normalize_text(value: Any, *, max_len: int) -> str:
+        text = str(value or "").strip()
+        text = re.sub(r"\s+", " ", text)
+        return text[:max_len]
+
+    @staticmethod
+    def _normalize_preferences(value: Any) -> dict[str, str]:
+        payload = value if isinstance(value, dict) else {}
+        normalized: dict[str, str] = {}
+        detail = str(payload.get("detail_level", "") or "").strip().lower()
+        style = str(payload.get("style", "") or "").strip().lower()
+        if detail in _VALID_DETAIL_LEVELS and detail != "normal":
+            normalized["detail_level"] = detail
+        if style in _VALID_STYLE_VALUES and style != "default":
+            normalized["style"] = style
+        return normalized
+
+    @staticmethod
+    def _detect_preference_conflicts(user_text: str) -> list[str]:
+        conflicts: list[str] = []
+        if _PREF_CONCISE_RE.search(user_text) and _PREF_DETAILED_RE.search(user_text):
+            conflicts.append("detail_level")
+        if _PREF_EXAM_RE.search(user_text) and _PREF_EXAMPLE_RE.search(user_text):
+            conflicts.append("style")
+        return conflicts
+
+    @staticmethod
+    def _compute_extraction_confidence(
+        signal_counts: dict[str, int],
+        *,
+        mode_used: str,
+        conflict_count: int,
+    ) -> float:
+        total_signals = sum(int(signal_counts.get(key, 0) or 0) for key in signal_counts)
+        if total_signals == 0:
+            return 0.0
+        score = 0.15
+        score += min(signal_counts.get("topics", 0), 3) * 0.18
+        score += min(signal_counts.get("key_questions", 0), 2) * 0.10
+        score += min(signal_counts.get("weak_points", 0) + signal_counts.get("strong_points", 0), 2) * 0.08
+        score += signal_counts.get("has_summary", 0) * 0.12
+        score += min(signal_counts.get("preference_fields", 0), 2) * 0.24
+        if mode_used == "llm":
+            score += 0.05
+        score -= conflict_count * 0.25
+        return round(max(0.0, min(score, 1.0)), 3)
 
     @staticmethod
     def _format_conversation_text(conversation: Conversation, max_chars: int = 3000) -> str:
@@ -419,6 +605,22 @@ class MemoryRecordHook(LifecycleHook):
                     break
                 lines.append(line)
         return "\n".join(lines)
+
+    @staticmethod
+    def _format_user_text(conversation: Conversation, max_chars: int = 2000) -> str:
+        texts: list[str] = []
+        total = 0
+        for message in conversation.messages:
+            if message.role != "user" or not message.content:
+                continue
+            content = message.content.strip()
+            if not content:
+                continue
+            total += len(content)
+            if total > max_chars:
+                break
+            texts.append(content)
+        return "\n".join(texts)
 
     @staticmethod
     def _build_mastery_obs(extracted: dict) -> dict[str, str]:

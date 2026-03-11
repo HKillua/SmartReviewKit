@@ -34,6 +34,7 @@ class SessionSummary(BaseModel):
     summary_text: str = ""
     quiz_count: int = 0
     quiz_accuracy: float = 0.0
+    extraction_metadata: dict = Field(default_factory=dict)
 
 
 _CREATE_SQL = """

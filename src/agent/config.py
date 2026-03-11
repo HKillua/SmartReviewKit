@@ -51,6 +51,10 @@ class MemoryConfig(BaseModel):
     session_memory_enabled: bool = True
     decay_interval_hours: int = Field(default=24, ge=1)
     extraction_mode: str = Field(default="both", pattern=r"^(llm|rule|both)$")
+    write_gating_enabled: bool = True
+    session_write_min_confidence: float = Field(default=0.2, ge=0.0, le=1.0)
+    preference_write_min_confidence: float = Field(default=0.65, ge=0.0, le=1.0)
+    preference_conflict_guard: bool = True
     review_schedule_enabled: bool = True
     decay_on_session_start: bool = True
     compaction_enabled: bool = True

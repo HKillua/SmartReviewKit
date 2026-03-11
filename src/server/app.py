@@ -193,6 +193,10 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         session_memory=session_mem,
         llm_service=llm,
         extraction_mode=memory_cfg.extraction_mode,
+        write_gating_enabled=memory_cfg.write_gating_enabled,
+        session_write_min_confidence=memory_cfg.session_write_min_confidence,
+        preference_write_min_confidence=memory_cfg.preference_write_min_confidence,
+        preference_conflict_guard=memory_cfg.preference_conflict_guard,
     )
 
     # --- Review schedule hook ---
