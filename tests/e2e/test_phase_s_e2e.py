@@ -204,4 +204,4 @@ class TestE2EToolAsyncToThread:
         )
 
         assert all(r.success for r in results)
-        assert mock_search.search.call_count == 2
+        assert mock_search.search.call_count == 3

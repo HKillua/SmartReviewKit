@@ -90,6 +90,34 @@ def _extract_planner_info(trace: Dict[str, Any]) -> Dict[str, Any]:
     return planner_info
 
 
+def _extract_grounding_info(trace: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = trace.get("metadata", {})
+    grounding_info = {
+        "grounding_score": metadata.get("grounding_score", 0.0),
+        "grounding_policy_action": metadata.get("grounding_policy_action", ""),
+        "source_count": metadata.get("source_count", 0),
+        "generation_mode": metadata.get("generation_mode", ""),
+        "has_evidence": metadata.get("has_evidence", False),
+        "citation_count": len(metadata.get("citations", [])),
+    }
+    if grounding_info["grounding_policy_action"] or grounding_info["citation_count"]:
+        return grounding_info
+    for stage in trace.get("stages", []):
+        if stage.get("stage") == "answer_grounding":
+            data = stage.get("data", {})
+            grounding_info.update(
+                {
+                    "grounding_score": data.get("grounding_score", 0.0),
+                    "grounding_policy_action": data.get("grounding_policy_action", ""),
+                    "source_count": data.get("source_count", 0),
+                    "citation_count": data.get("citation_count", 0),
+                    "has_evidence": data.get("has_evidence", False),
+                }
+            )
+            break
+    return grounding_info
+
+
 def _filter_agent_traces(
     traces: List[Dict[str, Any]],
     keyword: str = "",
@@ -175,6 +203,7 @@ def render() -> None:
         tool_chain = _extract_tool_chain(trace)
         query_trace_ids = _extract_linked_query_trace_ids(trace)
         planner_info = _extract_planner_info(trace)
+        grounding_info = _extract_grounding_info(trace)
 
         expander_title = (
             f"🤖 {message_preview[:50]}{'…' if len(message_preview) > 50 else ''} "
@@ -207,6 +236,10 @@ def render() -> None:
             if planner_info.get("task_intent"):
                 st.markdown("**Planner Decision**")
                 st.json(planner_info)
+
+            if grounding_info.get("grounding_policy_action") or grounding_info.get("citation_count"):
+                st.markdown("**Grounding**")
+                st.json(grounding_info)
 
             if tool_chain:
                 st.markdown("**Tool Chain**")
@@ -267,6 +300,8 @@ def render() -> None:
             if final_responses:
                 final_data = final_responses[-1].get("data", {})
                 st.caption(f"content_length={final_data.get('content_length', 0)}")
+                if final_data.get("generation_mode"):
+                    st.caption(f"generation_mode={final_data.get('generation_mode', '')}")
                 preview = final_data.get("content_preview", "")
                 if preview:
                     st.text(preview)

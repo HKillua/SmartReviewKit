@@ -27,6 +27,9 @@ class AgentGoldenTestCase:
     forbidden_answer_substrings: List[str] = field(default_factory=list)
     expected_planner_intent: str = ""
     expected_control_mode: str = ""
+    require_citations: bool = False
+    expected_grounding_action: str = ""
+    expected_generation_mode: str = ""
     notes: str = ""
 
     @classmethod
@@ -46,6 +49,9 @@ class AgentGoldenTestCase:
             ],
             expected_planner_intent=str(data.get("expected_planner_intent", "")),
             expected_control_mode=str(data.get("expected_control_mode", "")),
+            require_citations=bool(data.get("require_citations", False)),
+            expected_grounding_action=str(data.get("expected_grounding_action", "")),
+            expected_generation_mode=str(data.get("expected_generation_mode", "")),
             notes=str(data.get("notes", "")),
         )
 
@@ -62,12 +68,20 @@ class AgentEvalCaseResult:
     forbidden_answer_substrings: List[str] = field(default_factory=list)
     expected_planner_intent: str = ""
     expected_control_mode: str = ""
+    require_citations: bool = False
+    expected_grounding_action: str = ""
+    expected_generation_mode: str = ""
     notes: str = ""
     actual_tool_chain: List[str] = field(default_factory=list)
     final_answer: str = ""
     trace_id: str = ""
     actual_planner_intent: str = ""
     actual_control_mode: str = ""
+    citations: List[Dict[str, Any]] = field(default_factory=list)
+    grounding_score: float = 0.0
+    grounding_policy_action: str = ""
+    generation_mode: str = ""
+    has_evidence: bool = False
     error: str = ""
     tool_errors: List[Dict[str, Any]] = field(default_factory=list)
     metrics: Dict[str, float] = field(default_factory=dict)
@@ -105,12 +119,20 @@ class AgentEvalReport:
                     "forbidden_answer_substrings": list(result.forbidden_answer_substrings),
                     "expected_planner_intent": result.expected_planner_intent,
                     "expected_control_mode": result.expected_control_mode,
+                    "require_citations": result.require_citations,
+                    "expected_grounding_action": result.expected_grounding_action,
+                    "expected_generation_mode": result.expected_generation_mode,
                     "notes": result.notes,
                     "actual_tool_chain": list(result.actual_tool_chain),
                     "final_answer": result.final_answer,
                     "trace_id": result.trace_id,
                     "actual_planner_intent": result.actual_planner_intent,
                     "actual_control_mode": result.actual_control_mode,
+                    "citations": list(result.citations),
+                    "grounding_score": round(result.grounding_score, 4),
+                    "grounding_policy_action": result.grounding_policy_action,
+                    "generation_mode": result.generation_mode,
+                    "has_evidence": result.has_evidence,
                     "error": result.error,
                     "tool_errors": list(result.tool_errors),
                     "metrics": {
@@ -170,6 +192,7 @@ class AgentEvalRunner:
         text_parts: List[str] = []
         tool_chain: List[str] = []
         trace_id = ""
+        done_metadata: Dict[str, Any] = {}
         error = ""
         tool_errors: List[Dict[str, Any]] = []
 
@@ -195,11 +218,21 @@ class AgentEvalRunner:
             elif event.type == StreamEventType.ERROR and event.content:
                 error = event.content
             elif event.type == StreamEventType.DONE:
-                trace_id = str(event.metadata.get("trace_id", ""))
+                done_metadata = dict(event.metadata)
+                trace_id = str(done_metadata.get("trace_id", ""))
 
         final_answer = "".join(text_parts).strip()
         iterations = self._lookup_iterations(trace_id)
         planner_intent, control_mode = self._lookup_planner(trace_id)
+        citations = [
+            citation
+            for citation in done_metadata.get("citations", [])
+            if isinstance(citation, dict)
+        ]
+        grounding_score = float(done_metadata.get("grounding_score", 0.0) or 0.0)
+        grounding_policy_action = str(done_metadata.get("grounding_policy_action", "") or "")
+        generation_mode = str(done_metadata.get("generation_mode", "") or "")
+        has_evidence = bool(done_metadata.get("has_evidence", False))
         elapsed_ms = (time.monotonic() - started) * 1000.0
         metrics = self._score_case(
             case,
@@ -210,6 +243,10 @@ class AgentEvalRunner:
             elapsed_ms,
             planner_intent,
             control_mode,
+            citations,
+            grounding_score,
+            grounding_policy_action,
+            generation_mode,
         )
 
         return AgentEvalCaseResult(
@@ -221,12 +258,20 @@ class AgentEvalRunner:
             forbidden_answer_substrings=list(case.forbidden_answer_substrings),
             expected_planner_intent=case.expected_planner_intent,
             expected_control_mode=case.expected_control_mode,
+            require_citations=case.require_citations,
+            expected_grounding_action=case.expected_grounding_action,
+            expected_generation_mode=case.expected_generation_mode,
             notes=case.notes,
             actual_tool_chain=tool_chain,
             final_answer=final_answer,
             trace_id=trace_id,
             actual_planner_intent=planner_intent,
             actual_control_mode=control_mode,
+            citations=citations,
+            grounding_score=grounding_score,
+            grounding_policy_action=grounding_policy_action,
+            generation_mode=generation_mode,
+            has_evidence=has_evidence,
             error=error,
             tool_errors=tool_errors,
             metrics=metrics,
@@ -275,6 +320,10 @@ class AgentEvalRunner:
         elapsed_ms: float,
         planner_intent: str,
         control_mode: str,
+        citations: List[Dict[str, Any]],
+        grounding_score: float,
+        grounding_policy_action: str,
+        generation_mode: str,
     ) -> Dict[str, float]:
         expected_hit_count = sum(1 for tool in case.expected_tools if tool in tool_chain)
         forbidden_tool_violations = sum(
@@ -296,6 +345,26 @@ class AgentEvalRunner:
             if not case.expected_control_mode
             else float(case.expected_control_mode == control_mode)
         )
+        citation_presence = (
+            1.0
+            if not case.require_citations
+            else float(bool(citations))
+        )
+        grounding_action_hit = (
+            1.0
+            if not case.expected_grounding_action
+            else float(case.expected_grounding_action == grounding_policy_action)
+        )
+        generation_mode_hit = (
+            1.0
+            if not case.expected_generation_mode
+            else float(case.expected_generation_mode == generation_mode)
+        )
+        quiz_grounded_success = 1.0
+        quiz_insufficient_evidence = 0.0
+        if case.expected_tools == ["quiz_generator"] or case.expected_planner_intent == "quiz_generator":
+            quiz_grounded_success = float(generation_mode in {"question_bank", "rag_backed"})
+            quiz_insufficient_evidence = float(generation_mode == "insufficient_evidence")
 
         return {
             "success": 0.0 if error else 1.0,
@@ -313,6 +382,12 @@ class AgentEvalRunner:
             "answer_forbidden_pass_rate": 0.0 if forbidden_answer_hits else 1.0,
             "planner_intent_hit_rate": planner_intent_hit,
             "planner_control_mode_hit_rate": planner_control_mode_hit,
+            "citation_presence_rate": citation_presence,
+            "grounding_score": grounding_score,
+            "grounding_action_hit_rate": grounding_action_hit,
+            "generation_mode_hit_rate": generation_mode_hit,
+            "quiz_grounded_success_rate": quiz_grounded_success,
+            "quiz_insufficient_evidence_rate": quiz_insufficient_evidence,
             "tool_calls": float(len(tool_chain)),
             "iterations": float(iterations),
             "latency_ms": elapsed_ms,
@@ -341,6 +416,28 @@ class AgentEvalRunner:
         planner_control_mode_hit_rate = sum(
             result.metrics.get("planner_control_mode_hit_rate", 0.0) for result in results
         ) / len(results)
+        citation_presence_rate = sum(
+            result.metrics.get("citation_presence_rate", 0.0) for result in results
+        ) / len(results)
+        avg_grounding_score = sum(
+            result.metrics.get("grounding_score", 0.0) for result in results
+        ) / len(results)
+        low_evidence_action_rate = sum(
+            1.0
+            for result in results
+            if result.grounding_policy_action == "low_evidence_warning"
+        ) / len(results)
+        conservative_rewrite_rate = sum(
+            1.0
+            for result in results
+            if result.grounding_policy_action == "conservative_rewrite"
+        ) / len(results)
+        quiz_grounded_success_rate = sum(
+            result.metrics.get("quiz_grounded_success_rate", 0.0) for result in results
+        ) / len(results)
+        quiz_insufficient_evidence_rate = sum(
+            result.metrics.get("quiz_insufficient_evidence_rate", 0.0) for result in results
+        ) / len(results)
         avg_tool_calls = sum(len(result.actual_tool_chain) for result in results) / len(results)
         avg_iterations = sum(result.iterations for result in results) / len(results)
         avg_latency_ms = sum(result.elapsed_ms for result in results) / len(results)
@@ -353,6 +450,12 @@ class AgentEvalRunner:
             "answer_forbidden_pass_rate": answer_forbidden_pass_rate,
             "planner_intent_hit_rate": planner_intent_hit_rate,
             "planner_control_mode_hit_rate": planner_control_mode_hit_rate,
+            "citation_presence_rate": citation_presence_rate,
+            "avg_grounding_score": avg_grounding_score,
+            "low_evidence_action_rate": low_evidence_action_rate,
+            "conservative_rewrite_rate": conservative_rewrite_rate,
+            "quiz_grounded_success_rate": quiz_grounded_success_rate,
+            "quiz_insufficient_evidence_rate": quiz_insufficient_evidence_rate,
             "avg_tool_calls": avg_tool_calls,
             "avg_iterations": avg_iterations,
             "avg_latency_ms": avg_latency_ms,

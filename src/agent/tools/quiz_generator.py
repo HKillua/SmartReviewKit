@@ -9,9 +9,11 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
+from src.agent.grounding import build_evidence_summary
 from src.agent.tools.base import Tool
 from src.agent.types import ToolContext, ToolResult
 from src.agent.utils.sanitizer import sanitize_user_input
+from src.core.response.citation_generator import CitationGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +113,7 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
         self._error_memory = error_memory
         self._knowledge_map = knowledge_map
         self._router = query_router
+        self._citation_generator = CitationGenerator(snippet_max_length=220)
 
     @property
     def name(self) -> str:
@@ -129,11 +132,24 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
         # --- Tier 1: try question bank ---
         qb_results = await self._search_question_bank(args.topic, args.count)
         if qb_results and len(qb_results) >= args.count:
-            formatted = self._format_existing_questions(qb_results, args.question_type)
+            formatted = self._format_existing_questions(qb_results[: args.count], args.question_type)
+            citations = [
+                citation.to_dict()
+                for citation in self._citation_generator.generate(qb_results[: args.count])
+            ]
             return ToolResult(
                 success=True,
                 result_for_llm=formatted,
-                metadata={"question_count": len(qb_results), "source": "question_bank"},
+                metadata={
+                    "question_count": min(len(qb_results), args.count),
+                    "source": "question_bank",
+                    "generation_mode": "question_bank",
+                    "grounding_capable": True,
+                    "citations": citations,
+                    "evidence_summary": build_evidence_summary(citations),
+                    "source_count": len(citations),
+                    "final_response_preferred": True,
+                },
             )
 
         # --- Tier 2: RAG context + LLM generation ---
@@ -141,8 +157,23 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
         if results:
             return await self._generate_from_context(results, args, weak_hint)
 
-        # --- Tier 3: pure LLM fallback ---
-        return await self._generate_from_llm_knowledge(args, weak_hint)
+        return ToolResult(
+            success=True,
+            result_for_llm=(
+                f"当前知识库中关于“{sanitize_user_input(args.topic)}”的课程证据不足，"
+                "暂不生成正式题目。请缩小范围（如指定章节、协议或知识点），"
+                "或先导入相关课件后再试。"
+            ),
+            metadata={
+                "question_count": 0,
+                "generation_mode": "insufficient_evidence",
+                "grounding_capable": True,
+                "citations": [],
+                "evidence_summary": "",
+                "source_count": 0,
+                "final_response_preferred": True,
+            },
+        )
 
     async def _search_question_bank(self, topic: str, count: int) -> list:
         if self._search is None:
@@ -196,7 +227,16 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
             context=knowledge_text,
             weak_points_hint=weak_hint,
         )
-        return await self._call_llm_for_quiz(prompt, args.question_type, source="rag_generated")
+        citations = [
+            citation.to_dict()
+            for citation in self._citation_generator.generate(results)
+        ]
+        return await self._call_llm_for_quiz(
+            prompt,
+            args.question_type,
+            source="rag_backed",
+            citations=citations,
+        )
 
     async def _generate_from_llm_knowledge(self, args: "QuizGeneratorArgs", weak_hint: str) -> ToolResult:
         if self._llm is None:
@@ -210,7 +250,13 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
         )
         return await self._call_llm_for_quiz(prompt, args.question_type, source="llm_fallback")
 
-    async def _call_llm_for_quiz(self, prompt: str, question_type: str, source: str = "rag_generated") -> ToolResult:
+    async def _call_llm_for_quiz(
+        self,
+        prompt: str,
+        question_type: str,
+        source: str = "rag_backed",
+        citations: Optional[list[dict[str, Any]]] = None,
+    ) -> ToolResult:
         if self._llm is None:
             return ToolResult(success=False, error="LLM 服务未初始化")
         try:
@@ -229,15 +275,35 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
             from src.agent.utils.json_helpers import safe_parse_json
             questions = safe_parse_json(resp.content or "")
             if questions is None:
-                return ToolResult(success=True, result_for_llm=resp.content or "")
+                return ToolResult(
+                    success=True,
+                    result_for_llm=resp.content or "",
+                    metadata={
+                        "question_count": 0,
+                        "source": source,
+                        "generation_mode": source,
+                        "grounding_capable": source != "insufficient_evidence",
+                        "citations": citations or [],
+                        "evidence_summary": build_evidence_summary(citations or []),
+                        "source_count": len(citations or []),
+                        "final_response_preferred": True,
+                    },
+                )
 
             formatted = _format_questions(questions, question_type)
-            if source == "llm_fallback":
-                formatted += "\n\n> *注意：以上题目基于通用知识生成，未关联课程课件。*"
             return ToolResult(
                 success=True,
                 result_for_llm=formatted,
-                metadata={"question_count": len(questions), "source": source},
+                metadata={
+                    "question_count": len(questions),
+                    "source": source,
+                    "generation_mode": source,
+                    "grounding_capable": True,
+                    "citations": citations or [],
+                    "evidence_summary": build_evidence_summary(citations or []),
+                    "source_count": len(citations or []),
+                    "final_response_preferred": True,
+                },
             )
         except Exception as exc:
             logger.exception("QuizGeneratorTool LLM call failed")

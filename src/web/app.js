@@ -180,6 +180,69 @@ function addToolIndicator(toolName) {
   return div;
 }
 
+function renderAssistantMeta(bodyEl, metadata) {
+  if (!bodyEl) return;
+
+  const existing = bodyEl.querySelector('.assistant-meta');
+  if (existing) existing.remove();
+
+  const citations = Array.isArray(metadata?.citations) ? metadata.citations : [];
+  const groundingAction = metadata?.grounding_policy_action || '';
+  const generationMode = metadata?.generation_mode || '';
+  const needsWarning = groundingAction && groundingAction !== 'normal';
+
+  if (!citations.length && !needsWarning && generationMode !== 'insufficient_evidence') {
+    return;
+  }
+
+  const wrapper = document.createElement('div');
+  wrapper.className = 'assistant-meta';
+
+  if (needsWarning) {
+    const warning = document.createElement('div');
+    warning.className = 'assistant-warning';
+    warning.textContent = groundingAction === 'conservative_rewrite'
+      ? '证据偏弱，回答已按可验证范围保守收敛。'
+      : '当前回答的课程证据不足，请结合课件再次确认。';
+    wrapper.appendChild(warning);
+  }
+
+  if (generationMode === 'insufficient_evidence') {
+    const note = document.createElement('div');
+    note.className = 'assistant-warning';
+    note.textContent = '未生成正式题目，请缩小范围、指定章节或补充相关资料。';
+    wrapper.appendChild(note);
+  }
+
+  if (citations.length) {
+    const details = document.createElement('details');
+    details.className = 'assistant-sources';
+    details.open = true;
+
+    const summary = document.createElement('summary');
+    summary.textContent = `Sources (${citations.length})`;
+    details.appendChild(summary);
+
+    const list = document.createElement('div');
+    list.className = 'assistant-sources-list';
+    list.innerHTML = citations.map((citation) => {
+      const title = citation?.metadata?.title ? ` · ${escapeHtml(citation.metadata.title)}` : '';
+      const page = citation?.page ? ` · p.${escapeHtml(String(citation.page))}` : '';
+      const snippet = citation?.text_snippet ? `<div class="assistant-source-snippet">${escapeHtml(citation.text_snippet)}</div>` : '';
+      return `
+        <div class="assistant-source-item">
+          <div class="assistant-source-title">[${escapeHtml(String(citation.index || '?'))}] ${escapeHtml(citation.source || 'unknown')}${page}${title}</div>
+          ${snippet}
+        </div>
+      `;
+    }).join('');
+    details.appendChild(list);
+    wrapper.appendChild(details);
+  }
+
+  bodyEl.appendChild(wrapper);
+}
+
 function scrollToBottom() {
   const container = $('#chatContainer');
   requestAnimationFrame(() => {
@@ -255,6 +318,7 @@ async function sendMessage(overrideMsg) {
             case 'done':
               removeThinking();
               if (assistantEl && fullContent) flushRender(assistantEl, fullContent);
+              if (assistantEl) renderAssistantMeta(assistantEl, event.metadata || {});
               if (event.metadata?.conversation_id) {
                 conversationId = event.metadata.conversation_id;
               }

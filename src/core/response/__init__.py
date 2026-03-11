@@ -8,12 +8,20 @@ This package contains response building components:
 """
 
 from src.core.response.citation_generator import Citation, CitationGenerator
-from src.core.response.multimodal_assembler import (
-    ImageContent,
-    ImageReference,
-    MultimodalAssembler,
-)
-from src.core.response.response_builder import MCPToolResponse, ResponseBuilder
+
+try:
+    from src.core.response.multimodal_assembler import (
+        ImageContent,
+        ImageReference,
+        MultimodalAssembler,
+    )
+    from src.core.response.response_builder import MCPToolResponse, ResponseBuilder
+except ModuleNotFoundError:  # pragma: no cover - optional MCP dependency
+    ImageContent = None
+    ImageReference = None
+    MultimodalAssembler = None
+    MCPToolResponse = None
+    ResponseBuilder = None
 
 __all__ = [
     "Citation",

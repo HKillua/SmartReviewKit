@@ -171,6 +171,61 @@ class _DummyKnowledgeTool(_TraceAwareTool):
     pass
 
 
+class _KnowledgePlanner:
+    def plan(self, message, matched_skill=None):
+        from src.agent.planner import ControlMode, PlannerDecision, TaskIntent
+
+        return PlannerDecision(
+            task_intent=TaskIntent.KNOWLEDGE_QUERY,
+            confidence=0.95,
+            match_method="rule",
+            control_mode=ControlMode.ADVISORY,
+            selected_tool="knowledge_query",
+            planner_hint="Use course evidence.",
+        )
+
+
+class _GroundedTool(_TraceAwareTool):
+    async def execute(self, context, args):
+        from src.agent.types import ToolResult
+
+        return ToolResult(
+            success=True,
+            result_for_llm="检索到 1 条相关内容：\n[1] `network.md`\nTCP 通过三次握手建立连接。",
+            metadata={
+                "grounding_capable": True,
+                "query_trace_id": "query-trace-123",
+                "query_trace_ids": ["query-trace-123"],
+                "source_count": 1,
+                "citations": [
+                    {
+                        "index": 1,
+                        "source": "network.md",
+                        "text_snippet": "TCP 通过三次握手建立连接。",
+                    }
+                ],
+                "evidence_summary": "[1] `network.md`: TCP 通过三次握手建立连接。",
+            },
+        )
+
+
+class _GroundedAnswerLlm(_ToolThenAnswerLlm):
+    async def send_request(self, request):
+        self.calls += 1
+        if self.calls == 1:
+            return LlmResponse(
+                content="先查知识库。",
+                tool_calls=[
+                    ToolCallData(
+                        id="tc_1",
+                        name="knowledge_query",
+                        arguments={"query": "TCP", "collection": "computer_network"},
+                    )
+                ],
+            )
+        return LlmResponse(content="TCP 通过三次握手建立连接 [1]。")
+
+
 @pytest.mark.asyncio
 async def test_agent_done_event_contains_trace_id_and_agent_trace(tmp_path: Path) -> None:
     from src.agent.agent import Agent
@@ -219,6 +274,49 @@ async def test_agent_done_event_contains_trace_id_and_agent_trace(tmp_path: Path
     assert "final_response" in stage_names
     tool_stage = next(stage for stage in trace["stages"] if stage["stage"] == "tool_execution")
     assert tool_stage["data"]["retryable"] is False
+
+
+@pytest.mark.asyncio
+async def test_agent_done_event_contains_grounding_metadata(tmp_path: Path) -> None:
+    from src.agent.agent import Agent
+    from src.agent.config import AgentConfig
+    from src.agent.conversation import ConversationStore
+    from src.agent.tools.base import ToolRegistry
+
+    trace_path = tmp_path / "grounding_traces.jsonl"
+    collector = TraceCollector(traces_path=trace_path)
+
+    conversation = Conversation(id="conv_grounding", user_id="u1", messages=[])
+    store = AsyncMock(spec=ConversationStore)
+    store.get.return_value = conversation
+    store.create.return_value = conversation
+    store.update.return_value = None
+
+    registry = ToolRegistry()
+    registry.register(_GroundedTool())
+
+    agent = Agent(
+        llm_service=_GroundedAnswerLlm(),
+        tool_registry=registry,
+        conversation_store=store,
+        config=AgentConfig(stream_responses=False, max_tool_iterations=2),
+        task_planner=_KnowledgePlanner(),
+        trace_enabled=True,
+        trace_collector=collector,
+    )
+
+    events = [event async for event in agent.chat("Explain TCP", "u1", "conv_grounding")]
+
+    done_event = next(event for event in events if event.type.value == "done")
+    assert done_event.metadata["has_evidence"] is True
+    assert done_event.metadata["grounding_score"] >= 0.4
+    assert done_event.metadata["grounding_policy_action"] == "normal"
+    assert len(done_event.metadata["citations"]) == 1
+
+    trace = TraceService(trace_path).get_trace(done_event.metadata["trace_id"])
+    assert trace is not None
+    stage_names = [stage["stage"] for stage in trace["stages"]]
+    assert "answer_grounding" in stage_names
 
 
 @pytest.mark.asyncio
@@ -298,6 +396,9 @@ async def test_knowledge_query_returns_query_trace_id_and_parent_link(tmp_path: 
     )
 
     query_trace_id = result.metadata["query_trace_id"]
+    assert result.metadata["grounding_capable"] is True
+    assert len(result.metadata["citations"]) == 1
+    assert "TCP uses SYN" in result.metadata["evidence_summary"]
     trace = TraceService(trace_path).get_trace(query_trace_id)
     assert trace is not None
     assert trace["trace_type"] == "query"

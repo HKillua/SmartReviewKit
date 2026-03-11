@@ -145,7 +145,7 @@ class TestS3AsyncToThread:
 
         result = await tool.execute(ctx, args)
         assert result.success
-        mock_search.search.assert_called_once()
+        assert mock_search.search.call_count == 2
 
     @pytest.mark.asyncio
     async def test_review_summary_uses_to_thread(self):

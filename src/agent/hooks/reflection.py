@@ -12,6 +12,7 @@ import logging
 import re
 from typing import Set
 
+from src.agent.grounding import GroundingEvaluator, build_evidence_bundle
 from src.agent.hooks.middleware import LlmMiddleware
 from src.agent.types import LlmRequest, LlmResponse
 
@@ -46,6 +47,7 @@ class ReflectionMiddleware(LlmMiddleware):
         self._threshold = groundedness_threshold
         self._append_warning = append_warning
         self._enabled = enabled
+        self._evaluator = GroundingEvaluator(threshold=groundedness_threshold)
 
     async def after_llm_response(
         self, request: LlmRequest, response: LlmResponse,
@@ -53,17 +55,40 @@ class ReflectionMiddleware(LlmMiddleware):
         if not self._enabled:
             return response
 
+        if bool(request.metadata.get("skip_reflection_warning", False)):
+            return response
+
         if not response.content or response.tool_calls:
             return response
 
+        bundle = build_evidence_bundle(
+            "reflection",
+                {
+                    "grounding_capable": bool(request.metadata.get("citations") or request.metadata.get("evidence_summary")),
+                    "citations": request.metadata.get("citations", []),
+                    "evidence_summary": request.metadata.get("evidence_summary", ""),
+                    "source_count": int(request.metadata.get("source_count", len(request.metadata.get("citations", [])))),
+                },
+            )
         rag_context = self._extract_rag_context(request.messages)
-        if not rag_context:
+        if bundle is None and not rag_context:
             return response
 
-        score = self._groundedness_score(response.content, rag_context)
+        if bundle is None and rag_context:
+            bundle = build_evidence_bundle(
+                "reflection",
+                {
+                    "grounding_capable": True,
+                    "citations": [],
+                    "evidence_summary": rag_context,
+                    "source_count": 1,
+                },
+            )
+        assessment = self._evaluator.assess(response.content, bundle)
+        score = assessment.score
         logger.debug("Reflection groundedness score: %.3f", score)
 
-        if score < self._threshold and self._append_warning:
+        if assessment.low_evidence and self._append_warning:
             response = LlmResponse(
                 content=response.content + self.WARNING_TEXT,
                 tool_calls=response.tool_calls,

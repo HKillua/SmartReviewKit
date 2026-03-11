@@ -8,8 +8,10 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
+from src.agent.grounding import build_evidence_summary
 from src.agent.tools.base import Tool
 from src.agent.types import ToolContext, ToolResult
+from src.core.response.citation_generator import CitationGenerator
 from src.core.trace.trace_collector import TraceCollector
 from src.core.trace.trace_context import TraceContext
 
@@ -49,6 +51,7 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
         self._embedding_client: Any = None
         self._init_lock = asyncio.Lock()
         self._trace_collector = TraceCollector()
+        self._citation_generator = CitationGenerator(snippet_max_length=220)
 
         retrieval_cfg = None
         if settings and hasattr(settings, 'retrieval'):
@@ -148,10 +151,15 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                 try:
                     cached = await self._semantic_cache.get(args.query)
                     if cached is not None:
+                        cached_metadata = dict(cached.metadata or {})
+                        cached_metadata.setdefault("cache_hit", True)
+                        cached_metadata.setdefault("grounding_capable", True)
+                        if query_trace is not None:
+                            cached_metadata.setdefault("query_trace_id", query_trace.trace_id)
                         return ToolResult(
                             success=True,
                             result_for_llm=cached.result + "\n\n_(来自语义缓存)_",
-                            metadata={"cache_hit": True},
+                            metadata=cached_metadata,
                         )
                 except Exception:
                     logger.debug("Semantic cache lookup failed", exc_info=True)
@@ -257,10 +265,20 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
             results = sorted(seen.values(), key=lambda x: x.score, reverse=True)[:args.top_k]
 
             if not results:
+                metadata = {
+                    "grounding_capable": True,
+                    "citations": [],
+                    "evidence_summary": "",
+                    "source_count": 0,
+                    "query_trace_ids": [query_trace.trace_id] if query_trace is not None else [],
+                    "final_response_preferred": True,
+                }
+                if query_trace is not None:
+                    metadata["query_trace_id"] = query_trace.trace_id
                 return ToolResult(
                     success=True,
                     result_for_llm="未找到与查询相关的知识库内容。请尝试换一种表述重新提问。",
-                    metadata={"query_trace_id": query_trace.trace_id} if query_trace is not None else {},
+                    metadata=metadata,
                 )
 
             if args.use_parent:
@@ -297,17 +315,32 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
             if conflict_section:
                 result_text += "\n" + conflict_section
 
+            citations = [citation.to_dict() for citation in self._citation_generator.generate(results)]
+            evidence_summary = build_evidence_summary(citations)
+            query_trace_ids = [query_trace.trace_id] if query_trace is not None else []
+            metadata = {
+                "grounding_capable": True,
+                "citations": citations,
+                "evidence_summary": evidence_summary,
+                "source_count": len(citations),
+                "query_trace_ids": query_trace_ids,
+            }
+            if query_trace is not None:
+                metadata["query_trace_id"] = query_trace.trace_id
+
             if self._semantic_cache is not None:
                 try:
                     await self._semantic_cache.put(
-                        args.query, result_text, {"collection": args.collection},
+                        args.query,
+                        result_text,
+                        {
+                            "collection": args.collection,
+                            **metadata,
+                        },
                     )
                 except Exception:
                     logger.debug("Semantic cache write failed", exc_info=True)
 
-            metadata = {}
-            if query_trace is not None:
-                metadata["query_trace_id"] = query_trace.trace_id
             return ToolResult(success=True, result_for_llm=result_text, metadata=metadata)
 
         except Exception as exc:

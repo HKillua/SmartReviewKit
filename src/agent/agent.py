@@ -11,14 +11,24 @@ import hashlib
 import logging
 import time
 import uuid
-from typing import AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Optional
 
 from src.agent.config import AgentConfig
 from src.agent.conversation import ConversationStore
+from src.agent.grounding import (
+    DEFAULT_LOW_EVIDENCE_MESSAGE,
+    EvidenceBundle,
+    GroundingAssessment,
+    GroundingEvaluator,
+    GroundingPolicyAction,
+    build_conservative_rewrite_messages,
+    build_evidence_bundle,
+    build_grounding_context,
+)
 from src.agent.hooks.lifecycle import LifecycleHook
 from src.agent.hooks.middleware import LlmMiddleware
 from src.agent.llm.base import LlmService
-from src.agent.planner import ControlMode, PlannerDecision, TaskPlanner
+from src.agent.planner import ControlMode, PlannerDecision, TaskIntent, TaskPlanner
 from src.agent.prompt_builder import SystemPromptBuilder
 from src.agent.tools.base import ToolRegistry
 from src.agent.types import (
@@ -105,6 +115,28 @@ def _planner_metadata(decision: PlannerDecision | None) -> dict[str, object]:
     }
 
 
+def _is_course_task(decision: PlannerDecision | None) -> bool:
+    return decision is not None and decision.task_intent != TaskIntent.GENERAL_CHAT
+
+
+def _append_warning(text: str, warning: str) -> str:
+    if not warning or warning in text:
+        return text
+    return f"{text.rstrip()}\n\n{warning}"
+
+
+def _build_evidence_metadata(
+    bundle: EvidenceBundle | None,
+    assessment: GroundingAssessment | None = None,
+) -> dict[str, object]:
+    metadata: dict[str, object] = {}
+    if bundle is not None:
+        metadata.update(bundle.to_metadata())
+    if assessment is not None:
+        metadata.update(assessment.to_metadata())
+    return metadata
+
+
 def _accumulate_tool_calls(chunks: list[LlmStreamChunk]) -> list[ToolCallData] | None:
     """Reassemble streamed tool-call deltas into complete ToolCallData objects."""
     by_index: dict[int, dict] = {}
@@ -171,6 +203,7 @@ class Agent:
         self._bg_tasks: set[asyncio.Task] = set()
         self._trace_enabled = trace_enabled
         self._trace_collector = trace_collector or (TraceCollector() if trace_enabled else None)
+        self._grounding_evaluator = GroundingEvaluator()
 
     async def chat(
         self,
@@ -295,6 +328,7 @@ class Agent:
 
             planner_decision: PlannerDecision | None = None
             planner_context = ""
+            course_task = False
             if self.task_planner is not None:
                 try:
                     planner_decision = self.task_planner.plan(
@@ -302,6 +336,7 @@ class Agent:
                         matched_skill=matched_skill or None,
                     )
                     planner_context = _build_planner_context(planner_decision)
+                    course_task = _is_course_task(planner_decision)
                 except Exception:
                     logger.exception("Task planner failed")
 
@@ -335,6 +370,7 @@ class Agent:
                 tool_schemas=tool_schemas,
                 memory_context=memory_ctx,
                 planner_context=planner_context,
+                grounding_context=build_grounding_context(None, course_task=course_task),
                 active_skill=skill_ctx,
             )
             if agent_trace is not None:
@@ -391,6 +427,7 @@ class Agent:
 
             # --- Tool loop ---
             try:
+                response_state: dict[str, object] = {}
                 async for event in self._tool_loop(
                     conversation,
                     system_prompt,
@@ -399,6 +436,7 @@ class Agent:
                     trace=agent_trace,
                     planner_decision=planner_decision,
                     planner_runtime=planner_runtime,
+                    response_state=response_state,
                 ):
                     yield event
             except Exception as exc:
@@ -419,9 +457,11 @@ class Agent:
                 done_metadata["trace_id"] = agent_trace.trace_id
                 agent_trace.metadata["planner_final_control_mode"] = planner_runtime["final_control_mode"]
                 agent_trace.metadata["planner_violation_count"] = planner_runtime["violation_count"]
+                agent_trace.metadata.update(response_state)
             done_metadata.update(_planner_metadata(planner_decision))
             done_metadata["planner_final_control_mode"] = planner_runtime["final_control_mode"]
             done_metadata["planner_violation_count"] = planner_runtime["violation_count"]
+            done_metadata.update(response_state)
             yield StreamEvent(type=StreamEventType.DONE, metadata=done_metadata)
 
             task = asyncio.create_task(self._post_message_tasks(conversation))
@@ -470,6 +510,7 @@ class Agent:
         trace: TraceContext | None = None,
         planner_decision: PlannerDecision | None = None,
         planner_runtime: dict[str, object] | None = None,
+        response_state: dict[str, object] | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Inner ReAct loop: call LLM -> execute tools -> repeat.
 
@@ -483,6 +524,9 @@ class Agent:
             and bool(planner_decision.selected_tool)
         )
         force_retry_limit = 1
+        course_task = _is_course_task(planner_decision)
+        evidence_bundle: EvidenceBundle | None = None
+        latest_grounded_tool_text = ""
 
         for iteration in range(self.config.max_tool_iterations):
             iteration_started = time.monotonic()
@@ -513,6 +557,12 @@ class Agent:
                         f"这一次必须先调用 `{planner_decision.selected_tool}`，然后再继续回答。"
                     )
                 iteration_prompt = system_prompt + f"\n\n## [Planner Enforcement]\n{reminder}"
+            elif evidence_bundle is not None:
+                iteration_prompt = (
+                    system_prompt
+                    + "\n\n## [Grounding Context]\n"
+                    + build_grounding_context(evidence_bundle, course_task=course_task)
+                )
 
             llm_messages = await self._build_llm_messages(conversation, iteration_prompt)
 
@@ -521,7 +571,21 @@ class Agent:
                 tools=available_tool_schemas if available_tool_schemas else None,
                 temperature=self.config.temperature,
                 max_tokens=self.config.max_tokens,
-                stream=self.config.stream_responses and not force_active,
+                stream=self.config.stream_responses and not force_active and not course_task,
+                metadata={
+                    "course_task": course_task,
+                    "skip_reflection_warning": course_task,
+                    "citations": evidence_bundle.citations if evidence_bundle is not None else [],
+                    "evidence_summary": (
+                        evidence_bundle.evidence_summary if evidence_bundle is not None else ""
+                    ),
+                    "source_count": (
+                        evidence_bundle.source_count if evidence_bundle is not None else 0
+                    ),
+                    "generation_mode": (
+                        evidence_bundle.generation_mode if evidence_bundle is not None else ""
+                    ),
+                },
             )
 
             for mw in self.middlewares:
@@ -572,6 +636,10 @@ class Agent:
                     else ""
                 ),
                 "visible_tool_count": len(available_tool_schemas),
+                "has_evidence": bool(evidence_bundle and evidence_bundle.has_evidence),
+                "generation_mode": (
+                    evidence_bundle.generation_mode if evidence_bundle is not None else ""
+                ),
             }
             if trace is not None:
                 trace.record_stage(
@@ -598,6 +666,7 @@ class Agent:
                 conversation.messages.append(
                     Message(role="assistant", content=response.content, tool_calls=response.tool_calls)
                 )
+                passthrough_payload: tuple[str, dict[str, Any]] | None = None
 
                 for tc in response.tool_calls:
                     tool_started = time.monotonic()
@@ -657,6 +726,16 @@ class Agent:
                         )
                     )
 
+                    bundle = build_evidence_bundle(tc.name, tool_result_obj.metadata)
+                    if bundle is not None:
+                        evidence_bundle = bundle
+                        latest_grounded_tool_text = tool_result_obj.result_for_llm or ""
+                    if tool_result_obj.metadata.get("final_response_preferred"):
+                        passthrough_payload = (
+                            tool_result_obj.result_for_llm if tool_result_obj.success else (tool_result_obj.error or ""),
+                            tool_result_obj.metadata,
+                        )
+
                     if trace is not None:
                         trace.record_stage(
                             "tool_execution",
@@ -668,11 +747,58 @@ class Agent:
                                 "error_type": tool_result_obj.metadata.get("error_type", ""),
                                 "retryable": bool(tool_result_obj.metadata.get("retryable", False)),
                                 "query_trace_id": tool_result_obj.metadata.get("query_trace_id"),
+                                "generation_mode": tool_result_obj.metadata.get("generation_mode", ""),
+                                "source_count": int(tool_result_obj.metadata.get("source_count", 0) or 0),
                                 "error_summary": _truncate_text(tool_result_obj.error),
                                 "result_summary": _truncate_text(tool_result_obj.result_for_llm),
                             },
                             elapsed_ms=(time.monotonic() - tool_started) * 1000.0,
                         )
+
+                if passthrough_payload is not None:
+                    generation_mode = str(passthrough_payload[1].get("generation_mode", "") or "")
+                    if generation_mode in {"question_bank", "rag_backed"}:
+                        final_text = passthrough_payload[0]
+                        grounding_assessment = GroundingAssessment(
+                            score=1.0,
+                            has_evidence=bool(evidence_bundle and evidence_bundle.has_evidence),
+                            citation_count=0,
+                            source_count=evidence_bundle.source_count if evidence_bundle is not None else 0,
+                        )
+                    else:
+                        final_text, grounding_assessment = await self._finalize_answer(
+                            passthrough_payload[0],
+                            course_task=course_task,
+                            evidence_bundle=evidence_bundle,
+                            fallback_text=latest_grounded_tool_text,
+                        )
+                    if trace is not None and grounding_assessment is not None:
+                        trace.record_stage(
+                            "answer_grounding",
+                            grounding_assessment.to_metadata(),
+                        )
+                    if response_state is not None:
+                        response_state.update(
+                            _build_evidence_metadata(evidence_bundle, grounding_assessment)
+                        )
+                    if response_state is not None and generation_mode:
+                        response_state["generation_mode"] = generation_mode
+                    if trace is not None and generation_mode:
+                        trace.metadata["generation_mode"] = generation_mode
+                    if final_text:
+                        yield StreamEvent(type=StreamEventType.TEXT_DELTA, content=final_text)
+                    if trace is not None:
+                        trace.record_stage(
+                            "final_response",
+                            {
+                                "iteration": iteration + 1,
+                                "content_length": len(final_text or ""),
+                                "content_preview": _truncate_text(final_text),
+                                "generation_mode": generation_mode,
+                            },
+                        )
+                    conversation.messages.append(Message(role="assistant", content=final_text or ""))
+                    return
 
                 if force_active:
                     force_active = False
@@ -716,18 +842,34 @@ class Agent:
                     )
                 continue
 
-            if response.content and not request.stream:
-                yield StreamEvent(type=StreamEventType.TEXT_DELTA, content=response.content)
+            final_content, grounding_assessment = await self._finalize_answer(
+                response.content or "",
+                course_task=course_task,
+                evidence_bundle=evidence_bundle,
+                fallback_text=latest_grounded_tool_text,
+            )
+            if final_content and not request.stream:
+                yield StreamEvent(type=StreamEventType.TEXT_DELTA, content=final_content)
+            if trace is not None and grounding_assessment is not None:
+                trace.record_stage(
+                    "answer_grounding",
+                    grounding_assessment.to_metadata(),
+                )
+            if response_state is not None:
+                response_state.update(_build_evidence_metadata(evidence_bundle, grounding_assessment))
             if trace is not None:
                 trace.record_stage(
                     "final_response",
                     {
                         "iteration": iteration + 1,
-                        "content_length": len(response.content or ""),
-                        "content_preview": _truncate_text(response.content),
+                        "content_length": len(final_content or ""),
+                        "content_preview": _truncate_text(final_content),
+                        "generation_mode": (
+                            evidence_bundle.generation_mode if evidence_bundle is not None else ""
+                        ),
                     },
                 )
-            conversation.messages.append(Message(role="assistant", content=response.content or ""))
+            conversation.messages.append(Message(role="assistant", content=final_content or ""))
             return
 
         if trace is not None:
@@ -743,6 +885,81 @@ class Agent:
             type=StreamEventType.ERROR,
             content=f"达到最大工具调用轮次 ({self.config.max_tool_iterations})，请简化问题后重试。",
         )
+
+    async def _finalize_answer(
+        self,
+        content: str,
+        *,
+        course_task: bool,
+        evidence_bundle: EvidenceBundle | None,
+        fallback_text: str = "",
+    ) -> tuple[str, GroundingAssessment | None]:
+        if not course_task:
+            return content, None
+
+        assessment = self._grounding_evaluator.assess(content, evidence_bundle)
+        if not assessment.low_evidence:
+            return content, assessment
+
+        if evidence_bundle is not None and evidence_bundle.has_evidence:
+            rewritten = await self._rewrite_answer_conservatively(content, evidence_bundle)
+            if rewritten:
+                rewritten_assessment = self._grounding_evaluator.assess(rewritten, evidence_bundle)
+                rewritten_assessment.conservative_rewrite_used = True
+                if not rewritten_assessment.low_evidence:
+                    rewritten_assessment.policy_action = GroundingPolicyAction.CONSERVATIVE_REWRITE.value
+                    return rewritten, rewritten_assessment
+                rewritten_assessment.policy_action = GroundingPolicyAction.LOW_EVIDENCE_WARNING.value
+                return (
+                    _append_warning(
+                        rewritten,
+                        "> ⚠️ 现有课程证据不足，以上回答已按可验证范围保守表达。",
+                    ),
+                    rewritten_assessment,
+                )
+
+        conservative = fallback_text or content or DEFAULT_LOW_EVIDENCE_MESSAGE
+        if not any(token in conservative for token in ("证据不足", "未找到", "暂不生成", "无法可靠")):
+            conservative = DEFAULT_LOW_EVIDENCE_MESSAGE
+        assessment.policy_action = GroundingPolicyAction.LOW_EVIDENCE_WARNING.value
+        assessment.low_evidence = True
+        return conservative, assessment
+
+    async def _rewrite_answer_conservatively(
+        self,
+        content: str,
+        evidence_bundle: EvidenceBundle,
+    ) -> str:
+        system_prompt, user_prompt = build_conservative_rewrite_messages(content, evidence_bundle)
+        rewrite_request = LlmRequest(
+            messages=[
+                LlmMessage(role="system", content=system_prompt),
+                LlmMessage(role="user", content=user_prompt),
+            ],
+            temperature=0.2,
+            max_tokens=self.config.max_tokens,
+            stream=False,
+            metadata={
+                "course_task": True,
+                "skip_reflection_warning": True,
+                "citations": evidence_bundle.citations,
+                "evidence_summary": evidence_bundle.evidence_summary,
+                "generation_mode": evidence_bundle.generation_mode,
+            },
+        )
+        try:
+            for mw in self.middlewares:
+                rewrite_request = await mw.before_llm_request(rewrite_request)
+            rewrite_response = await self.llm.send_request(rewrite_request)
+            for mw in reversed(self.middlewares):
+                rewrite_response = await mw.after_llm_response(rewrite_request, rewrite_response)
+        except Exception:
+            logger.exception("Conservative rewrite failed")
+            return ""
+        if rewrite_response.error:
+            logger.warning("Conservative rewrite returned error: %s", rewrite_response.error)
+            return ""
+        return (rewrite_response.content or "").strip()
 
     async def _build_llm_messages(
         self, conversation: Conversation, system_prompt: str

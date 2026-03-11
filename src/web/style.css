@@ -410,6 +410,67 @@ body {
 .msg-body .katex { font-size: 1.05em; }
 .msg-body .katex-display { margin: 12px 0; overflow-x: auto; overflow-y: hidden; }
 
+.assistant-meta {
+  margin-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.assistant-warning {
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(245, 158, 11, 0.12);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  color: var(--text);
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+
+.assistant-sources {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  padding: 10px 12px;
+}
+
+.assistant-sources summary {
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.assistant-sources-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.assistant-source-item {
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.assistant-source-item:first-child {
+  padding-top: 0;
+  border-top: none;
+}
+
+.assistant-source-title {
+  font-size: 0.84rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.assistant-source-snippet {
+  margin-top: 4px;
+  font-size: 0.82rem;
+  line-height: 1.55;
+  color: var(--text-secondary);
+}
+
 /* Tool indicator */
 .tool-indicator {
   display: inline-flex;

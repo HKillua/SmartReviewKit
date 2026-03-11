@@ -13,6 +13,8 @@
       "forbidden_answer_substrings": ["无法回答"],
       "expected_planner_intent": "knowledge_query",
       "expected_control_mode": "advisory",
+      "require_citations": true,
+      "expected_grounding_action": "normal",
       "notes": "基础知识问答，应该走 knowledge_query。"
     },
     {
@@ -39,6 +41,7 @@
       "forbidden_answer_substrings": [],
       "expected_planner_intent": "quiz_generator",
       "expected_control_mode": "force_tool",
+      "expected_generation_mode": "",
       "notes": "练习题生成应命中 quiz_generator。"
     },
     {

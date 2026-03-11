@@ -43,6 +43,7 @@ class TestAgentEvaluationPanelHelpers:
 class TestAgentTracesHelpers:
     def test_extract_tool_chain_and_query_trace_ids(self) -> None:
         from src.observability.dashboard.pages.agent_traces import (
+            _extract_grounding_info,
             _extract_planner_info,
             _extract_linked_query_trace_ids,
             _extract_tool_chain,
@@ -53,6 +54,9 @@ class TestAgentTracesHelpers:
                 "status": "success",
                 "planner_task_intent": "review_summary",
                 "planner_control_mode": "force_tool",
+                "grounding_score": 0.81,
+                "grounding_policy_action": "normal",
+                "citations": [{"index": 1, "source": "network.md"}],
             },
             "stages": [
                 {
@@ -69,6 +73,7 @@ class TestAgentTracesHelpers:
         assert _extract_tool_chain(trace) == ["knowledge_query", "review_summary"]
         assert _extract_linked_query_trace_ids(trace) == ["q1"]
         assert _extract_planner_info(trace)["task_intent"] == "review_summary"
+        assert _extract_grounding_info(trace)["citation_count"] == 1
 
     def test_filter_agent_traces_by_keyword_tool_and_status(self) -> None:
         from src.observability.dashboard.pages.agent_traces import _filter_agent_traces

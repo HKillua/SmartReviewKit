@@ -163,6 +163,9 @@ def _render_case_details(report: Dict[str, Any]) -> None:
                         ),
                         "expected_planner_intent": result.get("expected_planner_intent", ""),
                         "expected_control_mode": result.get("expected_control_mode", ""),
+                        "require_citations": result.get("require_citations", False),
+                        "expected_grounding_action": result.get("expected_grounding_action", ""),
+                        "expected_generation_mode": result.get("expected_generation_mode", ""),
                     }
                 )
             with compare_cols[1]:
@@ -173,6 +176,10 @@ def _render_case_details(report: Dict[str, Any]) -> None:
                         "iterations": result.get("iterations", 0),
                         "actual_planner_intent": result.get("actual_planner_intent", ""),
                         "actual_control_mode": result.get("actual_control_mode", ""),
+                        "grounding_score": result.get("grounding_score", 0.0),
+                        "grounding_policy_action": result.get("grounding_policy_action", ""),
+                        "generation_mode": result.get("generation_mode", ""),
+                        "citation_count": len(result.get("citations", [])),
                         "final_answer": result.get("final_answer", ""),
                     }
                 )
@@ -184,6 +191,11 @@ def _render_case_details(report: Dict[str, Any]) -> None:
             if tool_errors:
                 st.markdown("**Tool Errors**")
                 st.json(tool_errors)
+
+            citations = result.get("citations", [])
+            if citations:
+                st.markdown("**Citations**")
+                st.json(citations)
 
             if metrics:
                 metric_cols = st.columns(min(len(metrics), 4))

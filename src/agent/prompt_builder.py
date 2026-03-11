@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_TEMPLATE = (
     "你是一个专业的课程学习助手。请帮助用户进行知识问答、考点复习、习题练习。\n"
-    "$tool_descriptions\n$memory_context\n$planner_context\n$active_skill"
+    "$tool_descriptions\n$memory_context\n$planner_context\n$grounding_context\n$active_skill"
 )
 
 
@@ -30,6 +30,7 @@ class SystemPromptBuilder:
             raw = raw.replace("{tool_descriptions}", "$tool_descriptions")
             raw = raw.replace("{memory_context}", "$memory_context")
             raw = raw.replace("{planner_context}", "$planner_context")
+            raw = raw.replace("{grounding_context}", "$grounding_context")
             raw = raw.replace("{active_skill}", "$active_skill")
             self._cached_template = raw
         except FileNotFoundError:
@@ -42,6 +43,7 @@ class SystemPromptBuilder:
         tool_schemas: list[dict] | None = None,
         memory_context: str = "",
         planner_context: str = "",
+        grounding_context: str = "",
         active_skill: str = "",
     ) -> str:
         template_str = self._load_template()
@@ -67,9 +69,14 @@ class SystemPromptBuilder:
         if planner_context:
             planner_section = f"## [Planner Context]\n{planner_context}"
 
+        grounding_section = ""
+        if grounding_context:
+            grounding_section = f"## [Grounding Context]\n{grounding_context}"
+
         return tmpl.safe_substitute(
             tool_descriptions=tool_desc,
             memory_context=mem_section,
             planner_context=planner_section,
+            grounding_context=grounding_section,
             active_skill=skill_section,
         ).strip()

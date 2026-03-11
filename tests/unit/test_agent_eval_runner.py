@@ -38,6 +38,8 @@ async def test_agent_eval_runner_reconstructs_case_outputs(tmp_path: Path) -> No
                         "forbidden_answer_substrings": ["I do not know"],
                         "expected_planner_intent": "knowledge_query",
                         "expected_control_mode": "advisory",
+                        "require_citations": True,
+                        "expected_grounding_action": "normal",
                     }
                 ]
             }
@@ -77,7 +79,19 @@ async def test_agent_eval_runner_reconstructs_case_outputs(tmp_path: Path) -> No
             StreamEvent(type=StreamEventType.TEXT_DELTA, content=" answer"),
             StreamEvent(
                 type=StreamEventType.DONE,
-                metadata={"trace_id": "agent-trace-1"},
+                metadata={
+                    "trace_id": "agent-trace-1",
+                    "citations": [
+                        {
+                            "index": 1,
+                            "source": "network.md",
+                            "text_snippet": "TCP uses a three-way handshake.",
+                        }
+                    ],
+                    "grounding_score": 0.88,
+                    "grounding_policy_action": "normal",
+                    "has_evidence": True,
+                },
             ),
         ]
     )
@@ -93,6 +107,9 @@ async def test_agent_eval_runner_reconstructs_case_outputs(tmp_path: Path) -> No
     assert case.iterations == 2
     assert case.actual_planner_intent == "knowledge_query"
     assert case.actual_control_mode == "advisory"
+    assert case.grounding_policy_action == "normal"
+    assert case.grounding_score == 0.88
+    assert len(case.citations) == 1
     assert case.tool_errors == [
         {
             "tool_name": "knowledge_query",
@@ -105,7 +122,10 @@ async def test_agent_eval_runner_reconstructs_case_outputs(tmp_path: Path) -> No
     assert case.metrics["expected_tool_recall"] == 1.0
     assert case.metrics["planner_intent_hit_rate"] == 1.0
     assert case.metrics["planner_control_mode_hit_rate"] == 1.0
+    assert case.metrics["citation_presence_rate"] == 1.0
+    assert case.metrics["grounding_action_hit_rate"] == 1.0
     assert report.aggregate_metrics["success_rate"] == 1.0
+    assert report.aggregate_metrics["citation_presence_rate"] == 1.0
     assert report.aggregate_metrics["avg_iterations"] == 2.0
 
 
