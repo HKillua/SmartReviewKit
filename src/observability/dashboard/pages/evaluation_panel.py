@@ -78,6 +78,22 @@ def render() -> None:
             help="Limit retrieval to a specific collection.",
         )
 
+    compare_mode = st.checkbox(
+        "Compare Legacy vs Production Backends",
+        value=False,
+        help="Run the same golden set against Chroma/BM25 and Milvus/OpenSearch.",
+    )
+    legacy_settings_path = st.text_input(
+        "Legacy Settings Path",
+        value="config/settings.yaml",
+        disabled=not compare_mode,
+    )
+    prod_settings_path = st.text_input(
+        "Production Settings Path",
+        value="config/settings.storage_stack.yaml",
+        disabled=not compare_mode,
+    )
+
     # Golden test set file selection
     golden_path_str = st.text_input(
         "Golden Test Set Path",
@@ -107,6 +123,9 @@ def render() -> None:
             golden_path=golden_path,
             top_k=int(top_k),
             collection=collection.strip() or None,
+            compare_mode=compare_mode,
+            legacy_settings_path=legacy_settings_path,
+            prod_settings_path=prod_settings_path,
         )
 
     # ── Historical Results ─────────────────────────────────────────
@@ -119,6 +138,9 @@ def _run_evaluation(
     golden_path: Path,
     top_k: int,
     collection: Optional[str],
+    compare_mode: bool = False,
+    legacy_settings_path: str = "config/settings.yaml",
+    prod_settings_path: str = "config/settings.storage_stack.yaml",
 ) -> None:
     """Execute an evaluation run and display results.
 
@@ -133,6 +155,9 @@ def _run_evaluation(
                 golden_path=golden_path,
                 top_k=top_k,
                 collection=collection,
+                compare_mode=compare_mode,
+                legacy_settings_path=legacy_settings_path,
+                prod_settings_path=prod_settings_path,
             )
         except Exception as exc:
             st.error(f"❌ Evaluation failed: {exc}")
@@ -142,8 +167,11 @@ def _run_evaluation(
     # ── Display results ────────────────────────────────────────────
     st.success("✅ Evaluation complete!")
 
-    _render_aggregate_metrics(report_dict)
-    _render_query_details(report_dict)
+    if compare_mode and "pairwise_summary" in report_dict:
+        _render_compare_results(report_dict)
+    else:
+        _render_aggregate_metrics(report_dict)
+        _render_query_details(report_dict)
 
     # Save to history
     _save_to_history(report_dict)
@@ -154,6 +182,9 @@ def _execute_evaluation(
     golden_path: Path,
     top_k: int,
     collection: Optional[str],
+    compare_mode: bool = False,
+    legacy_settings_path: str = "config/settings.yaml",
+    prod_settings_path: str = "config/settings.storage_stack.yaml",
 ) -> Dict[str, Any]:
     """Run the evaluation pipeline and return the report dict.
 
@@ -162,7 +193,19 @@ def _execute_evaluation(
     """
     from src.core.settings import load_settings
     from src.libs.evaluator.evaluator_factory import EvaluatorFactory
-    from src.observability.evaluation.eval_runner import EvalRunner, load_test_set
+    from src.observability.evaluation.eval_runner import EvalRunner
+    from src.observability.evaluation.migration_compare import MigrationCompareRunner
+
+    if compare_mode:
+        runner = MigrationCompareRunner(
+            legacy_settings_path=legacy_settings_path,
+            production_settings_path=prod_settings_path,
+        )
+        return runner.run(
+            test_set_path=golden_path,
+            top_k=top_k,
+            collection=collection,
+        ).to_dict()
 
     settings = load_settings()
 
@@ -233,6 +276,30 @@ def _render_aggregate_metrics(report: Dict[str, Any]) -> None:
         f"Queries: **{report.get('query_count', 0)}** · "
         f"Total time: **{report.get('total_elapsed_ms', 0):.0f} ms**"
     )
+
+
+def _render_compare_results(report: Dict[str, Any]) -> None:
+    """Display legacy-vs-production backend comparison results."""
+    st.subheader("📊 Backend Compare")
+    summary = report.get("pairwise_summary", {})
+    cols = st.columns(4)
+    cols[0].metric("Cases", summary.get("case_count", 0))
+    cols[1].metric("Avg Overlap@K", f"{summary.get('avg_overlap_at_k', 0):.4f}")
+    cols[2].metric("Hard Failures", summary.get("hard_failure_count", 0))
+    cols[3].metric("Warnings", summary.get("warning_count", 0))
+
+    st.markdown("**Legacy Metrics**")
+    st.json(report.get("legacy_metrics", {}))
+    st.markdown("**Production Metrics**")
+    st.json(report.get("prod_metrics", {}))
+
+    if report.get("hard_failures"):
+        st.error("\n".join(report["hard_failures"][:20]))
+    if report.get("warnings"):
+        st.warning("\n".join(report["warnings"][:20]))
+
+    st.subheader("🔍 Per-Case Diff")
+    st.dataframe(report.get("per_case", []), use_container_width=True)
 
 
 def _render_query_details(report: Dict[str, Any]) -> None:

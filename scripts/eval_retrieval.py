@@ -61,21 +61,21 @@ def load_eval_set(path: str) -> list[dict[str, Any]]:
 
 
 def run_evaluation(eval_file: str, top_k: int = 5, collection: str = "computer_network"):
-    from src.core.settings import load_settings, resolve_path
+    from src.core.settings import load_settings
     from src.core.query_engine.query_processor import QueryProcessor
     from src.core.query_engine.hybrid_search import HybridSearch
     from src.core.query_engine.dense_retriever import create_dense_retriever
     from src.core.query_engine.sparse_retriever import create_sparse_retriever
     from src.core.query_engine.fusion import RRFFusion
-    from src.ingestion.storage.bm25_indexer import BM25Indexer
     from src.libs.embedding.embedding_factory import EmbeddingFactory
     from src.libs.vector_store.vector_store_factory import VectorStoreFactory
+    from src.storage.runtime import create_sparse_index
 
     settings = load_settings()
     embedding = EmbeddingFactory.create(settings)
     vector_store = VectorStoreFactory.create(settings, collection_name=collection)
     dense = create_dense_retriever(settings=settings, embedding_client=embedding, vector_store=vector_store)
-    bm25 = BM25Indexer(index_dir=str(resolve_path(f"data/db/bm25/{collection}")))
+    bm25 = create_sparse_index(settings, collection=collection)
     sparse = create_sparse_retriever(settings=settings, bm25_indexer=bm25, vector_store=vector_store)
     sparse.default_collection = collection
     fusion = RRFFusion(k=60)

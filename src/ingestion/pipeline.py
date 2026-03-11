@@ -47,6 +47,7 @@ from src.ingestion.embedding.batch_processor import BatchProcessor
 from src.ingestion.storage.vector_upserter import VectorUpserter
 from src.ingestion.transform.contextual_enricher import ContextualEnricher
 from src.ingestion.transform.chunk_dedup import dedup_chunks
+from src.ingestion.document_manager import DocumentManager
 from src.storage.runtime import create_ingestion_backends, create_sparse_index
 
 logger = get_logger(__name__)
@@ -243,6 +244,8 @@ class IngestionPipeline:
         trace: Optional[TraceContext] = None,
         on_progress: Optional[Callable[[str, int, int], None]] = None,
         source_type: str = "auto",
+        metadata_overrides: Optional[Dict[str, Any]] = None,
+        record_file_path: Optional[str] = None,
     ) -> PipelineResult:
         """Execute the full ingestion pipeline on a file.
         
@@ -258,6 +261,12 @@ class IngestionPipeline:
             PipelineResult with success status and statistics
         """
         file_path = Path(file_path)
+        metadata_overrides = {
+            key: value
+            for key, value in (metadata_overrides or {}).items()
+            if value not in (None, "")
+        }
+        persisted_file_path = str(record_file_path or metadata_overrides.get("source_path") or file_path)
         stages: Dict[str, Any] = {}
         _total_stages = 6
 
@@ -284,7 +293,7 @@ class IngestionPipeline:
             file_hash = self.integrity_checker.compute_sha256(str(file_path))
             logger.info(f"  File hash: {file_hash[:16]}...")
             
-            if not self.force and self.integrity_checker.should_skip(file_hash):
+            if not self.force and self.integrity_checker.should_skip(file_hash, self.collection):
                 logger.info(f"  ⏭️  File already processed, skipping (use force=True to reprocess)")
                 return PipelineResult(
                     success=True,
@@ -294,7 +303,7 @@ class IngestionPipeline:
                 )
             
             # When force-reprocessing, clean up stale data from previous run
-            if self.force and self.integrity_checker.should_skip(file_hash):
+            if self.force and self.integrity_checker.should_skip(file_hash, self.collection):
                 logger.info("  🧹 Force mode: cleaning stale data from previous ingestion")
                 self._cleanup_stale_data(file_hash, str(file_path))
             
@@ -317,6 +326,8 @@ class IngestionPipeline:
                 document = self.docx_loader.load(str(file_path))
             else:
                 document = self.pdf_loader.load(str(file_path))
+            if metadata_overrides:
+                document = self._apply_document_metadata_overrides(document, metadata_overrides)
             _elapsed = (time.monotonic() - _t0) * 1000.0
             
             text_preview = document.text[:200].replace('\n', ' ') + "..." if len(document.text) > 200 else document.text
@@ -354,7 +365,11 @@ class IngestionPipeline:
                 qp = QuestionParser()
                 parsed = qp.parse(document.text)
                 if parsed:
-                    chunks = qp.to_chunks(parsed, source_path=str(file_path), doc_id=document.id)
+                    chunks = qp.to_chunks(
+                        parsed,
+                        source_path=str(document.metadata.get("source_path", persisted_file_path)),
+                        doc_id=document.id,
+                    )
                     logger.info(f"  QuestionParser: {len(chunks)} questions extracted")
                 else:
                     chunks = self.chunker.split_document(document, source_type=source_type)
@@ -364,6 +379,12 @@ class IngestionPipeline:
 
             for c in chunks:
                 c.metadata.setdefault("source_type", source_type)
+                c.metadata["collection"] = self.collection
+                c.metadata.setdefault("source_collection", self.collection)
+                for key in ("source_label", "original_filename", "object_uri", "object_key"):
+                    value = document.metadata.get(key)
+                    if value:
+                        c.metadata.setdefault(key, value)
 
             _elapsed = (time.monotonic() - _t0) * 1000.0
             
@@ -523,6 +544,8 @@ class IngestionPipeline:
                 "sparse_doc_count": len(sparse_stats),
                 "failed_chunk_count": failed_chunk_count,
             }
+            for stat in sparse_stats:
+                stat["doc_hash"] = file_hash
             if trace is not None:
                 # Build per-chunk encoding details (both dense & sparse)
                 chunk_details = []
@@ -638,19 +661,24 @@ class IngestionPipeline:
             # ─────────────────────────────────────────────────────────────
             # Mark Success
             # ─────────────────────────────────────────────────────────────
-            self.integrity_checker.mark_success(file_hash, str(file_path), self.collection)
+            self.integrity_checker.mark_success(file_hash, persisted_file_path, self.collection)
             document_registry = getattr(self, "document_registry", None)
             if document_registry is not None:
                 try:
                     document_registry.upsert_document(
                         file_hash=file_hash,
-                        file_path=str(file_path),
+                        file_path=persisted_file_path,
                         collection=self.collection,
                         status="ready",
                         metadata={
                             "chunk_count": len(chunks),
                             "image_count": len(images),
                             "vector_ids_count": len(vector_ids),
+                            **{
+                                key: metadata_overrides[key]
+                                for key in ("source_label", "original_filename", "object_uri", "object_key")
+                                if key in metadata_overrides
+                            },
                         },
                     )
                 except Exception:
@@ -679,7 +707,12 @@ class IngestionPipeline:
             resolved_hash = file_hash if 'file_hash' in locals() else None
             if resolved_hash is not None:
                 try:
-                    self.integrity_checker.mark_failed(resolved_hash, str(file_path), str(e))
+                    self.integrity_checker.mark_failed(
+                        resolved_hash,
+                        persisted_file_path,
+                        str(e),
+                        collection=self.collection,
+                    )
                 except Exception:
                     logger.warning("Failed to record ingestion failure in integrity DB")
                 document_registry = getattr(self, "document_registry", None)
@@ -687,10 +720,17 @@ class IngestionPipeline:
                     try:
                         document_registry.upsert_document(
                             file_hash=resolved_hash,
-                            file_path=str(file_path),
+                            file_path=persisted_file_path,
                             collection=self.collection,
                             status="failed",
-                            metadata={"error": str(e)},
+                            metadata={
+                                "error": str(e),
+                                **{
+                                    key: metadata_overrides[key]
+                                    for key in ("source_label", "original_filename", "object_uri", "object_key")
+                                    if key in metadata_overrides
+                                },
+                            },
                         )
                     except Exception:
                         logger.warning("Failed to upsert failed document registry entry", exc_info=True)
@@ -709,30 +749,60 @@ class IngestionPipeline:
         Cascades deletion across vector store, BM25, image index, and
         integrity records so that a ``force=True`` re-ingest starts clean.
         """
-        try:
-            self.vector_upserter.vector_store.delete_by_metadata({"doc_hash": file_hash})
-            logger.info("    Cleaned stale vectors")
-        except Exception as e:
-            logger.warning("    Failed to clean stale vectors: %s", e)
+        manager = DocumentManager(
+            self.vector_upserter.vector_store,
+            self.bm25_indexer,
+            self.image_storage,
+            self.integrity_checker,
+            document_registry=self.document_registry,
+            object_store=self.object_store,
+            task_store=self.task_store,
+        )
+        result = manager.delete_document(
+            source_path=file_path,
+            collection=self.collection,
+            source_hash=file_hash,
+            remove_original_object=False,
+            remove_task_records=False,
+        )
+        if result.success:
+            logger.info("    Cleaned stale ingestion state for %s", file_hash[:12])
+        else:
+            logger.warning("    Stale cleanup finished with errors: %s", "; ".join(result.errors))
 
-        try:
-            self.bm25_indexer.remove_document(file_hash, self.collection)
-            logger.info("    Cleaned stale BM25 postings")
-        except Exception as e:
-            logger.warning("    Failed to clean stale BM25 data: %s", e)
-
-        try:
-            self.integrity_checker.remove_record(file_hash)
-            logger.info("    Cleaned stale integrity record")
-        except Exception as e:
-            logger.warning("    Failed to clean stale integrity record: %s", e)
-        document_registry = getattr(self, "document_registry", None)
-        if document_registry is not None:
-            try:
-                document_registry.delete_document(file_hash)
-                logger.info("    Cleaned stale document registry record")
-            except Exception as e:
-                logger.warning("    Failed to clean stale document registry record: %s", e)
+    @staticmethod
+    def _apply_document_metadata_overrides(
+        document: Document,
+        metadata_overrides: Dict[str, Any],
+    ) -> Document:
+        merged_metadata = dict(document.metadata)
+        merged_metadata.update(metadata_overrides)
+        stable_source_path = (
+            metadata_overrides.get("source_path")
+            or metadata_overrides.get("source_label")
+            or metadata_overrides.get("original_filename")
+            or merged_metadata.get("source_path")
+        )
+        if stable_source_path:
+            merged_metadata["source_path"] = str(stable_source_path)
+        if "images" in merged_metadata and isinstance(merged_metadata["images"], list):
+            updated_images = []
+            for image in merged_metadata["images"]:
+                if not isinstance(image, dict):
+                    updated_images.append(image)
+                    continue
+                image_meta = dict(image)
+                if metadata_overrides.get("source_label"):
+                    image_meta.setdefault("source_label", str(metadata_overrides["source_label"]))
+                if metadata_overrides.get("original_filename"):
+                    image_meta.setdefault("original_filename", str(metadata_overrides["original_filename"]))
+                if metadata_overrides.get("object_uri"):
+                    image_meta.setdefault("object_uri", str(metadata_overrides["object_uri"]))
+                if metadata_overrides.get("object_key"):
+                    image_meta.setdefault("object_key", str(metadata_overrides["object_key"]))
+                updated_images.append(image_meta)
+            merged_metadata["images"] = updated_images
+        return Document(id=document.id, text=document.text, metadata=merged_metadata)
 
     def close(self) -> None:
         """Clean up resources."""

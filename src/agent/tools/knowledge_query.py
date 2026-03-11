@@ -11,7 +11,11 @@ from pydantic import BaseModel, Field
 from src.agent.grounding import build_evidence_summary
 from src.agent.tools.base import Tool
 from src.agent.types import ToolContext, ToolResult
-from src.core.response.citation_generator import CitationGenerator
+from src.core.response.citation_generator import (
+    CitationGenerator,
+    resolve_source_display,
+    sanitize_retrieval_text,
+)
 from src.core.trace.trace_collector import TraceCollector
 from src.core.trace.trace_context import TraceContext
 
@@ -21,7 +25,7 @@ logger = logging.getLogger(__name__)
 class KnowledgeQueryArgs(BaseModel):
     query: str = Field(..., description="检索查询文本")
     top_k: int = Field(default=5, ge=1, le=20, description="返回结果数量")
-    collection: str = Field(default="computer_network", description="知识库 collection 名称，默认 computer_network，必须使用英文")
+    collection: Optional[str] = Field(default=None, description="知识库 collection 名称；未提供时使用当前默认 collection")
     content_type: Optional[str] = Field(default=None, description="按内容类型过滤: concept/definition/theorem/example/exercise/formula/summary")
     use_parent: bool = Field(default=False, description="如果匹配的是 child chunk，返回其 parent chunk 以获取更完整的上下文")
 
@@ -38,6 +42,7 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
         conflict_detector: Any = None,
         query_router: Any = None,
         semantic_cache: Any = None,
+        trace_collector: TraceCollector | None = None,
     ) -> None:
         self._settings = settings
         self._hybrid_search = hybrid_search
@@ -50,8 +55,11 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
         self._current_collection: Optional[str] = None
         self._embedding_client: Any = None
         self._init_lock = asyncio.Lock()
-        self._trace_collector = TraceCollector()
+        self._trace_collector = trace_collector or TraceCollector()
         self._citation_generator = CitationGenerator(snippet_max_length=220)
+        if hybrid_search is not None:
+            sparse_retriever = getattr(hybrid_search, "sparse_retriever", None)
+            self._current_collection = getattr(sparse_retriever, "default_collection", None)
 
         retrieval_cfg = None
         if settings and hasattr(settings, 'retrieval'):
@@ -87,15 +95,15 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
         if self._settings is None:
             raise RuntimeError("KnowledgeQueryTool requires settings or a pre-built HybridSearch")
 
-        from src.core.settings import load_settings, resolve_path
+        from src.core.settings import load_settings
         from src.core.query_engine.query_processor import QueryProcessor
         from src.core.query_engine.hybrid_search import create_hybrid_search
         from src.core.query_engine.dense_retriever import create_dense_retriever
         from src.core.query_engine.sparse_retriever import create_sparse_retriever
         from src.core.query_engine.reranker import create_core_reranker
-        from src.ingestion.storage.bm25_indexer import BM25Indexer
         from src.libs.embedding.embedding_factory import EmbeddingFactory
         from src.libs.vector_store.vector_store_factory import VectorStoreFactory
+        from src.storage.runtime import create_sparse_index
 
         settings = load_settings() if not hasattr(self._settings, 'embedding') else self._settings
 
@@ -110,7 +118,7 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
             embedding_client=self._embedding_client,
             vector_store=vector_store,
         )
-        bm25_indexer = BM25Indexer(index_dir=str(resolve_path(f"data/db/bm25/{collection}")))
+        bm25_indexer = create_sparse_index(settings, collection=collection)
         sparse_retriever = create_sparse_retriever(
             settings=settings,
             bm25_indexer=bm25_indexer,
@@ -132,6 +140,12 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
     async def execute(self, context: ToolContext, args: KnowledgeQueryArgs) -> ToolResult:
         query_trace: TraceContext | None = None
         try:
+            effective_collection = (
+                args.collection
+                or str(context.metadata.get("default_collection", "") or "").strip()
+                or self._current_collection
+                or "computer_network"
+            )
             # --- Adaptive routing ---
             routing = None
             if self._query_router is not None:
@@ -149,7 +163,7 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
             # --- Semantic cache lookup ---
             if self._semantic_cache is not None:
                 try:
-                    cached = await self._semantic_cache.get(args.query)
+                    cached = await self._semantic_cache.get(args.query, collection=effective_collection)
                     if cached is not None:
                         cached_metadata = dict(cached.metadata or {})
                         cached_metadata.setdefault("cache_hit", True)
@@ -165,7 +179,7 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                     logger.debug("Semantic cache lookup failed", exc_info=True)
 
             async with self._init_lock:
-                self._ensure_initialized(args.collection)
+                self._ensure_initialized(effective_collection)
 
             if self._trace_enabled():
                 query_trace = TraceContext(trace_type="query")
@@ -173,7 +187,7 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                     {
                         "query": args.query[:200],
                         "top_k": args.top_k,
-                        "collection": args.collection,
+                        "collection": effective_collection,
                         "source": "agent",
                         "parent_agent_trace_id": context.metadata.get("agent_trace_id", ""),
                     }
@@ -217,6 +231,7 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                 )
 
             search_kwargs: dict[str, Any] = {}
+            route_filter = None
             if args.content_type:
                 search_kwargs["filters"] = {"content_type": args.content_type}
             elif routing is not None and routing.preferred_sources:
@@ -238,6 +253,8 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
 
             if query_trace is not None:
                 query_trace.metadata["sub_query_count"] = len(queries)
+                if route_filter:
+                    query_trace.metadata["route_filter"] = route_filter
 
             # P3+P6: run searches via asyncio.to_thread to avoid blocking
             # the event loop, and run sub-queries in parallel.
@@ -270,6 +287,7 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                     "citations": [],
                     "evidence_summary": "",
                     "source_count": 0,
+                    "collection": effective_collection,
                     "query_trace_ids": [query_trace.trace_id] if query_trace is not None else [],
                     "final_response_preferred": True,
                 }
@@ -301,14 +319,14 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
 
             lines: list[str] = [f"检索到 {len(results)} 条相关内容：\n"]
             for i, r in enumerate(results, 1):
-                source = r.metadata.get("source_path", "未知来源")
+                source = resolve_source_display(r.metadata) or "未知来源"
                 title = r.metadata.get("title", "")
                 ct = r.metadata.get("content_type", "")
                 ct_tag = f" [{ct}]" if ct else ""
                 chunk_ref = r.chunk_id[:12]
                 header = f"**[{i}]** {title}{ct_tag} — `{source}` (chunk: {chunk_ref})" if title else f"**[{i}]{ct_tag}** `{source}` (chunk: {chunk_ref})"
                 lines.append(f"{header} (相关度: {r.score:.2f})")
-                lines.append(r.text[:800])
+                lines.append(sanitize_retrieval_text(r.text)[:1600])
                 lines.append("")
 
             result_text = "\n".join(lines)
@@ -322,7 +340,9 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                 "grounding_capable": True,
                 "citations": citations,
                 "evidence_summary": evidence_summary,
+                "evidence_texts": [str(r.text or "")[:4000] for r in results],
                 "source_count": len(citations),
+                "collection": effective_collection,
                 "query_trace_ids": query_trace_ids,
             }
             if query_trace is not None:
@@ -334,9 +354,10 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                         args.query,
                         result_text,
                         {
-                            "collection": args.collection,
+                            "collection": effective_collection,
                             **metadata,
                         },
+                        collection=effective_collection,
                     )
                 except Exception:
                     logger.debug("Semantic cache write failed", exc_info=True)

@@ -91,7 +91,7 @@ services:
       discovery.type: single-node
       DISABLE_SECURITY_PLUGIN: "true"
       DISABLE_INSTALL_DEMO_CONFIG: "true"
-      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+      OPENSEARCH_JAVA_OPTS: "-Xms256m -Xmx256m"
       bootstrap.memory_lock: "true"
     ulimits:
       memlock:
@@ -104,6 +104,11 @@ services:
       - "9200:9200"
     volumes:
       - opensearch_data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9200/_cluster/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
     networks:
       - storage
 

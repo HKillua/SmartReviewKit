@@ -20,6 +20,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+from src.core.response.citation_generator import resolve_source_display
 from src.core.types import RetrievalResult
 from src.libs.reranker.base_reranker import BaseReranker, NoneReranker
 from src.libs.reranker.reranker_factory import RerankerFactory
@@ -312,7 +313,7 @@ class CoreReranker:
                             "chunk_id": r.chunk_id,
                             "score": round(r.score, 4),
                             "text": r.text or "",
-                            "source": r.metadata.get("source_path", r.metadata.get("source", "")),
+                            "source": resolve_source_display(r.metadata),
                         }
                         for r in final_results
                     ],

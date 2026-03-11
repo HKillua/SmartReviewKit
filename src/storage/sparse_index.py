@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -10,6 +11,7 @@ from typing import Any, Dict, List, Optional
 from src.ingestion.storage.bm25_indexer import BM25Indexer
 
 logger = logging.getLogger(__name__)
+_DOC_HASH_PATTERN = re.compile(r"^doc_([0-9a-f]{16,64})(?:_|$)")
 
 try:
     from opensearchpy import OpenSearch
@@ -119,6 +121,15 @@ class OpenSearchSparseIndex(SparseIndex):
         safe = collection.replace("/", "-").replace("_", "-")
         return f"{self._index_prefix}-{safe}-chunks"
 
+    @staticmethod
+    def _extract_doc_hash(chunk_id: str) -> str:
+        match = _DOC_HASH_PATTERN.match(chunk_id or "")
+        if match:
+            return match.group(1)
+        if "_chunk" in chunk_id:
+            return chunk_id.split("_chunk", 1)[0]
+        return chunk_id
+
     def ensure_collection_ready(self, collection: str) -> bool:
         index_name = self._index_name(collection)
         if self._client.indices.exists(index=index_name):
@@ -130,6 +141,7 @@ class OpenSearchSparseIndex(SparseIndex):
                 "properties": {
                     "chunk_id": {"type": "keyword"},
                     "doc_id": {"type": "keyword"},
+                    "doc_hash": {"type": "keyword"},
                     "collection": {"type": "keyword"},
                     "text": {"type": "text"},
                     "doc_length": {"type": "integer"},
@@ -156,7 +168,8 @@ class OpenSearchSparseIndex(SparseIndex):
             for term, freq in stat.get("term_frequencies", {}).items():
                 tokens.extend([term] * int(freq))
             chunk_id = stat["chunk_id"]
-            doc_id = chunk_id.split("_chunk", 1)[0]
+            doc_hash = str(stat.get("doc_hash") or self._extract_doc_hash(chunk_id))
+            doc_id = doc_hash
             actions.append(
                 {
                     "_op_type": "index",
@@ -165,6 +178,7 @@ class OpenSearchSparseIndex(SparseIndex):
                     "_source": {
                         "chunk_id": chunk_id,
                         "doc_id": doc_id,
+                        "doc_hash": doc_hash,
                         "collection": collection,
                         "text": " ".join(tokens),
                         "doc_length": int(stat.get("doc_length", 0)),
@@ -208,9 +222,22 @@ class OpenSearchSparseIndex(SparseIndex):
         index_name = self._index_name(collection)
         if not self._client.indices.exists(index=index_name):
             return False
+        legacy_chunk_prefix = f"doc_{doc_id[:16]}" if doc_id and len(doc_id) > 16 else f"doc_{doc_id}"
         response = self._client.delete_by_query(
             index=index_name,
-            body={"query": {"prefix": {"doc_id": doc_id}}},
+            body={
+                "query": {
+                    "bool": {
+                        "should": [
+                            {"term": {"doc_hash": doc_id}},
+                            {"prefix": {"doc_id": doc_id}},
+                            {"prefix": {"chunk_id": legacy_chunk_prefix}},
+                            {"prefix": {"chunk_id": f"doc_{doc_id}"}} if doc_id and not doc_id.startswith("doc_") else {"prefix": {"chunk_id": doc_id}},
+                        ],
+                        "minimum_should_match": 1,
+                    }
+                }
+            },
             refresh=True,
         )
         return int(response.get("deleted", 0)) > 0

@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from mcp import types
+from src.core.response.citation_generator import resolve_source_display
 
 if TYPE_CHECKING:
     from src.mcp_server.protocol_handler import ProtocolHandler
@@ -264,7 +265,7 @@ class GetDocumentSummaryTool:
         tags = self._extract_tags(metadata)
         
         # Extract source path
-        source_path = metadata.get('source_path', metadata.get('source', None))
+        source_path = resolve_source_display(metadata)
         
         # Collect additional metadata (excluding internal fields)
         additional_metadata = self._filter_metadata(metadata)
@@ -308,9 +309,9 @@ class GetDocumentSummaryTool:
                     return line[2:].strip()
         
         # Priority 3: Filename from source_path
-        source_path = metadata.get('source_path', metadata.get('source'))
-        if source_path:
-            filename = Path(source_path).stem
+        source_label = resolve_source_display(metadata)
+        if source_label and source_label != "unknown":
+            filename = Path(source_label).stem
             # Convert snake_case/kebab-case to Title Case
             title = filename.replace('_', ' ').replace('-', ' ').title()
             return title
@@ -403,7 +404,7 @@ class GetDocumentSummaryTool:
         exclude_fields = {
             'source_ref', 'chunk_index', 'start_offset', 'end_offset',
             '_placeholder', 'text', 'title', 'summary', 'tags',
-            'source_path', 'source'
+            'source_path', 'source', 'source_label', 'original_filename'
         }
         
         return {

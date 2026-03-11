@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -142,6 +143,21 @@ class RetrievalSettings:
     sparse_top_k: int
     fusion_top_k: int
     rrf_k: int
+    dense_weight: float = 1.0
+    sparse_weight: float = 1.0
+    rerank_enabled: bool = False
+    rerank_top_k: int = 5
+    mmr_enabled: bool = False
+    mmr_lambda: float = 0.7
+    query_rewrite_enabled: bool = False
+    hyde_enabled: bool = False
+    multi_query_enabled: bool = False
+    contextual_enrichment: str = "off"
+    embedding_cache_size: int = 4096
+    dedup_enabled: bool = True
+    dedup_threshold: int = 3
+    min_score: float = 0.0
+    post_dedup_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -165,6 +181,8 @@ class ObservabilitySettings:
     trace_enabled: bool
     trace_file: str
     structured_logging: bool
+    trace_sink: str = "file"
+    trace_source: str = "auto"
 
 
 @dataclass(frozen=True)
@@ -232,6 +250,17 @@ class IngestionSettings:
 
 
 @dataclass(frozen=True)
+class IngestionWorkerSettings:
+    enabled: bool = False
+    mode: str = "separate_process"
+    poll_interval_seconds: int = 2
+    lease_seconds: int = 120
+    heartbeat_interval_seconds: int = 30
+    max_attempts: int = 3
+    dev_fallback_sync: bool = True
+
+
+@dataclass(frozen=True)
 class Settings:
     llm: LLMSettings
     embedding: EmbeddingSettings
@@ -247,6 +276,7 @@ class Settings:
     sparse_store: SparseStoreSettings
     opensearch: OpenSearchSettings
     ingestion: Optional[IngestionSettings] = None
+    ingestion_worker: Optional[IngestionWorkerSettings] = None
     vision_llm: Optional[VisionLLMSettings] = None
 
     @classmethod
@@ -295,6 +325,19 @@ class Settings:
                 base_url=vision_llm.get("base_url"),
             )
 
+        ingestion_worker_settings = None
+        if "ingestion_worker" in data:
+            ingestion_worker = _require_mapping(data, "ingestion_worker", "settings")
+            ingestion_worker_settings = IngestionWorkerSettings(
+                enabled=bool(ingestion_worker.get("enabled", False)),
+                mode=str(ingestion_worker.get("mode", "separate_process")),
+                poll_interval_seconds=int(ingestion_worker.get("poll_interval_seconds", 2)),
+                lease_seconds=int(ingestion_worker.get("lease_seconds", 120)),
+                heartbeat_interval_seconds=int(ingestion_worker.get("heartbeat_interval_seconds", 30)),
+                max_attempts=int(ingestion_worker.get("max_attempts", 3)),
+                dev_fallback_sync=bool(ingestion_worker.get("dev_fallback_sync", True)),
+            )
+
         settings = cls(
             llm=LLMSettings(
                 provider=_require_str(llm, "provider", "llm"),
@@ -338,6 +381,21 @@ class Settings:
                 sparse_top_k=_require_int(retrieval, "sparse_top_k", "retrieval"),
                 fusion_top_k=_require_int(retrieval, "fusion_top_k", "retrieval"),
                 rrf_k=_require_int(retrieval, "rrf_k", "retrieval"),
+                dense_weight=float(retrieval.get("dense_weight", 1.0)),
+                sparse_weight=float(retrieval.get("sparse_weight", 1.0)),
+                rerank_enabled=bool(retrieval.get("rerank_enabled", False)),
+                rerank_top_k=int(retrieval.get("rerank_top_k", 5)),
+                mmr_enabled=bool(retrieval.get("mmr_enabled", False)),
+                mmr_lambda=float(retrieval.get("mmr_lambda", 0.7)),
+                query_rewrite_enabled=bool(retrieval.get("query_rewrite_enabled", False)),
+                hyde_enabled=bool(retrieval.get("hyde_enabled", False)),
+                multi_query_enabled=bool(retrieval.get("multi_query_enabled", False)),
+                contextual_enrichment=str(retrieval.get("contextual_enrichment", "off")),
+                embedding_cache_size=int(retrieval.get("embedding_cache_size", 4096)),
+                dedup_enabled=bool(retrieval.get("dedup_enabled", True)),
+                dedup_threshold=int(retrieval.get("dedup_threshold", 3)),
+                min_score=float(retrieval.get("min_score", 0.0)),
+                post_dedup_enabled=bool(retrieval.get("post_dedup_enabled", True)),
             ),
             rerank=RerankSettings(
                 enabled=_require_bool(rerank, "enabled", "rerank"),
@@ -355,6 +413,8 @@ class Settings:
                 trace_enabled=_require_bool(observability, "trace_enabled", "observability"),
                 trace_file=_require_str(observability, "trace_file", "observability"),
                 structured_logging=_require_bool(observability, "structured_logging", "observability"),
+                trace_sink=str(observability.get("trace_sink", "file")),
+                trace_source=str(observability.get("trace_source", "auto")),
             ),
             postgres=PostgresSettings(
                 enabled=bool(postgres_cfg.get("enabled", False)),
@@ -388,6 +448,7 @@ class Settings:
                 password=opensearch_cfg.get("password"),
             ),
             ingestion=ingestion_settings,
+            ingestion_worker=ingestion_worker_settings,
             vision_llm=vision_llm_settings,
         )
 
@@ -420,7 +481,8 @@ def load_settings(path: str | Path | None = None) -> Settings:
         path: Path to settings YAML.  Defaults to
             ``<repo>/config/settings.yaml`` (absolute, CWD-independent).
     """
-    settings_path = Path(path) if path is not None else DEFAULT_SETTINGS_PATH
+    resolved_input = path if path is not None else os.environ.get("MODULAR_RAG_SETTINGS_PATH", DEFAULT_SETTINGS_PATH)
+    settings_path = Path(resolved_input)
     if not settings_path.is_absolute():
         settings_path = resolve_path(settings_path)
     if not settings_path.exists():

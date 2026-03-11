@@ -21,10 +21,12 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from mcp import types
 
+from src.core.response.citation_generator import resolve_source_display
 from src.core.response.response_builder import ResponseBuilder, MCPToolResponse
-from src.core.settings import load_settings, resolve_path, Settings
+from src.core.settings import load_settings, Settings
 from src.core.trace import TraceContext, TraceCollector
 from src.core.types import RetrievalResult
+from src.storage.runtime import create_sparse_index
 
 if TYPE_CHECKING:
     from src.core.query_engine.hybrid_search import HybridSearch
@@ -125,6 +127,7 @@ class QueryKnowledgeHubTool:
         self._reranker = reranker
         self._embedding_client = None
         self._response_builder = response_builder or ResponseBuilder()
+        self._trace_collector = TraceCollector.from_settings(self.settings) if settings is not None else None
         
         # Track initialization state
         self._initialized = False
@@ -135,6 +138,8 @@ class QueryKnowledgeHubTool:
         """Get settings, loading if necessary."""
         if self._settings is None:
             self._settings = load_settings()
+            if self._trace_collector is None:
+                self._trace_collector = TraceCollector.from_settings(self._settings)
         return self._settings
     
     def _ensure_initialized(self, collection: str) -> None:
@@ -171,7 +176,6 @@ class QueryKnowledgeHubTool:
         from src.core.query_engine.dense_retriever import create_dense_retriever
         from src.core.query_engine.sparse_retriever import create_sparse_retriever
         from src.core.query_engine.reranker import create_core_reranker
-        from src.ingestion.storage.bm25_indexer import BM25Indexer
         from src.libs.embedding.embedding_factory import EmbeddingFactory
         from src.libs.vector_store.vector_store_factory import VectorStoreFactory
         
@@ -200,7 +204,7 @@ class QueryKnowledgeHubTool:
         # BM25Indexer just holds the index dir path; the SparseRetriever
         # calls _ensure_index_loaded() on every search, which always
         # reloads from disk — so it picks up dashboard-written data.
-        bm25_indexer = BM25Indexer(index_dir=str(resolve_path(f"data/db/bm25/{collection}")))
+        bm25_indexer = create_sparse_index(self.settings, collection=collection)
         sparse_retriever = create_sparse_retriever(
             settings=self.settings,
             bm25_indexer=bm25_indexer,
@@ -298,7 +302,7 @@ class QueryKnowledgeHubTool:
                     "chunk_id": r.chunk_id,
                     "score": round(r.score, 4),
                     "text": r.text or "",
-                    "source": r.metadata.get("source_path", r.metadata.get("source", "")),
+                    "source": resolve_source_display(r.metadata),
                     "title": r.metadata.get("title", ""),
                 }
                 for r in results
@@ -309,12 +313,12 @@ class QueryKnowledgeHubTool:
                 f"is_empty={response.is_empty}"
             )
             
-            TraceCollector().collect(trace)
+            (self._trace_collector or TraceCollector.from_settings(self.settings)).collect(trace)
             return response
             
         except Exception as e:
             logger.exception(f"query_knowledge_hub failed: {e}")
-            TraceCollector().collect(trace)
+            (self._trace_collector or TraceCollector.from_settings(self.settings)).collect(trace)
             # Return error response
             return self._build_error_response(query, effective_collection, str(e))
     

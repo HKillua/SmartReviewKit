@@ -288,14 +288,17 @@ class TestCrossEncoderRerankerSorting:
         scores = [0.1, 0.9, 0.5]
         
         result = reranker._attach_scores_and_sort(candidates, scores, top_k=3)
-        
+
         assert len(result) == 3
         assert result[0]["id"] == "2"
-        assert result[0]["rerank_score"] == 0.9
+        assert 0.72 > result[0]["rerank_score"] > 0.70
+        assert result[0]["rerank_raw_score"] == 0.9
         assert result[1]["id"] == "3"
-        assert result[1]["rerank_score"] == 0.5
+        assert 0.63 > result[1]["rerank_score"] > 0.62
+        assert result[1]["rerank_raw_score"] == 0.5
         assert result[2]["id"] == "1"
-        assert result[2]["rerank_score"] == 0.1
+        assert 0.53 > result[2]["rerank_score"] > 0.52
+        assert result[2]["rerank_raw_score"] == 0.1
     
     def test_attach_scores_top_k_limit(self, mock_settings):
         """Test top_k limits output size."""
@@ -337,8 +340,30 @@ class TestCrossEncoderRerankerSorting:
         assert "rerank_score" not in candidates[0]
         # Result should have rerank_score
         assert "rerank_score" in result[0]
+        assert "rerank_raw_score" in result[0]
         # Other fields preserved
         assert result[0]["metadata"] == {"key": "value"}
+
+    def test_attach_scores_normalizes_negative_logits(self, mock_settings):
+        """Negative logits should still produce sortable positive scores."""
+        mock_model = MockCrossEncoder()
+        reranker = CrossEncoderReranker(
+            settings=mock_settings,
+            model=mock_model
+        )
+
+        candidates = [
+            {"id": "1", "text": "A"},
+            {"id": "2", "text": "B"},
+        ]
+        scores = [-2.0, -0.1]
+
+        result = reranker._attach_scores_and_sort(candidates, scores, top_k=2)
+
+        assert result[0]["id"] == "2"
+        assert 0.48 > result[0]["rerank_score"] > 0.47
+        assert result[1]["id"] == "1"
+        assert 0.12 > result[1]["rerank_score"] > 0.11
 
 
 class TestCrossEncoderRerankerEndToEnd:

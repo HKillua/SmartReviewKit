@@ -8,7 +8,7 @@ import pytest
 from typing import Dict, Any, List
 
 from src.core.response.citation_generator import Citation, CitationGenerator
-from src.core.response.response_builder import ResponseBuilder, MCPToolResponse
+from src.core.response.response_builder import ResponseBuilder, MCPToolResponse, types
 from src.core.types import RetrievalResult
 
 
@@ -194,6 +194,24 @@ class TestCitationGenerator:
         assert citations[0].page == 5
         assert citations[1].page == 10
         assert citations[2].page is None
+
+    def test_source_label_is_preferred_over_tmp_source_path(self) -> None:
+        """Citations should prefer stable source labels over worker temp files."""
+        generator = CitationGenerator()
+        result = RetrievalResult(
+            chunk_id="test_label_001",
+            score=0.91,
+            text="这本笔记售价 199 元。",
+            metadata={
+                "source_label": "blogger_intro.pdf",
+                "original_filename": "blogger_intro.pdf",
+                "source_path": "/tmp/worker-download-1234.pdf",
+            },
+        )
+
+        citations = generator.generate([result])
+
+        assert citations[0].source == "blogger_intro.pdf"
     
     def test_format_citation_marker(
         self,
@@ -317,8 +335,6 @@ class TestResponseBuilder:
         sample_retrieval_results: List[RetrievalResult],
     ) -> None:
         """Test MCPToolResponse.to_mcp_content() for MCP protocol."""
-        from mcp import types
-        
         response = response_builder.build(
             results=sample_retrieval_results,
             query="Azure",

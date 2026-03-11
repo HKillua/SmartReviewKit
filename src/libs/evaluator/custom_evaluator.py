@@ -131,6 +131,9 @@ class CustomEvaluator(BaseEvaluator):
             if hasattr(item, "id"):
                 ids.append(str(getattr(item, "id")))
                 continue
+            if hasattr(item, "chunk_id"):
+                ids.append(str(getattr(item, "chunk_id")))
+                continue
 
             raise ValueError(
                 f"Unable to extract id from {label}[{index}] of type "

@@ -180,6 +180,7 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
     memory_cfg = load_memory_config(settings)
     collection = agent_cfg.default_collection
     ingestion_backends = create_ingestion_backends(core_settings, collection=collection)
+    shared_trace_collector = TraceCollector.from_settings(core_settings)
 
     # --- LLM ---
     llm = create_llm_service(settings)
@@ -212,6 +213,7 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         preference_write_min_confidence=memory_cfg.preference_write_min_confidence,
         preference_conflict_guard=memory_cfg.preference_conflict_guard,
         trace_enabled=bool(settings.get("observability", {}).get("trace_enabled", False)),
+        trace_collector=shared_trace_collector,
     )
 
     # --- Review schedule hook ---
@@ -279,6 +281,7 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         query_enhancer=query_enhancer,
         query_router=query_router,
         semantic_cache=semantic_cache,
+        trace_collector=shared_trace_collector,
     ))
     tool_registry.register(DocumentIngestTool(
         settings=core_settings,
@@ -293,6 +296,7 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         error_memory=error_mem,
         knowledge_map=kmap_mem,
         trace_enabled=bool(settings.get("observability", {}).get("trace_enabled", False)),
+        trace_collector=shared_trace_collector,
     ))
     tool_registry.register(QuizGeneratorTool(
         hybrid_search=hybrid_search,
@@ -307,6 +311,7 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         knowledge_map=kmap_mem,
         hybrid_search=hybrid_search,
         trace_enabled=bool(settings.get("observability", {}).get("trace_enabled", False)),
+        trace_collector=shared_trace_collector,
     ))
 
     # --- Skills ---
@@ -363,7 +368,7 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         context_filter=context_filter,
         review_hook=review_hook,
         trace_enabled=bool(settings.get("observability", {}).get("trace_enabled", False)),
-        trace_collector=TraceCollector(),
+        trace_collector=shared_trace_collector,
     )
 
     chat_handler = ChatHandler(agent)
@@ -388,6 +393,7 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         server_cfg.upload_dir, server_cfg.max_upload_size_mb,
         feedback_store=feedback_store,
         object_store=ingestion_backends.object_store,
+        task_store=ingestion_backends.task_store,
     )
     app.include_router(router)
 

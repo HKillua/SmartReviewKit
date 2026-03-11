@@ -7,6 +7,7 @@ and API-based endpoints.
 
 from __future__ import annotations
 
+import math
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -263,7 +264,17 @@ class CrossEncoderReranker(BaseReranker):
         for candidate, score in zip(candidates, scores):
             # Create a copy to avoid modifying original
             candidate_copy = candidate.copy()
-            candidate_copy["rerank_score"] = float(score)
+            raw_score = float(score)
+            # Cross-encoder models usually return logits, which can be negative.
+            # Normalize to (0, 1) so downstream min_score filtering remains meaningful.
+            if raw_score >= 20:
+                normalized_score = 1.0
+            elif raw_score <= -20:
+                normalized_score = 0.0
+            else:
+                normalized_score = 1.0 / (1.0 + math.exp(-raw_score))
+            candidate_copy["rerank_score"] = float(normalized_score)
+            candidate_copy["rerank_raw_score"] = raw_score
             scored_candidates.append(candidate_copy)
         
         # Sort by score (descending) and take top_k

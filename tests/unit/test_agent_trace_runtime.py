@@ -171,6 +171,38 @@ class _DummyKnowledgeTool(_TraceAwareTool):
     pass
 
 
+class _DocumentIngestTool:
+    @property
+    def name(self) -> str:
+        return "document_ingest"
+
+    @property
+    def description(self) -> str:
+        return "fake document ingest tool"
+
+    def get_args_schema(self):
+        class _Args(BaseModel):
+            file_path: str = Field(default="")
+            collection: str = Field(default="computer_network")
+
+        return _Args
+
+    async def execute(self, context, args):
+        from src.agent.types import ToolResult
+
+        return ToolResult(success=True, result_for_llm="queued")
+
+    def get_schema(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.get_args_schema().model_json_schema(),
+            },
+        }
+
+
 class _KnowledgePlanner:
     def plan(self, message, matched_skill=None):
         from src.agent.planner import ControlMode, PlannerDecision, TaskIntent
@@ -258,6 +290,27 @@ class _ReviewPassthroughTool:
                 "evidence_summary": "[1] `dns.pdf`: DNS 解析包含递归查询。",
             },
         )
+
+    def get_schema(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.get_args_schema().model_json_schema(),
+            },
+        }
+
+
+class _CaptureVisibleToolsLlm:
+    def __init__(self) -> None:
+        self.seen_tools: list[list[str]] = []
+
+    async def send_request(self, request):
+        self.seen_tools.append(
+            [tool.get("function", {}).get("name") for tool in request.tools or []]
+        )
+        return LlmResponse(content="直接回答。")
 
     def get_schema(self) -> dict[str, Any]:
         return {
@@ -520,6 +573,82 @@ async def test_knowledge_query_returns_query_trace_id_and_parent_link(tmp_path: 
     assert trace["trace_type"] == "query"
     assert trace["metadata"]["source"] == "agent"
     assert trace["metadata"]["parent_agent_trace_id"] == "agent-trace-xyz"
+
+
+@pytest.mark.asyncio
+async def test_knowledge_query_uses_default_collection_from_tool_context(tmp_path: Path) -> None:
+    from src.agent.tools.knowledge_query import KnowledgeQueryArgs, KnowledgeQueryTool
+    from src.agent.types import ToolContext
+
+    class _FakeSparseRetriever:
+        default_collection = "api_e2e_test"
+
+    class _FakeHybridSearch:
+        def __init__(self) -> None:
+            self.sparse_retriever = _FakeSparseRetriever()
+            self.seen_queries: list[dict[str, Any]] = []
+
+        def search(self, *, query, top_k, trace=None, **kwargs):
+            self.seen_queries.append({"query": query, "kwargs": kwargs})
+            return [
+                RetrievalResult(
+                    chunk_id="chunk_default_collection",
+                    score=0.9,
+                    text="价格199元",
+                    metadata={"source_path": "blogger_intro.pdf", "title": "商品介绍"},
+                )
+            ]
+
+    hybrid_search = _FakeHybridSearch()
+    tool = KnowledgeQueryTool(
+        settings={"observability": {"trace_enabled": False}},
+        hybrid_search=hybrid_search,
+    )
+
+    result = await tool.execute(
+        ToolContext(
+            user_id="u1",
+            conversation_id="conv_default_collection",
+            metadata={"default_collection": "api_e2e_test"},
+        ),
+        KnowledgeQueryArgs(query="价格是多少"),
+    )
+
+    assert result.success is True
+    assert result.metadata["collection"] == "api_e2e_test"
+    assert hybrid_search.seen_queries
+
+
+@pytest.mark.asyncio
+async def test_normal_chat_hides_document_ingest_tool_schema(tmp_path: Path) -> None:
+    from src.agent.agent import Agent
+    from src.agent.config import AgentConfig
+    from src.agent.conversation import ConversationStore
+    from src.agent.tools.base import ToolRegistry
+
+    conversation = Conversation(id="conv_hide_ingest", user_id="u1", messages=[])
+    store = AsyncMock(spec=ConversationStore)
+    store.get.return_value = conversation
+    store.create.return_value = conversation
+    store.update.return_value = None
+
+    registry = ToolRegistry()
+    registry.register(_DummyKnowledgeTool())
+    registry.register(_DocumentIngestTool())
+
+    llm = _CaptureVisibleToolsLlm()
+    agent = Agent(
+        llm_service=llm,
+        tool_registry=registry,
+        conversation_store=store,
+        config=AgentConfig(stream_responses=False, max_tool_iterations=1),
+    )
+
+    events = [event async for event in agent.chat("解释一下 TCP 三次握手", "u1", "conv_hide_ingest")]
+    assert any(event.type.value == "done" for event in events)
+    assert llm.seen_tools
+    assert "document_ingest" not in llm.seen_tools[0]
+    assert "knowledge_query" in llm.seen_tools[0]
 
 
 @pytest.mark.asyncio

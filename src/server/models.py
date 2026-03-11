@@ -28,6 +28,8 @@ class UploadResponse(BaseModel):
     doc_id: str = ""
     chunk_count: int = 0
     image_count: int = 0
+    task_id: str = ""
+    status: str = ""
     error: Optional[str] = None
 
 

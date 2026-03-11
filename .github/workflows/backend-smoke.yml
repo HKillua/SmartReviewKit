@@ -1,0 +1,58 @@
+name: Backend Smoke
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  backend-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Start shared storage stack
+        run: docker compose -f docker-compose.storage.yml up -d
+
+      - name: Run storage smoke
+        run: python scripts/smoke_test_storage_stack.py --settings config/settings.storage_stack.yaml
+
+      - name: Run targeted regression tests
+        run: |
+          pytest -q \
+            tests/unit/test_grounding.py \
+            tests/unit/test_response_builder.py \
+            tests/unit/test_hybrid_search_filters.py \
+            tests/unit/test_ingestion_worker_async.py \
+            tests/unit/test_trace_postgres_adapter.py \
+            tests/unit/test_migration_compare.py
+
+      - name: Run backend API smoke
+        run: python scripts/smoke_test_backend_api.py --settings config/settings.storage_stack.yaml
+
+      - name: Run multi-instance validation
+        run: python scripts/validate_multi_instance.py --settings config/settings.storage_stack.yaml
+
+      - name: Run short backend soak
+        run: python scripts/soak_test_backend.py --settings config/settings.storage_stack.yaml --rounds 2
+
+      - name: Dump storage stack logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.storage.yml logs --tail=300
+
+      - name: Stop shared storage stack
+        if: always()
+        run: docker compose -f docker-compose.storage.yml down -v

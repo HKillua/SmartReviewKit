@@ -58,7 +58,7 @@ vector_store:
     user: ""
     password: ""
     db_name: ""
-    dim: 768
+    dim: 2048
 
 # =============================================================================
 # Production Shared Storage Configuration
@@ -124,8 +124,8 @@ retrieval:
 # =============================================================================
 rerank:
   enabled: true
-  provider: "llm"  # Options: none, cross_encoder, llm
-  model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+  provider: "cross_encoder"  # Options: none, cross_encoder, llm
+  model: "BAAI/bge-reranker-base"
   top_k: 5
 
 # =============================================================================
@@ -147,6 +147,8 @@ observability:
   trace_enabled: true
   trace_file: "./logs/traces.jsonl"
   structured_logging: true
+  trace_sink: "file"           # file / postgres / composite
+  trace_source: "auto"         # auto / file / postgres
 
 # =============================================================================
 # Ingestion Configuration
@@ -169,6 +171,15 @@ ingestion:
 
   metadata_enricher:
     use_llm: false
+
+ingestion_worker:
+  enabled: false
+  mode: "separate_process"
+  poll_interval_seconds: 2
+  lease_seconds: 120
+  heartbeat_interval_seconds: 30
+  max_attempts: 3
+  dev_fallback_sync: true
 
 # =============================================================================
 # Agent Configuration

@@ -25,6 +25,7 @@ _upload_dir = "data/uploads"
 _max_upload_mb = 50
 _feedback_store = None
 _object_store = None
+_task_store = None
 
 
 def configure_routes(
@@ -34,14 +35,16 @@ def configure_routes(
     max_upload_mb: int = 50,
     feedback_store: Any = None,
     object_store: Any = None,
+    task_store: Any = None,
 ) -> None:
-    global _chat_handler, _agent, _upload_dir, _max_upload_mb, _feedback_store, _object_store
+    global _chat_handler, _agent, _upload_dir, _max_upload_mb, _feedback_store, _object_store, _task_store
     _chat_handler = chat_handler
     _agent = agent
     _upload_dir = upload_dir
     _max_upload_mb = max_upload_mb
     _feedback_store = feedback_store
     _object_store = object_store
+    _task_store = task_store
 
 
 @router.post("/api/chat")
@@ -150,8 +153,27 @@ async def upload_file(file: UploadFile = File(...), user_id: str = "default_user
             doc_id=result.metadata.get("doc_id", ""),
             chunk_count=result.metadata.get("chunk_count", 0),
             image_count=result.metadata.get("image_count", 0),
+            task_id=result.metadata.get("task_id", ""),
+            status=result.metadata.get("status", ""),
         )
     return UploadResponse(success=False, filename=file.filename, error=result.error)
+
+
+@router.get("/api/ingestion/tasks/{task_id}")
+async def get_ingestion_task(task_id: str):
+    if _task_store is None:
+        raise HTTPException(status_code=503, detail="Ingestion task store not configured")
+    task = _task_store.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
+
+
+@router.get("/api/ingestion/tasks")
+async def list_ingestion_tasks(user_id: str = "default_user", status: str = "", limit: int = 20):
+    if _task_store is None:
+        raise HTTPException(status_code=503, detail="Ingestion task store not configured")
+    return _task_store.list_tasks(user_id=user_id, status=status or None, limit=limit)
 
 
 @router.post("/api/feedback")

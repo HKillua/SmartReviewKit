@@ -1,5 +1,6 @@
 """Unit tests for CustomEvaluator and EvaluatorFactory."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -48,6 +49,14 @@ class TestCustomEvaluator:
     def test_unsupported_metric_raises(self) -> None:
         with pytest.raises(ValueError, match="Unsupported custom metrics"):
             CustomEvaluator(metrics=["faithfulness"])  # not supported in custom evaluator
+
+    def test_chunk_id_attribute_is_accepted(self) -> None:
+        evaluator = CustomEvaluator(metrics=["hit_rate", "mrr"])
+        retrieved = [SimpleNamespace(chunk_id="c1"), SimpleNamespace(chunk_id="c2")]
+        metrics = evaluator.evaluate("query", retrieved, ground_truth=["c2"])
+
+        assert metrics["hit_rate"] == 1.0
+        assert metrics["mrr"] == 0.5
 
 
 class TestEvaluatorFactory:

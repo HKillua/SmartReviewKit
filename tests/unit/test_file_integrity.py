@@ -178,6 +178,29 @@ class TestSQLiteIntegrityChecker:
             assert count == 1
         finally:
             conn.close()
+
+    def test_should_skip_is_collection_aware(self, checker, temp_file):
+        """The same file hash can be ingested into multiple collections."""
+        file_hash = checker.compute_sha256(temp_file)
+
+        checker.mark_success(file_hash, temp_file, collection="collection_a")
+
+        assert checker.should_skip(file_hash, collection="collection_a") is True
+        assert checker.should_skip(file_hash, collection="collection_b") is False
+
+        checker.mark_success(file_hash, temp_file, collection="collection_b")
+        assert checker.should_skip(file_hash, collection="collection_b") is True
+
+        conn = sqlite3.connect(checker.db_path)
+        try:
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM ingestion_history WHERE file_hash = ?",
+                (file_hash,),
+            )
+            count = cursor.fetchone()[0]
+            assert count == 2
+        finally:
+            conn.close()
     
     def test_mark_failed_does_not_skip(self, checker, temp_file):
         """Test that marking as failed does not cause skip."""

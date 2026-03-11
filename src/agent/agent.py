@@ -87,6 +87,14 @@ def _restrict_tool_schemas(tool_schemas: list[dict], tool_name: str) -> list[dic
     return restricted or tool_schemas
 
 
+def _exclude_tool_schema(tool_schemas: list[dict], tool_name: str) -> list[dict]:
+    return [
+        schema
+        for schema in tool_schemas
+        if schema.get("function", {}).get("name") != tool_name
+    ]
+
+
 def _build_planner_context(decision: PlannerDecision | None) -> str:
     if decision is None or decision.control_mode == ControlMode.PASS_THROUGH:
         return ""
@@ -348,7 +356,11 @@ class Agent:
                 ),
                 "violation_count": 0,
                 "force_retry_count": 0,
+                "knowledge_retry_count": 0,
             }
+
+            if planner_decision is None or planner_decision.task_intent != TaskIntent.DOCUMENT_INGEST:
+                tool_schemas = _exclude_tool_schema(tool_schemas, "document_ingest")
 
             if agent_trace is not None:
                 agent_trace.record_stage(
@@ -421,7 +433,10 @@ class Agent:
                 user_id=user_id,
                 conversation_id=conversation.id,
                 request_id=request_id,
-                metadata=tool_metadata,
+                metadata={
+                    **tool_metadata,
+                    "default_collection": self.config.default_collection,
+                },
                 recent_messages=recent_msgs,
             )
 
@@ -532,6 +547,13 @@ class Agent:
             iteration_started = time.monotonic()
             iteration_prompt = system_prompt
             available_tool_schemas = tool_schemas
+            knowledge_retry_active = (
+                planner_decision is not None
+                and planner_decision.task_intent == TaskIntent.KNOWLEDGE_QUERY
+                and evidence_bundle is None
+                and planner_runtime is not None
+                and int(planner_runtime.get("knowledge_retry_count", 0)) > 0
+            )
             effective_control_mode = (
                 planner_runtime.get("final_control_mode")
                 if planner_runtime is not None
@@ -557,6 +579,17 @@ class Agent:
                         f"这一次必须先调用 `{planner_decision.selected_tool}`，然后再继续回答。"
                     )
                 iteration_prompt = system_prompt + f"\n\n## [Planner Enforcement]\n{reminder}"
+            elif knowledge_retry_active:
+                available_tool_schemas = _restrict_tool_schemas(
+                    tool_schemas,
+                    TaskIntent.KNOWLEDGE_QUERY.value,
+                )
+                retry_prompt = (
+                    "这是明确的课程知识库问答。"
+                    "你上一次没有先调用 `knowledge_query`。"
+                    "这一次请先调用 `knowledge_query` 获取课程证据，再回答用户。"
+                )
+                iteration_prompt = system_prompt + f"\n\n## [Knowledge Query Retry]\n{retry_prompt}"
             elif evidence_bundle is not None:
                 iteration_prompt = (
                     system_prompt
@@ -661,6 +694,48 @@ class Agent:
                     )
                 yield StreamEvent(type=StreamEventType.ERROR, content=response.error)
                 return
+
+            if (
+                not response.tool_calls
+                and planner_decision is not None
+                and planner_decision.task_intent == TaskIntent.KNOWLEDGE_QUERY
+                and evidence_bundle is None
+                and planner_runtime is not None
+                and int(planner_runtime.get("knowledge_retry_count", 0)) >= 1
+                and not bool(planner_runtime.get("manual_knowledge_query_used", False))
+            ):
+                user_query = next(
+                    (
+                        msg.content
+                        for msg in reversed(conversation.messages)
+                        if msg.role == "user" and msg.content
+                    ),
+                    "",
+                )
+                if user_query:
+                    planner_runtime["manual_knowledge_query_used"] = True
+                    if trace is not None:
+                        trace.record_stage(
+                            "knowledge_query_fallback",
+                            {
+                                "iteration": iteration + 1,
+                                "action": "manual_tool_dispatch",
+                            },
+                        )
+                    response = response.model_copy(
+                        update={
+                            "tool_calls": [
+                                ToolCallData(
+                                    id=f"manual_kq_{iteration + 1}",
+                                    name=TaskIntent.KNOWLEDGE_QUERY.value,
+                                    arguments={
+                                        "query": user_query,
+                                        "top_k": 5,
+                                    },
+                                )
+                            ]
+                        }
+                    )
 
             if response.tool_calls:
                 conversation.messages.append(
@@ -858,6 +933,24 @@ class Agent:
                             "iteration": iteration + 1,
                             "selected_tool": planner_decision.selected_tool,
                             "action": "downgrade_to_advisory",
+                        },
+                    )
+                continue
+
+            if (
+                planner_decision is not None
+                and planner_decision.task_intent == TaskIntent.KNOWLEDGE_QUERY
+                and evidence_bundle is None
+                and planner_runtime is not None
+                and int(planner_runtime.get("knowledge_retry_count", 0)) == 0
+            ):
+                planner_runtime["knowledge_retry_count"] = 1
+                if trace is not None:
+                    trace.record_stage(
+                        "knowledge_query_retry",
+                        {
+                            "iteration": iteration + 1,
+                            "action": "retry_with_knowledge_query_priority",
                         },
                     )
                 continue

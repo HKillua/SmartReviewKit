@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from pathlib import Path
 from typing import Any
@@ -68,6 +69,26 @@ class DocumentIngestTool(Tool[DocumentIngestArgs]):
                 return True
         return False
 
+    def _compute_file_hash(self, file_path: Path) -> str:
+        sha256_hash = hashlib.sha256()
+        with file_path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(65536), b""):
+                sha256_hash.update(chunk)
+        return sha256_hash.hexdigest()
+
+    def _worker_cfg(self) -> Any:
+        return getattr(self._settings, "ingestion_worker", None)
+
+    def _worker_enabled(self) -> bool:
+        cfg = self._worker_cfg()
+        return bool(cfg and getattr(cfg, "enabled", False) and self._task_store is not None)
+
+    def _dev_fallback_sync(self) -> bool:
+        cfg = self._worker_cfg()
+        if cfg is None:
+            return True
+        return bool(getattr(cfg, "dev_fallback_sync", True))
+
     async def execute(self, context: ToolContext, args: DocumentIngestArgs) -> ToolResult:
         path = Path(args.file_path)
         if not path.exists():
@@ -84,13 +105,73 @@ class DocumentIngestTool(Tool[DocumentIngestArgs]):
             return ToolResult(success=False, error=f"不支持的文件格式: {ext}，仅支持 .pdf 和 .pptx")
 
         uploaded_object_key = str(context.metadata.get("uploaded_object_key", "") or "")
+        file_hash = self._compute_file_hash(path)
+        object_uri = self._object_store.uri_for(uploaded_object_key) if uploaded_object_key and self._object_store else ""
+        payload = {
+            "collection": args.collection,
+            "source_type": "auto",
+            "original_filename": path.name,
+            "source_label": path.name,
+            "user_id": context.user_id,
+            "object_uri": object_uri,
+            "object_key": uploaded_object_key,
+            "local_file_path": str(path),
+        }
+
+        if self._worker_enabled():
+            try:
+                task_id = self._task_store.create_task(
+                    file_path=str(path),
+                    collection=args.collection,
+                    object_uri=object_uri,
+                    user_id=context.user_id,
+                    file_hash=file_hash,
+                    payload=payload,
+                    max_attempts=max(1, int(getattr(self._worker_cfg(), "max_attempts", 3))),
+                )
+                if self._document_registry is not None:
+                    self._document_registry.upsert_document(
+                        file_hash=file_hash,
+                        file_path=str(path),
+                        collection=args.collection,
+                        status="queued",
+                        object_uri=object_uri,
+                        metadata={
+                            "task_id": task_id,
+                            "uploaded_by": context.user_id,
+                            "original_filename": path.name,
+                            "object_key": uploaded_object_key,
+                        },
+                    )
+                return ToolResult(
+                    success=True,
+                    result_for_llm=(
+                        f"文件 '{path.name}' 已加入入库队列。\n"
+                        f"- Task ID: {task_id}\n"
+                        f"- 状态: queued"
+                    ),
+                    metadata={
+                        "task_id": task_id,
+                        "status": "queued",
+                        "doc_id": file_hash,
+                        "object_uri": object_uri,
+                    },
+                )
+            except Exception:
+                logger.exception("Failed to enqueue ingestion task")
+                if not self._dev_fallback_sync():
+                    return ToolResult(success=False, error="入库任务创建失败")
+
         task_id = ""
         if self._task_store is not None:
             try:
                 task_id = self._task_store.create_task(
                     file_path=str(path),
                     collection=args.collection,
-                    object_uri=self._object_store.uri_for(uploaded_object_key) if uploaded_object_key and self._object_store else "",
+                    object_uri=object_uri,
+                    user_id=context.user_id,
+                    file_hash=file_hash,
+                    payload=payload,
                 )
                 self._task_store.update_status(task_id, "running")
             except Exception:
@@ -99,7 +180,18 @@ class DocumentIngestTool(Tool[DocumentIngestArgs]):
 
         try:
             pipeline = self._get_pipeline(args.collection)
-            result = await asyncio.to_thread(pipeline.run, str(path))
+            result = await asyncio.to_thread(
+                pipeline.run,
+                str(path),
+                metadata_overrides={
+                    "source_path": str(path),
+                    "source_label": path.name,
+                    "original_filename": path.name,
+                    "object_uri": object_uri,
+                    "object_key": uploaded_object_key,
+                },
+                record_file_path=str(path),
+            )
 
             if result.success:
                 if self._semantic_cache is not None:
@@ -110,15 +202,17 @@ class DocumentIngestTool(Tool[DocumentIngestArgs]):
                 if self._document_registry is not None and result.doc_id:
                     try:
                         self._document_registry.upsert_document(
-                            file_hash=result.doc_id,
+                            file_hash=result.doc_id or file_hash,
                             file_path=str(path),
                             collection=args.collection,
                             status="ready",
-                            object_uri=self._object_store.uri_for(uploaded_object_key) if uploaded_object_key and self._object_store else "",
+                            object_uri=object_uri,
                             metadata={
                                 "chunk_count": result.chunk_count,
                                 "image_count": result.image_count,
                                 "task_id": task_id,
+                                "uploaded_by": context.user_id,
+                                "object_key": uploaded_object_key,
                             },
                         )
                     except Exception:
@@ -142,7 +236,8 @@ class DocumentIngestTool(Tool[DocumentIngestArgs]):
                         "chunk_count": result.chunk_count,
                         "image_count": result.image_count,
                         "task_id": task_id,
-                        "object_uri": self._object_store.uri_for(uploaded_object_key) if uploaded_object_key and self._object_store else "",
+                        "status": "succeeded",
+                        "object_uri": object_uri,
                     },
                 )
             else:

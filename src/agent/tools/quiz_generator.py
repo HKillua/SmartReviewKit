@@ -13,7 +13,7 @@ from src.agent.grounding import build_evidence_summary
 from src.agent.tools.base import Tool
 from src.agent.types import ToolContext, ToolResult
 from src.agent.utils.sanitizer import sanitize_user_input
-from src.core.response.citation_generator import CitationGenerator
+from src.core.response.citation_generator import CitationGenerator, sanitize_retrieval_text
 
 logger = logging.getLogger(__name__)
 
@@ -207,7 +207,7 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
         questions: list[dict] = []
         for r in results:
             q: dict = {
-                "question": r.text[:800],
+                "question": sanitize_retrieval_text(r.text)[:800],
                 "answer": r.metadata.get("answer", ""),
                 "explanation": r.metadata.get("explanation", ""),
                 "concepts": r.metadata.get("tags", []),
@@ -219,7 +219,10 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
         return "以下题目来自课程题库：\n\n" + _format_questions(questions, question_type)
 
     async def _generate_from_context(self, results: list, args: "QuizGeneratorArgs", weak_hint: str) -> ToolResult:
-        knowledge_text = "\n\n".join(f"[{i}] {r.text[:500]}" for i, r in enumerate(results, 1))
+        knowledge_text = "\n\n".join(
+            f"[{i}] {sanitize_retrieval_text(r.text)[:500]}"
+            for i, r in enumerate(results, 1)
+        )
         prompt = QUIZ_PROMPT_TEMPLATE.format(
             count=args.count,
             question_type=sanitize_user_input(args.question_type, max_length=50),

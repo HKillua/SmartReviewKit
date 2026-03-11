@@ -60,11 +60,20 @@ class DataService:
         )
         bm25 = create_sparse_index(settings, collection=target_collection)
         images = create_image_storage(settings, target_collection)
-        integrity = create_ingestion_backends(settings, target_collection).integrity_checker
+        ingestion_backends = create_ingestion_backends(settings, target_collection)
+        integrity = ingestion_backends.integrity_checker
 
         self._chroma = chroma
         self._images = images
-        self._manager = DocumentManager(chroma, bm25, images, integrity)
+        self._manager = DocumentManager(
+            chroma,
+            bm25,
+            images,
+            integrity,
+            document_registry=ingestion_backends.document_registry,
+            object_store=ingestion_backends.object_store,
+            task_store=ingestion_backends.task_store,
+        )
         self._current_collection = target_collection
 
     # ------------------------------------------------------------------

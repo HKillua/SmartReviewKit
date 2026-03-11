@@ -12,7 +12,25 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
-from mcp import types
+try:
+    from mcp import types
+except ModuleNotFoundError:  # pragma: no cover - optional dependency for MCP runtime
+    @dataclass
+    class _TextContent:
+        type: str
+        text: str
+
+    @dataclass
+    class _ImageContent:
+        type: str
+        data: str = ""
+        mimeType: str = ""
+
+    class _TypesFallback:
+        TextContent = _TextContent
+        ImageContent = _ImageContent
+
+    types = _TypesFallback()
 
 from src.core.response.citation_generator import Citation, CitationGenerator
 from src.core.types import RetrievalResult

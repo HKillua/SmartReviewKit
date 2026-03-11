@@ -52,6 +52,9 @@ class DeleteResult:
     bm25_removed: bool = False
     images_deleted: int = 0
     integrity_removed: bool = False
+    registry_removed: bool = False
+    object_removed: bool = False
+    tasks_removed: int = 0
     errors: List[str] = field(default_factory=list)
 
 
@@ -85,11 +88,18 @@ class DocumentManager:
         bm25_indexer: Any,
         image_storage: Any,
         file_integrity: Any,
+        *,
+        document_registry: Any = None,
+        object_store: Any = None,
+        task_store: Any = None,
     ) -> None:
         self.chroma = chroma_store
         self.bm25 = bm25_indexer
         self.images = image_storage
         self.integrity = file_integrity
+        self.document_registry = document_registry
+        self.object_store = object_store
+        self.task_store = task_store
 
     # ------------------------------------------------------------------
     # list_documents
@@ -110,6 +120,22 @@ class DocumentManager:
             List of ``DocumentInfo`` objects.
         """
         records = self.integrity.list_processed(collection)
+        if not records and self.document_registry is not None:
+            try:
+                registry_docs = self.document_registry.list_documents(collection)
+                records = [
+                    {
+                        "file_hash": doc["file_hash"],
+                        "file_path": doc["file_path"],
+                        "collection": doc.get("collection"),
+                        "processed_at": "",
+                        "updated_at": doc.get("metadata", {}).get("updated_at", ""),
+                    }
+                    for doc in registry_docs
+                    if doc.get("status") in {"ready", "queued", "running", "failed"}
+                ]
+            except Exception:
+                logger.debug("Failed to read document registry during list_documents", exc_info=True)
 
         docs: List[DocumentInfo] = []
         for rec in records:
@@ -191,6 +217,9 @@ class DocumentManager:
         source_path: str,
         collection: str = "default",
         source_hash: Optional[str] = None,
+        *,
+        remove_original_object: bool = True,
+        remove_task_records: bool = True,
     ) -> DeleteResult:
         """Delete a document from all storage backends.
 
@@ -257,15 +286,65 @@ class DocumentManager:
         # 4. FileIntegrity – remove the ingestion record
         try:
             result.integrity_removed = self.integrity.remove_record(
-                source_hash
+                source_hash,
+                collection,
             )
         except Exception as e:
             result.errors.append(f"FileIntegrity remove failed: {e}")
+
+        object_uri = ""
+        if self.document_registry is not None:
+            try:
+                registry_doc = self.document_registry.get_document(source_hash, collection)
+                object_uri = (registry_doc or {}).get("object_uri", "") or ""
+                result.registry_removed = self.document_registry.delete_document(source_hash, collection)
+            except Exception as e:
+                result.errors.append(f"Document registry delete failed: {e}")
+        if not object_uri and self.task_store is not None:
+            try:
+                tasks = self.task_store.list_tasks(file_hash=source_hash, collection=collection, limit=10)
+                object_uri = next((task.get("object_uri", "") or "" for task in tasks if task.get("object_uri")), "")
+            except Exception:
+                logger.debug("Failed to read task object URI during delete", exc_info=True)
+
+        if remove_original_object and self.object_store is not None:
+            object_key = ""
+            if object_uri:
+                object_key = self.object_store.key_from_uri(object_uri) or ""
+            if object_key:
+                try:
+                    result.object_removed = self.object_store.delete_object(object_key)
+                except Exception as e:
+                    result.errors.append(f"Object store delete failed: {e}")
+
+        if remove_task_records and self.task_store is not None:
+            try:
+                result.tasks_removed = int(self.task_store.delete_tasks_by_file(source_hash, collection))
+            except Exception as e:
+                result.errors.append(f"Task store delete failed: {e}")
 
         if result.errors:
             result.success = False
 
         return result
+
+    def rollback_document(
+        self,
+        *,
+        source_hash: str,
+        source_path: str,
+        collection: str,
+        purge_original_object: bool = False,
+        remove_task_records: bool = False,
+    ) -> DeleteResult:
+        """Rollback partially written ingestion state for a document."""
+        return self.delete_document(
+            source_path=source_path,
+            collection=collection,
+            source_hash=source_hash,
+            remove_original_object=purge_original_object,
+            remove_task_records=remove_task_records,
+        )
 
     # ------------------------------------------------------------------
     # get_collection_stats
@@ -341,4 +420,11 @@ class DocumentManager:
                     return rec["file_hash"]
         except Exception:
             pass
+        if self.document_registry is not None:
+            try:
+                for rec in self.document_registry.list_documents():
+                    if rec["file_path"] == source_path:
+                        return rec["file_hash"]
+            except Exception:
+                pass
         return None

@@ -12,7 +12,7 @@ from src.agent.grounding import build_evidence_summary
 from src.agent.tools.base import Tool
 from src.agent.types import ToolContext, ToolResult
 from src.agent.utils.sanitizer import sanitize_user_input
-from src.core.response.citation_generator import CitationGenerator
+from src.core.response.citation_generator import CitationGenerator, sanitize_retrieval_text
 from src.core.trace.trace_collector import TraceCollector
 from src.core.trace.trace_context import TraceContext
 
@@ -148,7 +148,7 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
         evidence_summary = build_evidence_summary(citations)
 
         knowledge_text = "\n\n".join(
-            f"[{i}] {r.text[:600]}" for i, r in enumerate(results, 1)
+            f"[{i}] {sanitize_retrieval_text(r.text)[:600]}" for i, r in enumerate(results, 1)
         )
 
         # Step 2: get weak points from memory (if available)

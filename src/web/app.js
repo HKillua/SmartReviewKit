@@ -515,6 +515,35 @@ dropZone.addEventListener('drop', (e) => {
 });
 fileInput.addEventListener('change', () => { if (fileInput.files.length) uploadFile(fileInput.files[0]); });
 
+async function pollIngestionTask(taskId, fileName) {
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    const resp = await fetch(`/api/ingestion/tasks/${encodeURIComponent(taskId)}`);
+    const task = await resp.json();
+    const status = task.status || 'queued';
+    uploadStatus.textContent = `${fileName} 入库任务状态: ${status}`;
+
+    if (status === 'succeeded') {
+      const chunkCount = task.result?.chunk_count || 0;
+      progressFill.style.width = '100%';
+      uploadStatus.textContent = `${fileName} 入库完成 (${chunkCount} 个分块)`;
+      addMessage('assistant', `课件 **${fileName}** 已成功导入知识库（${chunkCount} 个分块）。`);
+      setTimeout(() => uploadModal.classList.add('hidden'), 1500);
+      return;
+    }
+
+    if (status === 'failed') {
+      progressFill.style.width = '0%';
+      uploadStatus.textContent = `${fileName} 入库失败: ${task.error_msg || '未知错误'}`;
+      return;
+    }
+
+    progressFill.style.width = status === 'running' ? '85%' : '70%';
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+
+  uploadStatus.textContent = `${fileName} 入库任务仍在运行，请稍后到任务列表查看。`;
+}
+
 async function uploadFile(file) {
   uploadProgress.classList.remove('hidden');
   uploadStatus.textContent = `正在上传: ${file.name}...`;
@@ -530,9 +559,15 @@ async function uploadFile(file) {
     progressFill.style.width = '100%';
 
     if (result.success) {
-      uploadStatus.textContent = `${file.name} 上传成功 (${result.chunk_count} 个分块)`;
-      addMessage('assistant', `课件 **${file.name}** 已成功导入知识库（${result.chunk_count} 个分块）。`);
-      setTimeout(() => uploadModal.classList.add('hidden'), 1500);
+      if (result.task_id && result.status && ['queued', 'running'].includes(result.status)) {
+        uploadStatus.textContent = `${file.name} 上传成功，入库任务已创建 (${result.task_id})`;
+        addMessage('assistant', `课件 **${file.name}** 已上传，正在后台入库。任务 ID：\`${result.task_id}\``);
+        await pollIngestionTask(result.task_id, file.name);
+      } else {
+        uploadStatus.textContent = `${file.name} 上传成功 (${result.chunk_count} 个分块)`;
+        addMessage('assistant', `课件 **${file.name}** 已成功导入知识库（${result.chunk_count} 个分块）。`);
+        setTimeout(() => uploadModal.classList.add('hidden'), 1500);
+      }
     } else {
       uploadStatus.textContent = `上传失败: ${result.error}`;
     }

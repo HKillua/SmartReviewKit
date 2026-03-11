@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -22,6 +24,8 @@ except ImportError:
 
 _DEFAULT_DIM = 768
 _DEFAULT_URI = "./data/db/milvus.db"
+_VALID_COLLECTION_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_MAX_COLLECTION_NAME = 255
 
 
 class MilvusStore(BaseVectorStore):
@@ -35,10 +39,19 @@ class MilvusStore(BaseVectorStore):
             )
 
         vs_cfg = settings.vector_store
-        self.collection_name = kwargs.get(
+        requested_collection_name = kwargs.get(
             "collection_name",
             getattr(vs_cfg, "collection_name", "knowledge_hub"),
         )
+        self.requested_collection_name = str(requested_collection_name or "knowledge_hub")
+        self.collection_name = self._normalize_collection_name(self.requested_collection_name)
+        self._collection_aliases: Dict[str, str] = {self.collection_name: self.requested_collection_name}
+        if self.collection_name != self.requested_collection_name:
+            logger.info(
+                "Normalized Milvus collection name '%s' -> '%s'",
+                self.requested_collection_name,
+                self.collection_name,
+            )
 
         milvus_cfg = getattr(settings, "milvus", None)
         self._dim = int(getattr(milvus_cfg, "dim", _DEFAULT_DIM))
@@ -82,6 +95,23 @@ class MilvusStore(BaseVectorStore):
     # ------------------------------------------------------------------
     # Collection management
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_collection_name(name: str) -> str:
+        raw = str(name or "knowledge_hub").strip() or "knowledge_hub"
+        if _VALID_COLLECTION_NAME.fullmatch(raw) and len(raw) <= _MAX_COLLECTION_NAME:
+            return raw
+
+        sanitized = re.sub(r"[^A-Za-z0-9_]", "_", raw)
+        if not sanitized:
+            sanitized = "knowledge_hub"
+        if not re.match(r"^[A-Za-z_]", sanitized):
+            sanitized = f"c_{sanitized}"
+        sanitized = sanitized[:200].rstrip("_") or "knowledge_hub"
+        digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
+        max_base_len = _MAX_COLLECTION_NAME - len(digest) - 1
+        base = sanitized[:max_base_len].rstrip("_") or "knowledge_hub"
+        return f"{base}_{digest}"
 
     def _ensure_collection(self, name: str) -> None:
         if self.client.has_collection(name):
@@ -135,13 +165,20 @@ class MilvusStore(BaseVectorStore):
         return CollectionSchema(fields=fields, description="RAG knowledge store")
 
     def get_or_switch_collection(self, collection_name: str) -> None:
-        self._ensure_collection(collection_name)
-        self.collection_name = collection_name
-        self._ensure_loaded(collection_name)
-        logger.info(f"Switched to Milvus collection '{collection_name}'")
+        requested = str(collection_name or "knowledge_hub")
+        normalized = self._normalize_collection_name(requested)
+        self._ensure_collection(normalized)
+        self.collection_name = normalized
+        self.requested_collection_name = requested
+        self._collection_aliases[normalized] = requested
+        self._ensure_loaded(normalized)
+        if normalized != requested:
+            logger.info("Switched to Milvus collection '%s' (physical='%s')", requested, normalized)
+        else:
+            logger.info("Switched to Milvus collection '%s'", requested)
 
     def list_collections(self) -> List[str]:
-        return self.client.list_collections()
+        return [self._collection_aliases.get(name, name) for name in self.client.list_collections()]
 
     # ------------------------------------------------------------------
     # CRUD
@@ -240,12 +277,16 @@ class MilvusStore(BaseVectorStore):
         trace: Optional[Any] = None,
         **kwargs: Any,
     ) -> None:
-        name = collection_name or self.collection_name
+        requested = collection_name or self.requested_collection_name
+        name = self._normalize_collection_name(requested)
         if self.client.has_collection(name):
             self.client.drop_collection(name)
         self._ensure_collection(name)
         self._ensure_loaded(name)
-        logger.info(f"Cleared Milvus collection '{name}'")
+        self.collection_name = name
+        self.requested_collection_name = requested
+        self._collection_aliases[name] = requested
+        logger.info("Cleared Milvus collection '%s' (physical='%s')", requested, name)
 
     def get_by_ids(
         self,
@@ -318,13 +359,16 @@ class MilvusStore(BaseVectorStore):
         ids = [r["id"] for r in results]
         if ids:
             self.client.delete(collection_name=self.collection_name, ids=ids)
+            self.client.flush(self.collection_name)
+            self._ensure_loaded(self.collection_name)
         return len(ids)
 
     def get_collection_stats(self) -> Dict[str, Any]:
         stats = self.client.get_collection_stats(self.collection_name)
         return {
             "count": stats.get("row_count", 0),
-            "name": self.collection_name,
+            "name": self.requested_collection_name,
+            "physical_name": self.collection_name,
         }
 
     # ------------------------------------------------------------------
@@ -339,6 +383,8 @@ class MilvusStore(BaseVectorStore):
 
         parts: List[str] = []
         for key, value in filters.items():
+            if key == "collection":
+                continue
             if isinstance(value, dict):
                 for op, val in value.items():
                     milvus_op = {"$eq": "==", "$ne": "!=", "$gt": ">", "$gte": ">=",

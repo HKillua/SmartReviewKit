@@ -9,6 +9,8 @@ from typing import Any
 
 _TOKEN_RE = re.compile(r"[\w\u4e00-\u9fff]+")
 _CITATION_RE = re.compile(r"\[(\d+)\]")
+_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
+_SEGMENT_SPLIT_RE = re.compile(r"[。！？!?\n]+")
 
 DEFAULT_LOW_EVIDENCE_MESSAGE = (
     "根据当前知识库证据，我暂时无法可靠地完整回答这个课程问题。"
@@ -26,6 +28,7 @@ class GroundingPolicyAction(str, Enum):
 class EvidenceBundle:
     citations: list[dict[str, Any]] = field(default_factory=list)
     evidence_summary: str = ""
+    evidence_texts: list[str] = field(default_factory=list)
     source_count: int = 0
     query_trace_ids: list[str] = field(default_factory=list)
     evidence_tool: str = ""
@@ -102,6 +105,11 @@ def build_evidence_bundle(tool_name: str, metadata: dict[str, Any] | None) -> Ev
     raw_citations = metadata.get("citations") or []
     citations = [_normalize_citation(citation) for citation in raw_citations if citation]
     evidence_summary = str(metadata.get("evidence_summary", "") or "")
+    evidence_texts = [
+        str(value)
+        for value in metadata.get("evidence_texts", [])
+        if str(value).strip()
+    ]
     source_count = int(metadata.get("source_count", len(citations) or 0) or 0)
     if not evidence_summary and citations:
         evidence_summary = build_evidence_summary(citations)
@@ -120,6 +128,7 @@ def build_evidence_bundle(tool_name: str, metadata: dict[str, Any] | None) -> Ev
     return EvidenceBundle(
         citations=citations,
         evidence_summary=evidence_summary,
+        evidence_texts=evidence_texts,
         source_count=source_count,
         query_trace_ids=query_trace_ids,
         evidence_tool=tool_name,
@@ -161,6 +170,39 @@ def _tokenize(text: str) -> set[str]:
     return set(_TOKEN_RE.findall(text.lower()))
 
 
+def _extract_numbers(text: str) -> set[str]:
+    return set(_NUMBER_RE.findall(text))
+
+
+def _strip_citation_markers(text: str) -> str:
+    return _CITATION_RE.sub("", text or "").strip()
+
+
+def _snippet_match_score(answer: str, snippet: str) -> float:
+    normalized_answer = " ".join(_strip_citation_markers(answer).split()).lower()
+    normalized_snippet = " ".join((snippet or "").split()).lower()
+    if not normalized_answer or not normalized_snippet:
+        return 0.0
+    if normalized_answer in normalized_snippet or normalized_snippet in normalized_answer:
+        return 1.0
+    answer_numbers = _extract_numbers(normalized_answer)
+    snippet_numbers = _extract_numbers(normalized_snippet)
+    if answer_numbers and answer_numbers <= snippet_numbers:
+        return 0.85
+    answer_tokens = _tokenize(normalized_answer)
+    snippet_tokens = _tokenize(normalized_snippet)
+    if not answer_tokens or not snippet_tokens:
+        return 0.0
+    overlap = len(answer_tokens & snippet_tokens)
+    return overlap / max(1, min(len(answer_tokens), len(snippet_tokens)))
+
+
+def _answer_segments(text: str) -> list[str]:
+    cleaned = _strip_citation_markers(text or "")
+    segments = [segment.strip() for segment in _SEGMENT_SPLIT_RE.split(cleaned) if segment.strip()]
+    return segments or ([cleaned] if cleaned else [])
+
+
 class GroundingEvaluator:
     """Deterministic answer grounding scorer."""
 
@@ -190,7 +232,8 @@ class GroundingEvaluator:
                 low_evidence=True,
             )
 
-        answer_tokens = _tokenize(answer)
+        answer_core = _strip_citation_markers(answer)
+        answer_tokens = _tokenize(answer_core)
         evidence_text = bundle.evidence_summary or " ".join(
             str(citation.get("text_snippet", "")) for citation in bundle.citations
         )
@@ -206,7 +249,43 @@ class GroundingEvaluator:
             }
         )
         citation_score = 1.0 if valid_indices else 0.0
-        score = round((0.7 * overlap) + (0.3 * citation_score), 4)
+        cited_snippets = [
+            str(
+                bundle.citations[index - 1].get("grounding_text")
+                or bundle.citations[index - 1].get("text_snippet", "")
+            )
+            for index in valid_indices
+        ] or [
+            str(citation.get("grounding_text") or citation.get("text_snippet", ""))
+            for citation in bundle.citations
+        ]
+        if bundle.evidence_texts:
+            cited_snippets.extend(bundle.evidence_texts)
+        cited_snippets = [snippet for snippet in cited_snippets if snippet]
+        snippet_match = max((_snippet_match_score(answer_core, snippet) for snippet in cited_snippets), default=0.0)
+        segment_match = max(
+            (
+                _snippet_match_score(segment, snippet)
+                for segment in _answer_segments(answer)
+                for snippet in cited_snippets
+            ),
+            default=0.0,
+        )
+        short_fact_answer = len(answer_tokens) <= 8 or len(answer_core) <= 32
+        if citation_score > 0 and short_fact_answer and max(snippet_match, segment_match) >= 0.5:
+            score = 0.9
+        elif citation_score > 0 and segment_match >= 0.72:
+            score = 0.86
+        else:
+            overlap_weight = 0.35 if short_fact_answer else 0.55
+            snippet_weight = 0.45 if short_fact_answer else 0.25
+            citation_weight = 0.20
+            score = round(
+                (overlap_weight * overlap)
+                + (snippet_weight * max(snippet_match, segment_match))
+                + (citation_weight * citation_score),
+                4,
+            )
         low_evidence = score < self.threshold
         return GroundingAssessment(
             score=score,

@@ -56,6 +56,7 @@ class ChunkRefiner(BaseTransform):
         self._llm_lock = threading.Lock()
         self._prompt_template: Optional[str] = None
         self._prompt_path = prompt_path or str(resolve_path("config/prompts/chunk_refinement.txt"))
+        self._llm_unavailable_reason: Optional[str] = None
         
         # Determine if LLM should be used
         self.use_llm = getattr(
@@ -73,9 +74,11 @@ class ChunkRefiner(BaseTransform):
                     try:
                         self._llm = LLMFactory.create(self.settings)
                         logger.info("LLM initialized for chunk refinement")
+                        self._llm_unavailable_reason = None
                     except Exception as e:
                         logger.warning(f"Failed to initialize LLM: {e}. Falling back to rule-based only.")
                         self.use_llm = False
+                        self._llm_unavailable_reason = "llm_init_failed"
         return self._llm
     
     def transform(
@@ -120,6 +123,7 @@ class ChunkRefiner(BaseTransform):
             rule_refined_text = self._rule_based_refine(chunk.text)
             
             # Step 2: LLM enhancement
+            fallback_reason = None
             if self.use_llm and self.llm:
                 llm_refined_text = self._llm_refine(rule_refined_text, trace)
                 
@@ -129,16 +133,19 @@ class ChunkRefiner(BaseTransform):
                 else:
                     refined_text = rule_refined_text
                     refined_by = "rule"
+                    fallback_reason = "llm_failed"
             else:
                 refined_text = rule_refined_text
                 refined_by = "rule"
+                fallback_reason = self._llm_unavailable_reason
             
             refined_chunk = Chunk(
                 id=chunk.id,
                 text=refined_text,
                 metadata={
                     **(chunk.metadata or {}),
-                    'refined_by': refined_by
+                    'refined_by': refined_by,
+                    **({"refine_fallback_reason": fallback_reason} if fallback_reason else {}),
                 },
                 source_ref=chunk.source_ref
             )
@@ -218,6 +225,7 @@ class ChunkRefiner(BaseTransform):
             try:
                 # Step 1: Rule-based refinement (always performed)
                 rule_refined_text = self._rule_based_refine(chunk.text)
+                fallback_reason = None
                 
                 # Step 2: Optional LLM enhancement
                 if self.use_llm and self.llm:
@@ -233,12 +241,12 @@ class ChunkRefiner(BaseTransform):
                         refined_text = rule_refined_text
                         refined_by = "rule"
                         fallback_count += 1
-                        if chunk.metadata:
-                            chunk.metadata['refine_fallback_reason'] = "llm_failed"
+                        fallback_reason = "llm_failed"
                 else:
                     # LLM disabled, use rule-based
                     refined_text = rule_refined_text
                     refined_by = "rule"
+                    fallback_reason = self._llm_unavailable_reason
                 
                 # Create refined chunk
                 refined_chunk = Chunk(
@@ -246,7 +254,8 @@ class ChunkRefiner(BaseTransform):
                     text=refined_text,
                     metadata={
                         **(chunk.metadata or {}),
-                        'refined_by': refined_by
+                        'refined_by': refined_by,
+                        **({"refine_fallback_reason": fallback_reason} if fallback_reason else {}),
                     },
                     source_ref=chunk.source_ref
                 )

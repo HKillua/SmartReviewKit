@@ -104,9 +104,9 @@ def main() -> int:
             from src.core.query_engine.hybrid_search import create_hybrid_search
             from src.core.query_engine.dense_retriever import create_dense_retriever
             from src.core.query_engine.sparse_retriever import create_sparse_retriever
-            from src.ingestion.storage.bm25_indexer import BM25Indexer
             from src.libs.embedding.embedding_factory import EmbeddingFactory
             from src.libs.vector_store.vector_store_factory import VectorStoreFactory
+            from src.storage.runtime import create_sparse_index
 
             collection = args.collection or "default"
 
@@ -119,7 +119,7 @@ def main() -> int:
                 embedding_client=embedding_client,
                 vector_store=vector_store,
             )
-            bm25_indexer = BM25Indexer(index_dir=f"data/db/bm25/{collection}")
+            bm25_indexer = create_sparse_index(settings, collection=collection)
             sparse_retriever = create_sparse_retriever(
                 settings=settings,
                 bm25_indexer=bm25_indexer,

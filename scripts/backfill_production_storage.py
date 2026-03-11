@@ -7,6 +7,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sqlite3
 from pathlib import Path
@@ -14,7 +15,9 @@ from pathlib import Path
 from src.agent.memory.session_memory import SessionSummary
 from src.agent.types import Conversation
 from src.core.settings import load_settings, resolve_path
+from src.core.trace.trace_collector import PostgresTraceSink
 from src.ingestion.pipeline import IngestionPipeline
+from src.observability.evaluation.migration_compare import MigrationCompareRunner
 from src.storage.object_store import ObjectImageStorage
 from src.storage.postgres_backends import (
     PostgresConversationStore,
@@ -155,13 +158,51 @@ def _reindex_documents(settings) -> int:
     return count
 
 
+def _backfill_traces(trace_path: Path, dsn: str) -> int:
+    if not trace_path.exists():
+        return 0
+    sink = PostgresTraceSink(dsn)
+    count = 0
+    with trace_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                sink.collect(json.loads(line))
+            except Exception:
+                continue
+            count += 1
+    return count
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Backfill local storage to production backends.")
     parser.add_argument("--settings", default="config/settings.yaml", help="Path to settings file")
     parser.add_argument(
+        "--legacy-settings",
+        default="config/settings.yaml",
+        help="Legacy retrieval settings path for migration compare.",
+    )
+    parser.add_argument(
         "--reindex-documents",
         action="store_true",
         help="Re-ingest successful local documents into the configured production vector/sparse stack.",
+    )
+    parser.add_argument(
+        "--skip-trace-backfill",
+        action="store_true",
+        help="Skip importing JSONL traces into PostgreSQL.",
+    )
+    parser.add_argument(
+        "--skip-compare-eval",
+        action="store_true",
+        help="Skip retrieval compare evaluation after migration/reindex.",
+    )
+    parser.add_argument(
+        "--compare-report",
+        default="logs/migration_compare_report.json",
+        help="Where to write the retrieval migration compare report.",
     )
     args = parser.parse_args()
 
@@ -177,6 +218,21 @@ async def main() -> None:
     registry = _backfill_ingestion_registry(settings.postgres.dsn)
     images = _backfill_images(settings, backends)
     reindexed = _reindex_documents(settings) if args.reindex_documents else 0
+    traces = 0 if args.skip_trace_backfill else _backfill_traces(resolve_path(settings.observability.trace_file), settings.postgres.dsn)
+    compare_report_path = resolve_path(args.compare_report)
+    compare_report = None
+    if not args.skip_compare_eval:
+        comparator = MigrationCompareRunner(
+            legacy_settings_path=args.legacy_settings,
+            production_settings_path=args.settings,
+        )
+        compare_report = comparator.run(
+            test_set_path=resolve_path("tests/fixtures/golden_test_set.json"),
+            top_k=settings.retrieval.fusion_top_k,
+            collection=settings.vector_store.collection_name,
+        )
+        compare_report_path.parent.mkdir(parents=True, exist_ok=True)
+        compare_report_path.write_text(compare_report.to_json(), encoding="utf-8")
 
     print("Backfill complete")
     print(f"- conversations: {conversations}")
@@ -186,9 +242,12 @@ async def main() -> None:
     print(f"- ingestion records: {registry}")
     print(f"- images: {images}")
     print(f"- reindexed documents: {reindexed}")
+    print(f"- traces imported: {traces}")
+    if compare_report is not None:
+        print(f"- compare hard failures: {len(compare_report.hard_failures)}")
+        print(f"- compare warnings: {len(compare_report.warnings)}")
+        print(f"- compare report: {compare_report_path}")
 
 
 if __name__ == "__main__":
-    import asyncio
-
     asyncio.run(main())

@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from psycopg import errors, sql
+
 from src.agent.conversation import ConversationStore
 from src.agent.memory.error_memory import ErrorMemory, ErrorRecord
 from src.agent.memory.feedback_store import FeedbackStore
@@ -30,6 +32,59 @@ def _to_json(model_or_value: Any) -> str:
     if hasattr(model_or_value, "model_dump_json"):
         return model_or_value.model_dump_json()
     return json.dumps(model_or_value, ensure_ascii=False, default=str)
+
+
+def _get_primary_key_constraints(cur: Any, table_name: str) -> list[tuple[str, list[str]]]:
+    cur.execute(
+        """
+        SELECT c.conname, a.attname, cols.ord
+        FROM pg_constraint c
+        JOIN pg_class t ON c.conrelid = t.oid
+        JOIN unnest(c.conkey) WITH ORDINALITY AS cols(attnum, ord) ON TRUE
+        JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = cols.attnum
+        WHERE t.relname = %s AND c.contype = 'p'
+        ORDER BY c.conname, cols.ord
+        """,
+        (table_name,),
+    )
+    constraints: dict[str, list[str]] = {}
+    for conname, attname, _ord in cur.fetchall():
+        constraints.setdefault(conname, []).append(attname)
+    return list(constraints.items())
+
+
+def _ensure_primary_key(
+    cur: Any,
+    *,
+    table_name: str,
+    columns: list[str],
+    constraint_name: str,
+) -> None:
+    current = _get_primary_key_constraints(cur, table_name)
+    if any(cols == columns for _name, cols in current):
+        return
+
+    for existing_name, _cols in current:
+        cur.execute(
+            sql.SQL("ALTER TABLE {} DROP CONSTRAINT IF EXISTS {}").format(
+                sql.Identifier(table_name),
+                sql.Identifier(existing_name),
+            )
+        )
+
+    try:
+        cur.execute(
+            sql.SQL("ALTER TABLE {} ADD CONSTRAINT {} PRIMARY KEY ({})").format(
+                sql.Identifier(table_name),
+                sql.Identifier(constraint_name),
+                sql.SQL(", ").join(sql.Identifier(col) for col in columns),
+            )
+        )
+    except (errors.DuplicateObject, errors.InvalidTableDefinition):
+        current = _get_primary_key_constraints(cur, table_name)
+        if any(cols == columns for _name, cols in current):
+            return
+        raise
 
 
 class PostgresConversationStore(ConversationStore):
@@ -54,6 +109,9 @@ class PostgresConversationStore(ConversationStore):
         self._db.execute_ddl(self._DDL)
         self._locks: dict[str, asyncio.Lock] = {}
         self._locks_guard = asyncio.Lock()
+
+    def _migrate_schema(self) -> None:
+        return None
 
     async def _get_write_lock(self, conversation_id: str) -> asyncio.Lock:
         async with self._locks_guard:
@@ -613,14 +671,15 @@ class PostgresIntegrityChecker(FileIntegrityChecker):
     _DDL = [
         """
         CREATE TABLE IF NOT EXISTS ingestion_history (
-            file_hash TEXT PRIMARY KEY,
+            file_hash TEXT NOT NULL,
             file_path TEXT NOT NULL,
             status TEXT NOT NULL,
-            collection TEXT,
+            collection TEXT NOT NULL DEFAULT '',
             error_msg TEXT,
             object_uri TEXT,
             processed_at TIMESTAMPTZ NOT NULL,
-            updated_at TIMESTAMPTZ NOT NULL
+            updated_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (file_hash, collection)
         )
         """,
         "CREATE INDEX IF NOT EXISTS idx_pg_ingestion_status ON ingestion_history(status)",
@@ -629,6 +688,19 @@ class PostgresIntegrityChecker(FileIntegrityChecker):
     def __init__(self, dsn: str) -> None:
         self._db = PostgresExecutor(dsn)
         self._db.execute_ddl(self._DDL)
+        self._migrate_schema()
+
+    def _migrate_schema(self) -> None:
+        with self._db.connect() as conn, conn.cursor() as cur:
+            cur.execute("UPDATE ingestion_history SET collection = '' WHERE collection IS NULL")
+            cur.execute("ALTER TABLE ingestion_history ALTER COLUMN collection SET DEFAULT ''")
+            cur.execute("ALTER TABLE ingestion_history ALTER COLUMN collection SET NOT NULL")
+            _ensure_primary_key(
+                cur,
+                table_name="ingestion_history",
+                columns=["file_hash", "collection"],
+                constraint_name="ingestion_history_pkey",
+            )
 
     def compute_sha256(self, file_path: str) -> str:
         path = Path(file_path)
@@ -642,50 +714,65 @@ class PostgresIntegrityChecker(FileIntegrityChecker):
                 sha256_hash.update(chunk)
         return sha256_hash.hexdigest()
 
-    def should_skip(self, file_hash: str) -> bool:
+    def should_skip(self, file_hash: str, collection: Optional[str] = None) -> bool:
         with self._db.connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT status FROM ingestion_history WHERE file_hash = %s", (file_hash,))
+            if collection is None:
+                cur.execute("SELECT status FROM ingestion_history WHERE file_hash = %s", (file_hash,))
+            else:
+                cur.execute(
+                    "SELECT status FROM ingestion_history WHERE file_hash = %s AND collection = %s",
+                    (file_hash, collection or ""),
+                )
             row = cur.fetchone()
         return bool(row and row[0] == "success")
 
     def mark_success(self, file_hash: str, file_path: str, collection: Optional[str] = None) -> None:
         now = utcnow()
+        normalized_collection = collection or ""
         with self._db.connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO ingestion_history
                 (file_hash, file_path, status, collection, error_msg, object_uri, processed_at, updated_at)
                 VALUES (%s, %s, 'success', %s, '', NULL, %s, %s)
-                ON CONFLICT (file_hash) DO UPDATE
+                ON CONFLICT (file_hash, collection) DO UPDATE
                 SET file_path = EXCLUDED.file_path,
                     status = EXCLUDED.status,
                     collection = EXCLUDED.collection,
                     error_msg = EXCLUDED.error_msg,
                     updated_at = EXCLUDED.updated_at
                 """,
-                (file_hash, file_path, collection, now, now),
+                (file_hash, file_path, normalized_collection, now, now),
             )
 
-    def mark_failed(self, file_hash: str, file_path: str, error_msg: str) -> None:
+    def mark_failed(self, file_hash: str, file_path: str, error_msg: str, collection: Optional[str] = None) -> None:
         now = utcnow()
+        normalized_collection = collection or ""
         with self._db.connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO ingestion_history
                 (file_hash, file_path, status, collection, error_msg, object_uri, processed_at, updated_at)
-                VALUES (%s, %s, 'failed', NULL, %s, NULL, %s, %s)
-                ON CONFLICT (file_hash) DO UPDATE
+                VALUES (%s, %s, 'failed', %s, %s, NULL, %s, %s)
+                ON CONFLICT (file_hash, collection) DO UPDATE
                 SET file_path = EXCLUDED.file_path,
                     status = EXCLUDED.status,
+                    collection = EXCLUDED.collection,
                     error_msg = EXCLUDED.error_msg,
                     updated_at = EXCLUDED.updated_at
                 """,
-                (file_hash, file_path, error_msg, now, now),
+                (file_hash, file_path, normalized_collection, error_msg, now, now),
             )
 
-    def remove_record(self, file_hash: str) -> bool:
+    def remove_record(self, file_hash: str, collection: Optional[str] = None) -> bool:
         with self._db.connect() as conn, conn.cursor() as cur:
-            cur.execute("DELETE FROM ingestion_history WHERE file_hash = %s", (file_hash,))
+            if collection is None:
+                cur.execute("DELETE FROM ingestion_history WHERE file_hash = %s", (file_hash,))
+            else:
+                cur.execute(
+                    "DELETE FROM ingestion_history WHERE file_hash = %s AND collection = %s",
+                    (file_hash, collection or ""),
+                )
             return cur.rowcount > 0
 
     def list_processed(self, collection: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -723,14 +810,15 @@ class PostgresDocumentRegistry:
     _DDL = [
         """
         CREATE TABLE IF NOT EXISTS document_registry (
-            file_hash TEXT PRIMARY KEY,
+            file_hash TEXT NOT NULL,
             file_path TEXT NOT NULL,
             collection TEXT NOT NULL,
             status TEXT NOT NULL,
             object_uri TEXT,
             metadata_json TEXT NOT NULL,
             created_at TIMESTAMPTZ NOT NULL,
-            updated_at TIMESTAMPTZ NOT NULL
+            updated_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (file_hash, collection)
         )
         """,
         "CREATE INDEX IF NOT EXISTS idx_pg_document_collection ON document_registry(collection)",
@@ -739,6 +827,16 @@ class PostgresDocumentRegistry:
     def __init__(self, dsn: str) -> None:
         self._db = PostgresExecutor(dsn)
         self._db.execute_ddl(self._DDL)
+        self._migrate_schema()
+
+    def _migrate_schema(self) -> None:
+        with self._db.connect() as conn, conn.cursor() as cur:
+            _ensure_primary_key(
+                cur,
+                table_name="document_registry",
+                columns=["file_hash", "collection"],
+                constraint_name="document_registry_pkey",
+            )
 
     def upsert_document(
         self,
@@ -756,7 +854,7 @@ class PostgresDocumentRegistry:
                 INSERT INTO document_registry
                 (file_hash, file_path, collection, status, object_uri, metadata_json, created_at, updated_at)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (file_hash) DO UPDATE
+                ON CONFLICT (file_hash, collection) DO UPDATE
                 SET file_path = EXCLUDED.file_path,
                     collection = EXCLUDED.collection,
                     status = EXCLUDED.status,
@@ -776,21 +874,39 @@ class PostgresDocumentRegistry:
                 ),
             )
 
-    def delete_document(self, file_hash: str) -> bool:
+    def delete_document(self, file_hash: str, collection: Optional[str] = None) -> bool:
         with self._db.connect() as conn, conn.cursor() as cur:
-            cur.execute("DELETE FROM document_registry WHERE file_hash = %s", (file_hash,))
+            if collection is None:
+                cur.execute("DELETE FROM document_registry WHERE file_hash = %s", (file_hash,))
+            else:
+                cur.execute(
+                    "DELETE FROM document_registry WHERE file_hash = %s AND collection = %s",
+                    (file_hash, collection),
+                )
             return cur.rowcount > 0
 
-    def get_document(self, file_hash: str) -> Optional[Dict[str, Any]]:
+    def get_document(self, file_hash: str, collection: Optional[str] = None) -> Optional[Dict[str, Any]]:
         with self._db.connect() as conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT file_hash, file_path, collection, status, object_uri, metadata_json
-                FROM document_registry
-                WHERE file_hash = %s
-                """,
-                (file_hash,),
-            )
+            if collection is None:
+                cur.execute(
+                    """
+                    SELECT file_hash, file_path, collection, status, object_uri, metadata_json
+                    FROM document_registry
+                    WHERE file_hash = %s
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    """,
+                    (file_hash,),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT file_hash, file_path, collection, status, object_uri, metadata_json
+                    FROM document_registry
+                    WHERE file_hash = %s AND collection = %s
+                    """,
+                    (file_hash, collection),
+                )
             row = cur.fetchone()
         if not row:
             return None
@@ -836,52 +952,132 @@ class IngestionTaskStore:
         """
         CREATE TABLE IF NOT EXISTS ingestion_tasks (
             task_id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL DEFAULT 'default_user',
+            file_hash TEXT NOT NULL DEFAULT '',
             file_path TEXT NOT NULL,
             collection TEXT NOT NULL,
             status TEXT NOT NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}',
             object_uri TEXT,
+            result_json TEXT NOT NULL DEFAULT '{}',
+            worker_id TEXT NOT NULL DEFAULT '',
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            max_attempts INTEGER NOT NULL DEFAULT 3,
+            lease_expires_at TIMESTAMPTZ,
+            started_at TIMESTAMPTZ,
+            finished_at TIMESTAMPTZ,
             error_msg TEXT,
             created_at TIMESTAMPTZ NOT NULL,
             updated_at TIMESTAMPTZ NOT NULL
         )
         """,
+        "ALTER TABLE ingestion_tasks ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT 'default_user'",
+        "ALTER TABLE ingestion_tasks ADD COLUMN IF NOT EXISTS file_hash TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE ingestion_tasks ADD COLUMN IF NOT EXISTS payload_json TEXT NOT NULL DEFAULT '{}'",
+        "ALTER TABLE ingestion_tasks ADD COLUMN IF NOT EXISTS result_json TEXT NOT NULL DEFAULT '{}'",
+        "ALTER TABLE ingestion_tasks ADD COLUMN IF NOT EXISTS worker_id TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE ingestion_tasks ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE ingestion_tasks ADD COLUMN IF NOT EXISTS max_attempts INTEGER NOT NULL DEFAULT 3",
+        "ALTER TABLE ingestion_tasks ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ",
+        "ALTER TABLE ingestion_tasks ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ",
+        "ALTER TABLE ingestion_tasks ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ",
         "CREATE INDEX IF NOT EXISTS idx_pg_ingestion_tasks_status ON ingestion_tasks(status)",
+        "CREATE INDEX IF NOT EXISTS idx_pg_ingestion_tasks_file_hash ON ingestion_tasks(file_hash)",
     ]
 
     def __init__(self, dsn: str) -> None:
         self._db = PostgresExecutor(dsn)
         self._db.execute_ddl(self._DDL)
 
-    def create_task(self, file_path: str, collection: str, object_uri: str = "") -> str:
+    def create_task(
+        self,
+        file_path: str,
+        collection: str,
+        *,
+        object_uri: str = "",
+        user_id: str = "default_user",
+        file_hash: str = "",
+        payload: Optional[Dict[str, Any]] = None,
+        max_attempts: int = 3,
+    ) -> str:
         task_id = uuid.uuid4().hex[:16]
         now = utcnow()
         with self._db.connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO ingestion_tasks
-                (task_id, file_path, collection, status, object_uri, error_msg, created_at, updated_at)
-                VALUES (%s, %s, %s, 'queued', %s, '', %s, %s)
+                (
+                    task_id, user_id, file_hash, file_path, collection, status,
+                    payload_json, object_uri, result_json, worker_id,
+                    attempt_count, max_attempts, lease_expires_at,
+                    started_at, finished_at, error_msg, created_at, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, 'queued', %s, %s, '{}', '', 0, %s, NULL, NULL, NULL, '', %s, %s)
                 """,
-                (task_id, file_path, collection, object_uri, now, now),
+                (
+                    task_id,
+                    user_id,
+                    file_hash,
+                    file_path,
+                    collection,
+                    _to_json(payload or {}),
+                    object_uri,
+                    max_attempts,
+                    now,
+                    now,
+                ),
             )
         return task_id
 
-    def update_status(self, task_id: str, status: str, error_msg: str = "") -> None:
+    def update_status(
+        self,
+        task_id: str,
+        status: str,
+        error_msg: str = "",
+        *,
+        result: Optional[Dict[str, Any]] = None,
+        worker_id: str = "",
+        lease_expires_at: Optional[datetime] = None,
+        started_at: Optional[datetime] = None,
+        finished_at: Optional[datetime] = None,
+    ) -> None:
         with self._db.connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
                 UPDATE ingestion_tasks
-                SET status = %s, error_msg = %s, updated_at = %s
+                SET status = %s,
+                    error_msg = %s,
+                    result_json = COALESCE(%s, result_json),
+                    worker_id = CASE WHEN %s <> '' THEN %s ELSE worker_id END,
+                    lease_expires_at = COALESCE(%s, lease_expires_at),
+                    started_at = COALESCE(%s, started_at),
+                    finished_at = COALESCE(%s, finished_at),
+                    updated_at = %s
                 WHERE task_id = %s
                 """,
-                (status, error_msg, utcnow(), task_id),
+                (
+                    status,
+                    error_msg,
+                    _to_json(result) if result is not None else None,
+                    worker_id,
+                    worker_id,
+                    lease_expires_at,
+                    started_at,
+                    finished_at,
+                    utcnow(),
+                    task_id,
+                ),
             )
 
     def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
         with self._db.connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT task_id, file_path, collection, status, object_uri, error_msg, created_at, updated_at
+                SELECT
+                    task_id, user_id, file_hash, file_path, collection, status,
+                    payload_json, object_uri, result_json, worker_id, attempt_count,
+                    max_attempts, lease_expires_at, started_at, finished_at,
+                    error_msg, created_at, updated_at
                 FROM ingestion_tasks
                 WHERE task_id = %s
                 """,
@@ -892,11 +1088,171 @@ class IngestionTaskStore:
             return None
         return {
             "task_id": row[0],
-            "file_path": row[1],
-            "collection": row[2],
-            "status": row[3],
-            "object_uri": row[4],
-            "error_msg": row[5],
-            "created_at": row[6].isoformat() if hasattr(row[6], "isoformat") else str(row[6]),
-            "updated_at": row[7].isoformat() if hasattr(row[7], "isoformat") else str(row[7]),
+            "user_id": row[1],
+            "file_hash": row[2],
+            "file_path": row[3],
+            "collection": row[4],
+            "status": row[5],
+            "payload": json.loads(row[6] or "{}"),
+            "object_uri": row[7],
+            "result": json.loads(row[8] or "{}"),
+            "worker_id": row[9],
+            "attempt_count": int(row[10] or 0),
+            "max_attempts": int(row[11] or 0),
+            "lease_expires_at": row[12].isoformat() if row[12] and hasattr(row[12], "isoformat") else (str(row[12]) if row[12] else None),
+            "started_at": row[13].isoformat() if row[13] and hasattr(row[13], "isoformat") else (str(row[13]) if row[13] else None),
+            "finished_at": row[14].isoformat() if row[14] and hasattr(row[14], "isoformat") else (str(row[14]) if row[14] else None),
+            "error_msg": row[15],
+            "created_at": row[16].isoformat() if hasattr(row[16], "isoformat") else str(row[16]),
+            "updated_at": row[17].isoformat() if hasattr(row[17], "isoformat") else str(row[17]),
         }
+
+    def list_tasks(
+        self,
+        *,
+        user_id: Optional[str] = None,
+        status: Optional[str] = None,
+        file_hash: Optional[str] = None,
+        collection: Optional[str] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        query = """
+            SELECT task_id
+            FROM ingestion_tasks
+            WHERE 1 = 1
+        """
+        params: list[Any] = []
+        if user_id:
+            query += " AND user_id = %s"
+            params.append(user_id)
+        if status:
+            query += " AND status = %s"
+            params.append(status)
+        if file_hash:
+            query += " AND file_hash = %s"
+            params.append(file_hash)
+        if collection:
+            query += " AND collection = %s"
+            params.append(collection)
+        query += " ORDER BY updated_at DESC LIMIT %s"
+        params.append(limit)
+        with self._db.connect() as conn, conn.cursor() as cur:
+            cur.execute(query, params)
+            rows = cur.fetchall()
+        tasks: List[Dict[str, Any]] = []
+        for (task_id,) in rows:
+            task = self.get_task(task_id)
+            if task:
+                tasks.append(task)
+        return tasks
+
+    def claim_task(self, worker_id: str, lease_seconds: int = 120) -> Optional[Dict[str, Any]]:
+        now = utcnow()
+        with self._db.connect() as conn, conn.cursor() as cur:
+            lease_expires_at = now.timestamp() + lease_seconds
+            lease_dt = datetime.fromtimestamp(lease_expires_at, timezone.utc)
+            cur.execute(
+                """
+                WITH candidate AS (
+                    SELECT task_id
+                    FROM ingestion_tasks
+                    WHERE status = 'queued'
+                       OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at < %s)
+                    ORDER BY created_at ASC
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE ingestion_tasks AS tasks
+                SET status = 'running',
+                    worker_id = %s,
+                    attempt_count = tasks.attempt_count + 1,
+                    started_at = COALESCE(tasks.started_at, %s),
+                    lease_expires_at = %s,
+                    updated_at = %s,
+                    finished_at = NULL
+                FROM candidate
+                WHERE tasks.task_id = candidate.task_id
+                RETURNING tasks.task_id
+                """,
+                (now, worker_id, now, lease_dt, now),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            task_id = row[0]
+        return self.get_task(task_id)
+
+    def heartbeat(self, task_id: str, worker_id: str, lease_seconds: int = 120) -> bool:
+        now = utcnow()
+        lease_dt = datetime.fromtimestamp(now.timestamp() + lease_seconds, timezone.utc)
+        with self._db.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE ingestion_tasks
+                SET lease_expires_at = %s, updated_at = %s
+                WHERE task_id = %s AND worker_id = %s AND status = 'running'
+                """,
+                (lease_dt, now, task_id, worker_id),
+            )
+            return cur.rowcount > 0
+
+    def mark_succeeded(self, task_id: str, worker_id: str, result: Optional[Dict[str, Any]] = None) -> None:
+        now = utcnow()
+        self.update_status(
+            task_id,
+            "succeeded",
+            "",
+            result=result or {},
+            worker_id=worker_id,
+            finished_at=now,
+            lease_expires_at=now,
+        )
+
+    def mark_failed(self, task_id: str, worker_id: str, error_msg: str) -> Dict[str, Any]:
+        task = self.get_task(task_id)
+        if task is None:
+            return {"task_id": task_id, "status": "missing", "terminal": True}
+        terminal = int(task["attempt_count"]) >= int(task["max_attempts"])
+        now = utcnow()
+        next_status = "failed" if terminal else "queued"
+        self.update_status(
+            task_id,
+            next_status,
+            error_msg,
+            worker_id=worker_id,
+            lease_expires_at=now if terminal else None,
+            finished_at=now if terminal else None,
+        )
+        if not terminal:
+            with self._db.connect() as conn, conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE ingestion_tasks
+                    SET worker_id = '', lease_expires_at = NULL, updated_at = %s
+                    WHERE task_id = %s
+                    """,
+                    (now, task_id),
+                )
+        updated = self.get_task(task_id)
+        return {
+            "task_id": task_id,
+            "status": next_status,
+            "terminal": terminal,
+            "attempt_count": updated["attempt_count"] if updated else task["attempt_count"],
+            "max_attempts": updated["max_attempts"] if updated else task["max_attempts"],
+        }
+
+    def delete_task(self, task_id: str) -> bool:
+        with self._db.connect() as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM ingestion_tasks WHERE task_id = %s", (task_id,))
+            return cur.rowcount > 0
+
+    def delete_tasks_by_file(self, file_hash: str, collection: Optional[str] = None) -> int:
+        query = "DELETE FROM ingestion_tasks WHERE file_hash = %s"
+        params: list[Any] = [file_hash]
+        if collection:
+            query += " AND collection = %s"
+            params.append(collection)
+        with self._db.connect() as conn, conn.cursor() as cur:
+            cur.execute(query, params)
+            return int(cur.rowcount or 0)

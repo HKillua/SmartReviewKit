@@ -12,6 +12,8 @@ Required environment variables:
 import os
 import pytest
 from unittest.mock import Mock
+from urllib.error import URLError
+from urllib.request import urlopen
 
 from src.core.settings import Settings, load_settings
 from src.core.types import Chunk
@@ -164,8 +166,15 @@ def is_provider_available(provider: str) -> tuple[bool, str]:
         return os.getenv(env_var) is not None, env_var
         
     elif provider == 'ollama':
-        # Ollama assumed available if base_url is set or default
-        return True, 'OLLAMA_BASE_URL'
+        env_var = 'OLLAMA_BASE_URL'
+        base_url = os.getenv(env_var, 'http://localhost:11434').rstrip('/')
+        try:
+            with urlopen(f"{base_url}/api/tags", timeout=2) as response:
+                if 200 <= getattr(response, "status", 200) < 500:
+                    return True, env_var
+        except (OSError, URLError):
+            return False, env_var
+        return True, env_var
         
     return False, ''
 

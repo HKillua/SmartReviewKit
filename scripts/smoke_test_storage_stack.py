@@ -251,9 +251,16 @@ def _exercise_vector_store(settings: Any) -> dict[str, Any]:
 
 
 async def _exercise_cache_and_rate_limit(settings: Any, raw_settings: dict[str, Any]) -> dict[str, Any]:
+    def _fake_embed(text: Any) -> list[float]:
+        if isinstance(text, list):
+            joined = " ".join(str(item) for item in text)
+        else:
+            joined = str(text)
+        return [1.0, 0.0] if "tcp" in joined.lower() else [0.0, 1.0]
+
     cache = create_semantic_cache(
         settings,
-        embedding_fn=lambda text: [1.0, 0.0] if "tcp" in text.lower() else [0.0, 1.0],
+        embedding_fn=_fake_embed,
         similarity_threshold=0.9,
         ttl_seconds=300,
         max_size=50,

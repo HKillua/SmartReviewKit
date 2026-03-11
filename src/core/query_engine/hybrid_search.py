@@ -16,11 +16,13 @@ Design Principles:
 from __future__ import annotations
 
 import logging
+import inspect
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
+from src.core.response.citation_generator import resolve_source_display
 from src.core.types import ProcessedQuery, RetrievalResult
 
 if TYPE_CHECKING:
@@ -52,7 +54,7 @@ def _snapshot_results(
             "chunk_id": r.chunk_id,
             "score": round(r.score, 4),
             "text": r.text or "",
-            "source": r.metadata.get("source_path", r.metadata.get("source", "")),
+            "source": resolve_source_display(r.metadata),
         }
         for r in results
     ]
@@ -304,7 +306,18 @@ class HybridSearch:
         
         # Step 5: Apply post-fusion metadata filters (if any)
         if merged_filters and self.config.metadata_filter_post:
+            before_filter_count = len(fused_results)
             fused_results = self._apply_metadata_filters(fused_results, merged_filters)
+            if trace is not None:
+                trace.record_stage(
+                    "metadata_filter_post",
+                    {
+                        "filters": merged_filters,
+                        "before_count": before_filter_count,
+                        "after_count": len(fused_results),
+                        "cleared_results": before_filter_count > 0 and len(fused_results) == 0,
+                    },
+                )
         
         # Step 6: Reranker (if enabled and available)
         if self.config.rerank_enabled and self.reranker is not None:
@@ -548,13 +561,23 @@ class HybridSearch:
         
         try:
             _t0 = time.monotonic()
-            results = self.dense_retriever.retrieve(
-                query=query,
-                top_k=self.config.dense_top_k,
-                filters=filters,
-                trace=trace,
-                query_vector=query_vector,
-            )
+            retrieve_kwargs = {
+                "query": query,
+                "top_k": self.config.dense_top_k,
+                "filters": filters,
+                "trace": trace,
+            }
+            try:
+                retrieve_signature = inspect.signature(self.dense_retriever.retrieve)
+            except (TypeError, ValueError):
+                retrieve_signature = None
+            if (
+                query_vector is not None
+                and retrieve_signature is not None
+                and "query_vector" in retrieve_signature.parameters
+            ):
+                retrieve_kwargs["query_vector"] = query_vector
+            results = self.dense_retriever.retrieve(**retrieve_kwargs)
             _elapsed = (time.monotonic() - _t0) * 1000.0
             if trace is not None:
                 trace.record_stage("dense_retrieval", {
@@ -859,14 +882,32 @@ class HybridSearch:
                 for c in reranked
             ]
             if trace is not None:
-                trace.record_stage("reranker", {
-                    "method": type(self.reranker).__name__,
-                    "input_count": len(results),
-                    "output_count": len(reranked_results),
-                }, elapsed_ms=_elapsed)
+                trace.record_stage(
+                    "rerank",
+                    {
+                        "method": type(self.reranker).__name__,
+                        "provider": type(self.reranker).__name__,
+                        "input_count": len(results),
+                        "output_count": len(reranked_results),
+                        "used_fallback": False,
+                    },
+                    elapsed_ms=_elapsed,
+                )
             logger.debug("Reranker: %d -> %d results", len(results), len(reranked_results))
             return reranked_results
         except Exception as exc:
+            if trace is not None:
+                trace.record_stage(
+                    "rerank",
+                    {
+                        "method": type(self.reranker).__name__ if self.reranker is not None else "none",
+                        "provider": type(self.reranker).__name__ if self.reranker is not None else "none",
+                        "input_count": len(results),
+                        "output_count": len(results),
+                        "used_fallback": True,
+                        "error": str(exc)[:300],
+                    },
+                )
             logger.warning("Reranker failed, returning original order: %s", exc)
             return results
 
@@ -885,6 +926,24 @@ class HybridSearch:
             True if all filters match, False otherwise.
         """
         for key, value in filters.items():
+            if isinstance(value, dict):
+                if "$in" in value:
+                    candidate_values = value.get("$in") or []
+                    if not isinstance(candidate_values, list):
+                        candidate_values = [candidate_values]
+                    meta_value = metadata.get(key)
+                    if isinstance(meta_value, list):
+                        if not set(meta_value) & set(candidate_values):
+                            return False
+                    elif meta_value not in candidate_values:
+                        return False
+                    continue
+                if "$eq" in value:
+                    if metadata.get(key) != value.get("$eq"):
+                        return False
+                    continue
+                logger.debug("Unsupported metadata filter operator for key '%s': %s", key, value)
+                return False
             if key == "collection":
                 # Collection might be in different metadata keys
                 meta_collection = (

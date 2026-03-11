@@ -7,10 +7,32 @@ can be used by AI assistants for source attribution.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+import re
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from src.core.types import RetrievalResult
+
+
+_CONTEXT_PREFIX_RE = re.compile(r"^\[上下文：[^\]]*\]\s*", re.MULTILINE)
+
+
+def sanitize_retrieval_text(text: str) -> str:
+    """Strip contextual prefixes and excessive path-heavy boilerplate for display."""
+    if not text:
+        return ""
+    sanitized = _CONTEXT_PREFIX_RE.sub("", text, count=1).strip()
+    return sanitized
+
+
+def resolve_source_display(metadata: Dict[str, Any] | None) -> str:
+    """Resolve the best human-readable source label for citations and UI."""
+    metadata = metadata or {}
+    for key in ("source_label", "original_filename", "source", "source_path", "object_uri", "object_key"):
+        value = metadata.get(key)
+        if value:
+            return str(value)
+    return "unknown"
 
 
 @dataclass
@@ -111,7 +133,7 @@ class CitationGenerator:
         metadata = result.metadata or {}
         
         # Extract source path
-        source = metadata.get("source_path", "unknown")
+        source = resolve_source_display(metadata)
         
         # Extract page number (may be int or string)
         page = metadata.get("page") or metadata.get("page_num")
@@ -127,7 +149,13 @@ class CitationGenerator:
         # Extract selected metadata fields
         extra_metadata = {}
         for field_name in self.include_metadata_fields:
-            if field_name in metadata and field_name not in ("source_path", "page", "page_num"):
+            if field_name in metadata and field_name not in (
+                "source_path",
+                "source_label",
+                "original_filename",
+                "page",
+                "page_num",
+            ):
                 extra_metadata[field_name] = metadata[field_name]
         
         return Citation(
@@ -152,8 +180,8 @@ class CitationGenerator:
         if not text:
             return ""
         
-        # Clean up whitespace
-        cleaned = " ".join(text.split())
+        # Remove contextual prefix before presenting snippets to users/LLMs.
+        cleaned = " ".join(sanitize_retrieval_text(text).split())
         
         if len(cleaned) <= self.snippet_max_length:
             return cleaned

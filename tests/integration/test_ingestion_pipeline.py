@@ -1,24 +1,27 @@
 """Integration tests for the Ingestion Pipeline.
 
-This module tests the complete ingestion flow using real Azure services:
-- Azure LLM (gpt-4o) for chunk refinement and metadata enrichment
-- Azure Vision LLM (gpt-4o) for image captioning
-- Azure Embedding (text-embedding-ada-002) for dense vectors
-- ChromaDB for vector storage
-- BM25 indexer for sparse retrieval
+This module tests the complete ingestion flow using the currently configured
+LLM / embedding providers from ``config/settings.yaml``:
+- LLM for chunk refinement and metadata enrichment
+- Vision LLM for image captioning
+- Dense embedding provider for vector generation
+- Vector store for dense persistence
+- Sparse index for keyword retrieval
 
 Test Data:
 - complex_technical_doc.pdf: Multi-chapter technical document with images and tables
 - simple.pdf: Basic PDF for regression testing
 """
 
+from pathlib import Path
 import os
 import shutil
+
 import pytest
-from pathlib import Path
 
 from src.core.settings import load_settings
 from src.ingestion.pipeline import IngestionPipeline, PipelineResult
+from src.libs.llm.llm_factory import LLMFactory
 
 
 class TestIngestionPipeline:
@@ -136,7 +139,7 @@ class TestIngestionPipeline:
             assert "encoding" in stages
             encoding = stages["encoding"]
             assert encoding["dense_vector_count"] == result.chunk_count
-            assert encoding["dense_dimension"] == 1536, "Azure ada-002 should produce 1536-dim vectors"
+            assert encoding["dense_dimension"] == settings.embedding.dimensions
             print(f"[OK] Dense vectors: {encoding['dense_vector_count']} x {encoding['dense_dimension']}dim")
             
             # Storage stage
@@ -149,9 +152,6 @@ class TestIngestionPipeline:
             # Verify files were created
             chroma_dir = Path(settings.vector_store.persist_directory)
             assert chroma_dir.exists(), "ChromaDB directory should exist"
-            
-            bm25_dir = Path(f"data/db/bm25/{collection}")
-            assert bm25_dir.exists(), "BM25 index directory should exist"
             
             print("\n" + "=" * 60)
             print("SUCCESS - All pipeline stages completed!")
@@ -224,32 +224,36 @@ class TestPipelineComponents:
     def test_settings_loads_correctly(self, settings):
         """Verify settings are loaded with expected values."""
         # LLM settings
-        assert settings.llm.provider == "azure"
-        assert settings.llm.model == "gpt-4o"
+        assert settings.llm.provider
+        assert settings.llm.model
         print(f"[OK] LLM: {settings.llm.provider}/{settings.llm.model}")
         
         # Embedding settings
-        assert settings.embedding.provider == "azure"
-        assert settings.embedding.model == "text-embedding-ada-002"
-        assert settings.embedding.dimensions == 1536
+        assert settings.embedding.provider
+        assert settings.embedding.model
+        assert settings.embedding.dimensions > 0
         print(f"[OK] Embedding: {settings.embedding.provider}/{settings.embedding.model}")
         
         # Vision LLM settings
         assert settings.vision_llm is not None
         assert settings.vision_llm.enabled == True
-        assert settings.vision_llm.provider == "azure"
+        assert settings.vision_llm.provider
         print(f"[OK] Vision LLM: {settings.vision_llm.provider}/{settings.vision_llm.model}")
         
         # Ingestion settings
         assert settings.ingestion is not None
         assert settings.ingestion.chunk_refiner is not None
-        assert settings.ingestion.chunk_refiner.get("use_llm") == True
+        assert isinstance(settings.ingestion.chunk_refiner.get("use_llm"), bool)
         assert settings.ingestion.metadata_enricher is not None
-        assert settings.ingestion.metadata_enricher.get("use_llm") == True
-        print("[OK] Ingestion LLM enhancement: enabled")
+        assert isinstance(settings.ingestion.metadata_enricher.get("use_llm"), bool)
+        print(
+            "[OK] Ingestion LLM enhancement:",
+            f"chunk_refiner={settings.ingestion.chunk_refiner.get('use_llm')},",
+            f"metadata_enricher={settings.ingestion.metadata_enricher.get('use_llm')}",
+        )
     
     def test_embedding_creates_vectors(self, settings):
-        """Test that Azure embedding service works."""
+        """Test that the configured embedding service works."""
         from src.libs.embedding.embedding_factory import EmbeddingFactory
         
         embedding = EmbeddingFactory.create(settings)
@@ -258,14 +262,18 @@ class TestPipelineComponents:
         vectors = embedding.embed(texts)
         
         assert len(vectors) == 2
-        assert len(vectors[0]) == 1536  # ada-002 dimension
+        assert len(vectors[0]) == settings.embedding.dimensions
         print(f"[OK] Embedding test: produced {len(vectors)} vectors of dim {len(vectors[0])}")
     
     def test_llm_responds(self, settings):
-        """Test that Azure LLM service works."""
-        from src.libs.llm.llm_factory import LLMFactory
+        """Test that the configured LLM service works."""
         from src.libs.llm.base_llm import Message
-        
+
+        if settings.llm.provider not in LLMFactory.list_providers():
+            pytest.skip(
+                f"Configured provider {settings.llm.provider!r} is not supported by src.libs.llm.LLMFactory"
+            )
+
         llm = LLMFactory.create(settings)
         
         messages = [

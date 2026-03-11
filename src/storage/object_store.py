@@ -49,6 +49,10 @@ class ObjectStore(ABC):
     def uri_for(self, key: str) -> str:
         raise NotImplementedError
 
+    @abstractmethod
+    def key_from_uri(self, uri: str) -> Optional[str]:
+        raise NotImplementedError
+
 
 class LocalObjectStore(ObjectStore):
     """Filesystem-backed object store for development and tests."""
@@ -96,6 +100,16 @@ class LocalObjectStore(ObjectStore):
 
     def uri_for(self, key: str) -> str:
         return str(self._resolve(key))
+
+    def key_from_uri(self, uri: str) -> Optional[str]:
+        try:
+            path = Path(uri).resolve()
+        except Exception:
+            return None
+        root = self._root.resolve()
+        if not str(path).startswith(str(root)):
+            return None
+        return str(path.relative_to(root)).replace("\\", "/")
 
 
 class MinioObjectStore(ObjectStore):
@@ -161,6 +175,12 @@ class MinioObjectStore(ObjectStore):
 
     def uri_for(self, key: str) -> str:
         return f"minio://{self._bucket}/{key}"
+
+    def key_from_uri(self, uri: str) -> Optional[str]:
+        prefix = f"minio://{self._bucket}/"
+        if not uri.startswith(prefix):
+            return None
+        return uri[len(prefix):]
 
 
 def _cfg_value(cfg: Any, name: str, default: Any) -> Any:
