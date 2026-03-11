@@ -43,12 +43,17 @@ class TestAgentEvaluationPanelHelpers:
 class TestAgentTracesHelpers:
     def test_extract_tool_chain_and_query_trace_ids(self) -> None:
         from src.observability.dashboard.pages.agent_traces import (
+            _extract_planner_info,
             _extract_linked_query_trace_ids,
             _extract_tool_chain,
         )
 
         trace = {
-            "metadata": {"status": "success"},
+            "metadata": {
+                "status": "success",
+                "planner_task_intent": "review_summary",
+                "planner_control_mode": "force_tool",
+            },
             "stages": [
                 {
                     "stage": "tool_execution",
@@ -63,6 +68,7 @@ class TestAgentTracesHelpers:
 
         assert _extract_tool_chain(trace) == ["knowledge_query", "review_summary"]
         assert _extract_linked_query_trace_ids(trace) == ["q1"]
+        assert _extract_planner_info(trace)["task_intent"] == "review_summary"
 
     def test_filter_agent_traces_by_keyword_tool_and_status(self) -> None:
         from src.observability.dashboard.pages.agent_traces import _filter_agent_traces
@@ -99,4 +105,3 @@ class TestAgentTracesHelpers:
 
         assert hasattr(agent_traces, "render")
         assert hasattr(agent_evaluation_panel, "render")
-

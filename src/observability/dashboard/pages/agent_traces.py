@@ -61,6 +61,35 @@ def _extract_linked_query_trace_ids(trace: Dict[str, Any]) -> List[str]:
     return query_trace_ids
 
 
+def _extract_planner_info(trace: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = trace.get("metadata", {})
+    planner_info = {
+        "task_intent": metadata.get("planner_task_intent", ""),
+        "control_mode": metadata.get("planner_control_mode", ""),
+        "final_control_mode": metadata.get("planner_final_control_mode", ""),
+        "selected_tool": metadata.get("planner_selected_tool", ""),
+        "confidence": metadata.get("planner_confidence", ""),
+        "match_method": metadata.get("planner_match_method", ""),
+        "violation_count": metadata.get("planner_violation_count", 0),
+    }
+    if planner_info["task_intent"]:
+        return planner_info
+    for stage in trace.get("stages", []):
+        if stage.get("stage") == "planner_decision":
+            data = stage.get("data", {})
+            planner_info.update(
+                {
+                    "task_intent": data.get("task_intent", ""),
+                    "control_mode": data.get("control_mode", ""),
+                    "selected_tool": data.get("selected_tool", ""),
+                    "confidence": data.get("confidence", ""),
+                    "match_method": data.get("match_method", ""),
+                }
+            )
+            break
+    return planner_info
+
+
 def _filter_agent_traces(
     traces: List[Dict[str, Any]],
     keyword: str = "",
@@ -145,6 +174,7 @@ def render() -> None:
         message_preview = str(metadata.get("message_preview", "")) or "—"
         tool_chain = _extract_tool_chain(trace)
         query_trace_ids = _extract_linked_query_trace_ids(trace)
+        planner_info = _extract_planner_info(trace)
 
         expander_title = (
             f"🤖 {message_preview[:50]}{'…' if len(message_preview) > 50 else ''} "
@@ -173,6 +203,10 @@ def render() -> None:
                     ]
                 )
             )
+
+            if planner_info.get("task_intent"):
+                st.markdown("**Planner Decision**")
+                st.json(planner_info)
 
             if tool_chain:
                 st.markdown("**Tool Chain**")

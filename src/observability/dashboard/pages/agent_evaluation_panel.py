@@ -161,6 +161,8 @@ def _render_case_details(report: Dict[str, Any]) -> None:
                         "forbidden_answer_substrings": result.get(
                             "forbidden_answer_substrings", []
                         ),
+                        "expected_planner_intent": result.get("expected_planner_intent", ""),
+                        "expected_control_mode": result.get("expected_control_mode", ""),
                     }
                 )
             with compare_cols[1]:
@@ -169,6 +171,8 @@ def _render_case_details(report: Dict[str, Any]) -> None:
                     {
                         "actual_tool_chain": result.get("actual_tool_chain", []),
                         "iterations": result.get("iterations", 0),
+                        "actual_planner_intent": result.get("actual_planner_intent", ""),
+                        "actual_control_mode": result.get("actual_control_mode", ""),
                         "final_answer": result.get("final_answer", ""),
                     }
                 )

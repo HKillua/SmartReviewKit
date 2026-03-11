@@ -36,6 +36,8 @@ async def test_agent_eval_runner_reconstructs_case_outputs(tmp_path: Path) -> No
                         "forbidden_tools": ["document_ingest"],
                         "expected_answer_substrings": ["TCP"],
                         "forbidden_answer_substrings": ["I do not know"],
+                        "expected_planner_intent": "knowledge_query",
+                        "expected_control_mode": "advisory",
                     }
                 ]
             }
@@ -46,6 +48,10 @@ async def test_agent_eval_runner_reconstructs_case_outputs(tmp_path: Path) -> No
     trace_service = MagicMock()
     trace_service.get_trace.return_value = {
         "trace_id": "agent-trace-1",
+        "metadata": {
+            "planner_task_intent": "knowledge_query",
+            "planner_final_control_mode": "advisory",
+        },
         "stages": [
             {"stage": "llm_iteration"},
             {"stage": "tool_execution"},
@@ -85,6 +91,8 @@ async def test_agent_eval_runner_reconstructs_case_outputs(tmp_path: Path) -> No
     assert case.final_answer == "TCP answer"
     assert case.trace_id == "agent-trace-1"
     assert case.iterations == 2
+    assert case.actual_planner_intent == "knowledge_query"
+    assert case.actual_control_mode == "advisory"
     assert case.tool_errors == [
         {
             "tool_name": "knowledge_query",
@@ -95,6 +103,8 @@ async def test_agent_eval_runner_reconstructs_case_outputs(tmp_path: Path) -> No
     ]
     assert case.metrics["success"] == 1.0
     assert case.metrics["expected_tool_recall"] == 1.0
+    assert case.metrics["planner_intent_hit_rate"] == 1.0
+    assert case.metrics["planner_control_mode_hit_rate"] == 1.0
     assert report.aggregate_metrics["success_rate"] == 1.0
     assert report.aggregate_metrics["avg_iterations"] == 2.0
 

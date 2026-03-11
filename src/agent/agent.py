@@ -18,6 +18,7 @@ from src.agent.conversation import ConversationStore
 from src.agent.hooks.lifecycle import LifecycleHook
 from src.agent.hooks.middleware import LlmMiddleware
 from src.agent.llm.base import LlmService
+from src.agent.planner import ControlMode, PlannerDecision, TaskPlanner
 from src.agent.prompt_builder import SystemPromptBuilder
 from src.agent.tools.base import ToolRegistry
 from src.agent.types import (
@@ -67,6 +68,43 @@ def _summarize_arguments(arguments: dict) -> dict:
     return summary
 
 
+def _restrict_tool_schemas(tool_schemas: list[dict], tool_name: str) -> list[dict]:
+    restricted = [
+        schema
+        for schema in tool_schemas
+        if schema.get("function", {}).get("name") == tool_name
+    ]
+    return restricted or tool_schemas
+
+
+def _build_planner_context(decision: PlannerDecision | None) -> str:
+    if decision is None or decision.control_mode == ControlMode.PASS_THROUGH:
+        return ""
+    lines = [
+        f"任务识别: {decision.task_intent.value}",
+        f"控制策略: {decision.control_mode.value}",
+        f"置信度: {decision.confidence:.2f}",
+        f"匹配方式: {decision.match_method}",
+    ]
+    if decision.selected_tool:
+        lines.append(f"建议工具: {decision.selected_tool}")
+    if decision.planner_hint:
+        lines.append(f"执行提示: {decision.planner_hint}")
+    return "\n".join(f"- {line}" for line in lines)
+
+
+def _planner_metadata(decision: PlannerDecision | None) -> dict[str, object]:
+    if decision is None:
+        return {}
+    return {
+        "planner_task_intent": decision.task_intent.value,
+        "planner_control_mode": decision.control_mode.value,
+        "planner_selected_tool": decision.selected_tool,
+        "planner_confidence": round(decision.confidence, 3),
+        "planner_match_method": decision.match_method,
+    }
+
+
 def _accumulate_tool_calls(chunks: list[LlmStreamChunk]) -> list[ToolCallData] | None:
     """Reassemble streamed tool-call deltas into complete ToolCallData objects."""
     by_index: dict[int, dict] = {}
@@ -111,6 +149,7 @@ class Agent:
         lifecycle_hooks: list[LifecycleHook] | None = None,
         llm_middlewares: list[LlmMiddleware] | None = None,
         memory_enhancer: object | None = None,
+        task_planner: TaskPlanner | None = None,
         skill_workflow: object | None = None,
         context_filter: object | None = None,
         review_hook: object | None = None,
@@ -125,6 +164,7 @@ class Agent:
         self.hooks = lifecycle_hooks or []
         self.middlewares = llm_middlewares or []
         self.memory_enhancer = memory_enhancer
+        self.task_planner = task_planner
         self.skill_workflow = skill_workflow
         self.context_filter = context_filter
         self.review_hook = review_hook
@@ -244,11 +284,36 @@ class Agent:
 
             skill_ctx = ""
             direct_response = ""
+            matched_skill = ""
             if wf_result is not None:
                 if hasattr(wf_result, "direct_response") and wf_result.direct_response:
                     direct_response = wf_result.direct_response
                 if hasattr(wf_result, "skill_instruction") and wf_result.skill_instruction:
                     skill_ctx = wf_result.skill_instruction
+                if hasattr(wf_result, "matched_skill") and wf_result.matched_skill:
+                    matched_skill = wf_result.matched_skill
+
+            planner_decision: PlannerDecision | None = None
+            planner_context = ""
+            if self.task_planner is not None:
+                try:
+                    planner_decision = self.task_planner.plan(
+                        effective_message,
+                        matched_skill=matched_skill or None,
+                    )
+                    planner_context = _build_planner_context(planner_decision)
+                except Exception:
+                    logger.exception("Task planner failed")
+
+            planner_runtime: dict[str, object] = {
+                "final_control_mode": (
+                    planner_decision.control_mode.value
+                    if planner_decision is not None
+                    else ControlMode.PASS_THROUGH.value
+                ),
+                "violation_count": 0,
+                "force_retry_count": 0,
+            }
 
             if agent_trace is not None:
                 agent_trace.record_stage(
@@ -261,11 +326,15 @@ class Agent:
                     },
                     elapsed_ms=(time.monotonic() - preprocess_started) * 1000.0,
                 )
+                if planner_decision is not None:
+                    agent_trace.record_stage("planner_decision", planner_decision.to_metadata())
+                    agent_trace.metadata.update(_planner_metadata(planner_decision))
 
             prompt_started = time.monotonic()
             system_prompt = self.prompt_builder.build(
                 tool_schemas=tool_schemas,
                 memory_context=memory_ctx,
+                planner_context=planner_context,
                 active_skill=skill_ctx,
             )
             if agent_trace is not None:
@@ -296,6 +365,9 @@ class Agent:
                 }
                 if agent_trace is not None:
                     done_metadata["trace_id"] = agent_trace.trace_id
+                done_metadata.update(_planner_metadata(planner_decision))
+                done_metadata["planner_final_control_mode"] = planner_runtime["final_control_mode"]
+                done_metadata["planner_violation_count"] = planner_runtime["violation_count"]
                 yield StreamEvent(type=StreamEventType.DONE, metadata=done_metadata)
                 return
 
@@ -307,6 +379,8 @@ class Agent:
             tool_metadata = {}
             if agent_trace is not None:
                 tool_metadata["agent_trace_id"] = agent_trace.trace_id
+            if planner_decision is not None:
+                tool_metadata.update(_planner_metadata(planner_decision))
             tool_ctx = ToolContext(
                 user_id=user_id,
                 conversation_id=conversation.id,
@@ -318,7 +392,13 @@ class Agent:
             # --- Tool loop ---
             try:
                 async for event in self._tool_loop(
-                    conversation, system_prompt, tool_schemas, tool_ctx, trace=agent_trace
+                    conversation,
+                    system_prompt,
+                    tool_schemas,
+                    tool_ctx,
+                    trace=agent_trace,
+                    planner_decision=planner_decision,
+                    planner_runtime=planner_runtime,
                 ):
                     yield event
             except Exception as exc:
@@ -337,6 +417,11 @@ class Agent:
             }
             if agent_trace is not None:
                 done_metadata["trace_id"] = agent_trace.trace_id
+                agent_trace.metadata["planner_final_control_mode"] = planner_runtime["final_control_mode"]
+                agent_trace.metadata["planner_violation_count"] = planner_runtime["violation_count"]
+            done_metadata.update(_planner_metadata(planner_decision))
+            done_metadata["planner_final_control_mode"] = planner_runtime["final_control_mode"]
+            done_metadata["planner_violation_count"] = planner_runtime["violation_count"]
             yield StreamEvent(type=StreamEventType.DONE, metadata=done_metadata)
 
             task = asyncio.create_task(self._post_message_tasks(conversation))
@@ -383,6 +468,8 @@ class Agent:
         tool_schemas: list[dict],
         tool_ctx: ToolContext,
         trace: TraceContext | None = None,
+        planner_decision: PlannerDecision | None = None,
+        planner_runtime: dict[str, object] | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Inner ReAct loop: call LLM -> execute tools -> repeat.
 
@@ -390,16 +477,51 @@ class Agent:
         in real-time as each token arrives from the LLM, instead of being
         buffered into a list first.
         """
+        force_active = (
+            planner_decision is not None
+            and planner_decision.control_mode == ControlMode.FORCE_TOOL
+            and bool(planner_decision.selected_tool)
+        )
+        force_retry_limit = 1
+
         for iteration in range(self.config.max_tool_iterations):
             iteration_started = time.monotonic()
-            llm_messages = await self._build_llm_messages(conversation, system_prompt)
+            iteration_prompt = system_prompt
+            available_tool_schemas = tool_schemas
+            effective_control_mode = (
+                planner_runtime.get("final_control_mode")
+                if planner_runtime is not None
+                else (
+                    planner_decision.control_mode.value
+                    if planner_decision is not None
+                    else ControlMode.PASS_THROUGH.value
+                )
+            )
+
+            if force_active and planner_decision is not None:
+                available_tool_schemas = _restrict_tool_schemas(
+                    tool_schemas,
+                    planner_decision.selected_tool,
+                )
+                reminder = (
+                    f"你必须先调用工具 `{planner_decision.selected_tool}`，"
+                    "不要直接回答用户。"
+                )
+                if planner_runtime is not None and int(planner_runtime.get("force_retry_count", 0)) > 0:
+                    reminder = (
+                        f"上一次你没有调用 `{planner_decision.selected_tool}`。"
+                        f"这一次必须先调用 `{planner_decision.selected_tool}`，然后再继续回答。"
+                    )
+                iteration_prompt = system_prompt + f"\n\n## [Planner Enforcement]\n{reminder}"
+
+            llm_messages = await self._build_llm_messages(conversation, iteration_prompt)
 
             request = LlmRequest(
                 messages=llm_messages,
-                tools=tool_schemas if tool_schemas else None,
+                tools=available_tool_schemas if available_tool_schemas else None,
                 temperature=self.config.temperature,
                 max_tokens=self.config.max_tokens,
-                stream=self.config.stream_responses,
+                stream=self.config.stream_responses and not force_active,
             )
 
             for mw in self.middlewares:
@@ -443,6 +565,13 @@ class Agent:
                 "tool_call_count": len(response.tool_calls or []),
                 "output_text_length": len(response.content or ""),
                 "had_error": bool(response.error),
+                "planner_control_mode": effective_control_mode,
+                "planner_forced_tool": (
+                    planner_decision.selected_tool
+                    if force_active and planner_decision is not None
+                    else ""
+                ),
+                "visible_tool_count": len(available_tool_schemas),
             }
             if trace is not None:
                 trace.record_stage(
@@ -545,6 +674,46 @@ class Agent:
                             elapsed_ms=(time.monotonic() - tool_started) * 1000.0,
                         )
 
+                if force_active:
+                    force_active = False
+                continue
+
+            if force_active and planner_decision is not None:
+                if trace is not None:
+                    trace.record_stage(
+                        "planner_violation",
+                        {
+                            "iteration": iteration + 1,
+                            "selected_tool": planner_decision.selected_tool,
+                            "force_retry_count": (
+                                planner_runtime.get("force_retry_count", 0)
+                                if planner_runtime is not None
+                                else 0
+                            ),
+                            "action": "retry_force_tool",
+                        },
+                    )
+                if planner_runtime is not None:
+                    planner_runtime["violation_count"] = int(
+                        planner_runtime.get("violation_count", 0)
+                    ) + 1
+                if planner_runtime is not None and int(planner_runtime.get("force_retry_count", 0)) < force_retry_limit:
+                    planner_runtime["force_retry_count"] = int(
+                        planner_runtime.get("force_retry_count", 0)
+                    ) + 1
+                    continue
+                force_active = False
+                if planner_runtime is not None:
+                    planner_runtime["final_control_mode"] = ControlMode.ADVISORY.value
+                if trace is not None:
+                    trace.record_stage(
+                        "planner_violation",
+                        {
+                            "iteration": iteration + 1,
+                            "selected_tool": planner_decision.selected_tool,
+                            "action": "downgrade_to_advisory",
+                        },
+                    )
                 continue
 
             if response.content and not request.stream:

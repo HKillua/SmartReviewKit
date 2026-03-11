@@ -25,6 +25,8 @@ class AgentGoldenTestCase:
     forbidden_tools: List[str] = field(default_factory=list)
     expected_answer_substrings: List[str] = field(default_factory=list)
     forbidden_answer_substrings: List[str] = field(default_factory=list)
+    expected_planner_intent: str = ""
+    expected_control_mode: str = ""
     notes: str = ""
 
     @classmethod
@@ -42,6 +44,8 @@ class AgentGoldenTestCase:
             forbidden_answer_substrings=[
                 str(v) for v in data.get("forbidden_answer_substrings", [])
             ],
+            expected_planner_intent=str(data.get("expected_planner_intent", "")),
+            expected_control_mode=str(data.get("expected_control_mode", "")),
             notes=str(data.get("notes", "")),
         )
 
@@ -56,10 +60,14 @@ class AgentEvalCaseResult:
     forbidden_tools: List[str] = field(default_factory=list)
     expected_answer_substrings: List[str] = field(default_factory=list)
     forbidden_answer_substrings: List[str] = field(default_factory=list)
+    expected_planner_intent: str = ""
+    expected_control_mode: str = ""
     notes: str = ""
     actual_tool_chain: List[str] = field(default_factory=list)
     final_answer: str = ""
     trace_id: str = ""
+    actual_planner_intent: str = ""
+    actual_control_mode: str = ""
     error: str = ""
     tool_errors: List[Dict[str, Any]] = field(default_factory=list)
     metrics: Dict[str, float] = field(default_factory=dict)
@@ -95,10 +103,14 @@ class AgentEvalReport:
                     "forbidden_tools": list(result.forbidden_tools),
                     "expected_answer_substrings": list(result.expected_answer_substrings),
                     "forbidden_answer_substrings": list(result.forbidden_answer_substrings),
+                    "expected_planner_intent": result.expected_planner_intent,
+                    "expected_control_mode": result.expected_control_mode,
                     "notes": result.notes,
                     "actual_tool_chain": list(result.actual_tool_chain),
                     "final_answer": result.final_answer,
                     "trace_id": result.trace_id,
+                    "actual_planner_intent": result.actual_planner_intent,
+                    "actual_control_mode": result.actual_control_mode,
                     "error": result.error,
                     "tool_errors": list(result.tool_errors),
                     "metrics": {
@@ -187,8 +199,18 @@ class AgentEvalRunner:
 
         final_answer = "".join(text_parts).strip()
         iterations = self._lookup_iterations(trace_id)
+        planner_intent, control_mode = self._lookup_planner(trace_id)
         elapsed_ms = (time.monotonic() - started) * 1000.0
-        metrics = self._score_case(case, tool_chain, final_answer, error, iterations, elapsed_ms)
+        metrics = self._score_case(
+            case,
+            tool_chain,
+            final_answer,
+            error,
+            iterations,
+            elapsed_ms,
+            planner_intent,
+            control_mode,
+        )
 
         return AgentEvalCaseResult(
             id=case.id,
@@ -197,10 +219,14 @@ class AgentEvalRunner:
             forbidden_tools=list(case.forbidden_tools),
             expected_answer_substrings=list(case.expected_answer_substrings),
             forbidden_answer_substrings=list(case.forbidden_answer_substrings),
+            expected_planner_intent=case.expected_planner_intent,
+            expected_control_mode=case.expected_control_mode,
             notes=case.notes,
             actual_tool_chain=tool_chain,
             final_answer=final_answer,
             trace_id=trace_id,
+            actual_planner_intent=planner_intent,
+            actual_control_mode=control_mode,
             error=error,
             tool_errors=tool_errors,
             metrics=metrics,
@@ -217,6 +243,28 @@ class AgentEvalRunner:
         stages = trace.get("stages", [])
         return sum(1 for stage in stages if stage.get("stage") == "llm_iteration")
 
+    def _lookup_planner(self, trace_id: str) -> tuple[str, str]:
+        if not trace_id:
+            return "", ""
+        trace = self.trace_service.get_trace(trace_id)
+        if not trace:
+            return "", ""
+        metadata = trace.get("metadata", {})
+        task_intent = str(metadata.get("planner_task_intent", ""))
+        control_mode = str(
+            metadata.get(
+                "planner_final_control_mode",
+                metadata.get("planner_control_mode", ""),
+            )
+        )
+        if task_intent and control_mode:
+            return task_intent, control_mode
+        for stage in trace.get("stages", []):
+            if stage.get("stage") == "planner_decision":
+                data = stage.get("data", {})
+                return str(data.get("task_intent", "")), str(data.get("control_mode", ""))
+        return "", ""
+
     def _score_case(
         self,
         case: AgentGoldenTestCase,
@@ -225,6 +273,8 @@ class AgentEvalRunner:
         error: str,
         iterations: int,
         elapsed_ms: float,
+        planner_intent: str,
+        control_mode: str,
     ) -> Dict[str, float]:
         expected_hit_count = sum(1 for tool in case.expected_tools if tool in tool_chain)
         forbidden_tool_violations = sum(
@@ -235,6 +285,16 @@ class AgentEvalRunner:
         )
         forbidden_answer_hits = sum(
             1 for snippet in case.forbidden_answer_substrings if snippet in final_answer
+        )
+        planner_intent_hit = (
+            1.0
+            if not case.expected_planner_intent
+            else float(case.expected_planner_intent == planner_intent)
+        )
+        planner_control_mode_hit = (
+            1.0
+            if not case.expected_control_mode
+            else float(case.expected_control_mode == control_mode)
         )
 
         return {
@@ -251,6 +311,8 @@ class AgentEvalRunner:
                 else 1.0
             ),
             "answer_forbidden_pass_rate": 0.0 if forbidden_answer_hits else 1.0,
+            "planner_intent_hit_rate": planner_intent_hit,
+            "planner_control_mode_hit_rate": planner_control_mode_hit,
             "tool_calls": float(len(tool_chain)),
             "iterations": float(iterations),
             "latency_ms": elapsed_ms,
@@ -273,6 +335,12 @@ class AgentEvalRunner:
         answer_forbidden_pass_rate = sum(
             result.metrics.get("answer_forbidden_pass_rate", 0.0) for result in results
         ) / len(results)
+        planner_intent_hit_rate = sum(
+            result.metrics.get("planner_intent_hit_rate", 0.0) for result in results
+        ) / len(results)
+        planner_control_mode_hit_rate = sum(
+            result.metrics.get("planner_control_mode_hit_rate", 0.0) for result in results
+        ) / len(results)
         avg_tool_calls = sum(len(result.actual_tool_chain) for result in results) / len(results)
         avg_iterations = sum(result.iterations for result in results) / len(results)
         avg_latency_ms = sum(result.elapsed_ms for result in results) / len(results)
@@ -283,6 +351,8 @@ class AgentEvalRunner:
             "forbidden_tool_pass_rate": forbidden_tool_pass_rate,
             "answer_keyword_recall": answer_keyword_recall,
             "answer_forbidden_pass_rate": answer_forbidden_pass_rate,
+            "planner_intent_hit_rate": planner_intent_hit_rate,
+            "planner_control_mode_hit_rate": planner_control_mode_hit_rate,
             "avg_tool_calls": avg_tool_calls,
             "avg_iterations": avg_iterations,
             "avg_latency_ms": avg_latency_ms,

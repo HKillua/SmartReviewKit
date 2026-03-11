@@ -86,6 +86,91 @@ class _AlwaysToolLlm:
         )
 
 
+class _PlannerForceLlm:
+    def __init__(self) -> None:
+        self.seen_tools = []
+        self.calls = 0
+
+    async def send_request(self, request):
+        self.calls += 1
+        self.seen_tools.append(
+            [tool.get("function", {}).get("name") for tool in request.tools or []]
+        )
+        if self.calls == 1:
+            return LlmResponse(
+                content="Need review summary",
+                tool_calls=[
+                    ToolCallData(
+                        id="tc_1",
+                        name="review_summary",
+                        arguments={"topic": "DNS"},
+                    )
+                ],
+            )
+        return LlmResponse(content="Here is the final review summary.")
+
+
+class _PlannerViolationLlm:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.seen_tools = []
+
+    async def send_request(self, request):
+        self.calls += 1
+        self.seen_tools.append(
+            [tool.get("function", {}).get("name") for tool in request.tools or []]
+        )
+        if self.calls <= 2:
+            return LlmResponse(content="I will answer directly without tools.")
+        if self.calls == 3:
+            return LlmResponse(
+                content="Now I will use a tool.",
+                tool_calls=[
+                    ToolCallData(
+                        id="tc_1",
+                        name="review_summary",
+                        arguments={"topic": "DNS"},
+                    )
+                ],
+            )
+        return LlmResponse(content="Done after downgrade.")
+
+
+class _ReviewSummaryTool:
+    @property
+    def name(self) -> str:
+        return "review_summary"
+
+    @property
+    def description(self) -> str:
+        return "fake review summary tool"
+
+    def get_args_schema(self):
+        class _Args(BaseModel):
+            topic: str = Field(default="")
+
+        return _Args
+
+    async def execute(self, context, args):
+        from src.agent.types import ToolResult
+
+        return ToolResult(success=True, result_for_llm=f"summary for {args.topic}")
+
+    def get_schema(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.get_args_schema().model_json_schema(),
+            },
+        }
+
+
+class _DummyKnowledgeTool(_TraceAwareTool):
+    pass
+
+
 @pytest.mark.asyncio
 async def test_agent_done_event_contains_trace_id_and_agent_trace(tmp_path: Path) -> None:
     from src.agent.agent import Agent
@@ -218,3 +303,118 @@ async def test_knowledge_query_returns_query_trace_id_and_parent_link(tmp_path: 
     assert trace["trace_type"] == "query"
     assert trace["metadata"]["source"] == "agent"
     assert trace["metadata"]["parent_agent_trace_id"] == "agent-trace-xyz"
+
+
+@pytest.mark.asyncio
+async def test_force_tool_first_round_only_exposes_selected_tool_schema(tmp_path: Path) -> None:
+    from src.agent.agent import Agent
+    from src.agent.config import AgentConfig
+    from src.agent.conversation import ConversationStore
+    from src.agent.planner import ControlMode, PlannerDecision, TaskIntent
+    from src.agent.tools.base import ToolRegistry
+
+    class _StubPlanner:
+        def plan(self, message, matched_skill=None):
+            return PlannerDecision(
+                task_intent=TaskIntent.REVIEW_SUMMARY,
+                confidence=1.0,
+                match_method="rule",
+                control_mode=ControlMode.FORCE_TOOL,
+                selected_tool="review_summary",
+                planner_hint="Use review_summary first.",
+            )
+
+    trace_path = tmp_path / "planner_force.jsonl"
+    collector = TraceCollector(traces_path=trace_path)
+    conversation = Conversation(id="conv_force", user_id="u1", messages=[])
+    store = AsyncMock(spec=ConversationStore)
+    store.get.return_value = conversation
+    store.create.return_value = conversation
+    store.update.return_value = None
+
+    registry = ToolRegistry()
+    registry.register(_ReviewSummaryTool())
+    registry.register(_DummyKnowledgeTool())
+
+    llm = _PlannerForceLlm()
+    agent = Agent(
+        llm_service=llm,
+        tool_registry=registry,
+        conversation_store=store,
+        config=AgentConfig(stream_responses=False, max_tool_iterations=3),
+        task_planner=_StubPlanner(),
+        trace_enabled=True,
+        trace_collector=collector,
+    )
+
+    events = [event async for event in agent.chat("帮我复习 DNS", "u1", "conv_force")]
+    done_event = next(event for event in events if event.type.value == "done")
+
+    assert llm.seen_tools[0] == ["review_summary"]
+    assert set(llm.seen_tools[1]) == {"review_summary", "knowledge_query"}
+    assert done_event.metadata["planner_task_intent"] == "review_summary"
+    assert done_event.metadata["planner_control_mode"] == "force_tool"
+    trace = TraceService(trace_path).get_trace(done_event.metadata["trace_id"])
+    assert trace is not None
+    planner_stage = next(stage for stage in trace["stages"] if stage["stage"] == "planner_decision")
+    assert planner_stage["data"]["selected_tool"] == "review_summary"
+
+
+@pytest.mark.asyncio
+async def test_planner_violation_retries_then_downgrades_to_advisory(tmp_path: Path) -> None:
+    from src.agent.agent import Agent
+    from src.agent.config import AgentConfig
+    from src.agent.conversation import ConversationStore
+    from src.agent.planner import ControlMode, PlannerDecision, TaskIntent
+    from src.agent.tools.base import ToolRegistry
+
+    class _StubPlanner:
+        def plan(self, message, matched_skill=None):
+            return PlannerDecision(
+                task_intent=TaskIntent.REVIEW_SUMMARY,
+                confidence=1.0,
+                match_method="rule",
+                control_mode=ControlMode.FORCE_TOOL,
+                selected_tool="review_summary",
+                planner_hint="Use review_summary first.",
+            )
+
+    trace_path = tmp_path / "planner_violation.jsonl"
+    collector = TraceCollector(traces_path=trace_path)
+    conversation = Conversation(id="conv_violation", user_id="u1", messages=[])
+    store = AsyncMock(spec=ConversationStore)
+    store.get.return_value = conversation
+    store.create.return_value = conversation
+    store.update.return_value = None
+
+    registry = ToolRegistry()
+    registry.register(_ReviewSummaryTool())
+    registry.register(_DummyKnowledgeTool())
+
+    llm = _PlannerViolationLlm()
+    agent = Agent(
+        llm_service=llm,
+        tool_registry=registry,
+        conversation_store=store,
+        config=AgentConfig(stream_responses=False, max_tool_iterations=4),
+        task_planner=_StubPlanner(),
+        trace_enabled=True,
+        trace_collector=collector,
+    )
+
+    events = [event async for event in agent.chat("帮我复习 DNS", "u1", "conv_violation")]
+    done_event = next(event for event in events if event.type.value == "done")
+
+    assert llm.seen_tools[0] == ["review_summary"]
+    assert llm.seen_tools[1] == ["review_summary"]
+    assert set(llm.seen_tools[2]) == {"review_summary", "knowledge_query"}
+    assert done_event.metadata["planner_final_control_mode"] == "advisory"
+    assert done_event.metadata["planner_violation_count"] == 2
+
+    trace = TraceService(trace_path).get_trace(done_event.metadata["trace_id"])
+    assert trace is not None
+    planner_violations = [
+        stage for stage in trace["stages"]
+        if stage["stage"] == "planner_violation"
+    ]
+    assert len(planner_violations) >= 2

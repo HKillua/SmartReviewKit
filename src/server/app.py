@@ -33,6 +33,7 @@ from src.agent.memory.knowledge_map import KnowledgeMapMemory
 from src.agent.memory.session_memory import SessionMemory
 from src.agent.memory.skill_memory import SkillMemory
 from src.agent.memory.student_profile import StudentProfileMemory
+from src.agent.planner import TaskPlanner
 from src.agent.prompt_builder import SystemPromptBuilder
 from src.agent.skills.registry import SkillRegistry
 from src.agent.skills.workflow import SkillWorkflowHandler
@@ -285,6 +286,9 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
     # --- Skills ---
     skill_registry = SkillRegistry(agent_cfg.skills_dir)
     skill_workflow = SkillWorkflowHandler(skill_registry)
+    task_planner = TaskPlanner(
+        embedding_fn=cached_embedding.embed if cached_embedding is not None else None,
+    )
 
     # --- Conversation ---
     conv_store = FileConversationStore(agent_cfg.conversation_store_dir)
@@ -328,6 +332,7 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         lifecycle_hooks=hooks,
         llm_middlewares=llm_middlewares,
         memory_enhancer=memory_enhancer,
+        task_planner=task_planner,
         skill_workflow=skill_workflow,
         context_filter=context_filter,
         review_hook=review_hook,

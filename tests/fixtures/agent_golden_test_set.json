@@ -11,6 +11,8 @@
       "forbidden_tools": ["document_ingest"],
       "expected_answer_substrings": ["TCP", "三次握手"],
       "forbidden_answer_substrings": ["无法回答"],
+      "expected_planner_intent": "knowledge_query",
+      "expected_control_mode": "advisory",
       "notes": "基础知识问答，应该走 knowledge_query。"
     },
     {
@@ -22,6 +24,8 @@
       "forbidden_tools": ["document_ingest"],
       "expected_answer_substrings": ["DNS", "复习"],
       "forbidden_answer_substrings": [],
+      "expected_planner_intent": "review_summary",
+      "expected_control_mode": "force_tool",
       "notes": "复习类问题优先走 review_summary。"
     },
     {
@@ -33,6 +37,8 @@
       "forbidden_tools": ["document_ingest"],
       "expected_answer_substrings": ["UDP"],
       "forbidden_answer_substrings": [],
+      "expected_planner_intent": "quiz_generator",
+      "expected_control_mode": "force_tool",
       "notes": "练习题生成应命中 quiz_generator。"
     },
     {
@@ -44,6 +50,8 @@
       "forbidden_tools": ["document_ingest"],
       "expected_answer_substrings": [],
       "forbidden_answer_substrings": [],
+      "expected_planner_intent": "quiz_evaluator",
+      "expected_control_mode": "force_tool",
       "notes": "判题类请求应命中 quiz_evaluator。"
     },
     {
@@ -55,6 +63,8 @@
       "forbidden_tools": [],
       "expected_answer_substrings": [],
       "forbidden_answer_substrings": [],
+      "expected_planner_intent": "document_ingest",
+      "expected_control_mode": "force_tool",
       "notes": "文档导入请求应命中 document_ingest。"
     }
   ]
