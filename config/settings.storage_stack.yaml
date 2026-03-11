@@ -1,0 +1,268 @@
+# Modular RAG MCP Server - Configuration
+# This is the main configuration file for the MCP Server.
+# Edit this file to configure LLM, Embedding, VectorStore, and other services.
+
+# =============================================================================
+# LLM Configuration
+# =============================================================================
+llm:
+  provider: "zhipu"  # Options: openai, azure, ollama, deepseek, zhipu
+  model: "glm-4-flash"
+  api_key: "8d4c63adb3674b0d8cb6f93e30ee7625.khqdn2kakxI1Vntd"
+  base_url: "https://open.bigmodel.cn/api/paas/v4/"
+  temperature: 0.7
+  max_tokens: 4096
+
+# =============================================================================
+# Embedding Configuration
+# =============================================================================
+embedding:
+  provider: "zhipu"  # Options: openai, azure, ollama, zhipu
+  model: "embedding-3"
+  dimensions: 2048  # embedding-3 supports 256/512/1024/2048, default 2048
+  api_key: "8d4c63adb3674b0d8cb6f93e30ee7625.khqdn2kakxI1Vntd"
+  base_url: "https://open.bigmodel.cn/api/paas/v4/"
+  # Ollama settings (if provider is ollama):
+  # model: "nomic-embed-text"
+  # dimensions: 768
+
+# =============================================================================
+# Vision LLM Configuration (for Image Captioning)
+# =============================================================================
+vision_llm:
+  enabled: true
+  provider: "zhipu"  # Options: openai, azure, zhipu, ollama
+  model: "glm-4v-flash"  # ZhiPu free vision model
+  api_key: "8d4c63adb3674b0d8cb6f93e30ee7625.khqdn2kakxI1Vntd"
+  base_url: "https://open.bigmodel.cn/api/paas/v4/"
+  max_image_size: 2048
+
+# =============================================================================
+# Vector Store Configuration
+# =============================================================================
+vector_store:
+  provider: "milvus"  # Options: chroma, milvus
+  persist_directory: "./data/db/chroma"
+  collection_name: "storage_smoke"
+  hnsw:
+    space: "cosine"
+    M: 32
+    construction_ef: 200
+    search_ef: 100
+  milvus:
+    uri: "http://127.0.0.1:19530"
+    mode: "service"           # lite / service
+    host: "127.0.0.1"
+    port: 19530
+    token: ""
+    user: ""
+    password: ""
+    db_name: ""
+    dim: 2048
+
+# =============================================================================
+# Production Shared Storage Configuration
+# =============================================================================
+postgres:
+  enabled: true
+  dsn: "postgresql://postgres:postgres@localhost:5433/modular_rag"
+
+redis:
+  enabled: true
+  url: "redis://localhost:6380/0"
+  ttl_seconds: 3600
+
+object_store:
+  provider: "minio"          # local / minio
+  local_root: "./data/object_store"
+  endpoint: "127.0.0.1:9000"
+  bucket: "modular-rag"
+  access_key: "minioadmin"
+  secret_key: "minioadmin"
+  secure: false
+  uploads_prefix: "uploads"
+  images_prefix: "images"
+  context_prefix: "context"
+
+sparse_store:
+  provider: "opensearch"     # bm25 / opensearch
+  index_dir: "./data/db/bm25"
+
+opensearch:
+  hosts:
+    - "http://localhost:9200"
+  index_prefix: "modular-rag"
+  username: ""
+  password: ""
+
+# =============================================================================
+# Retrieval Configuration
+# =============================================================================
+retrieval:
+  dense_top_k: 20
+  sparse_top_k: 20
+  fusion_top_k: 10
+  rrf_k: 60
+  dense_weight: 1.0
+  sparse_weight: 1.0
+  rerank_enabled: true         # N13: 启用 reranker 提升精排质量
+  rerank_top_k: 5
+  mmr_enabled: true            # N13: 启用 MMR 多样性控制
+  mmr_lambda: 0.7
+  query_rewrite_enabled: true  # N13: 启用 query rewrite
+  hyde_enabled: false           # HyDE 需要额外 LLM 调用，按需开启
+  multi_query_enabled: false    # Multi-query 需要额外 LLM 调用，按需开启
+  contextual_enrichment: "rule" # rule / llm / off
+  embedding_cache_size: 4096
+  dedup_enabled: true           # 入库阶段 SimHash 去重
+  dedup_threshold: 3
+  min_score: 0.15              # N13: 最低相关度阈值，过滤低质量结果
+  post_dedup_enabled: true     # N13: 检索后语义去重
+
+# =============================================================================
+# Rerank Configuration
+# =============================================================================
+rerank:
+  enabled: true
+  provider: "llm"  # Options: none, cross_encoder, llm
+  model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+  top_k: 5
+
+# =============================================================================
+# Evaluation Configuration
+# =============================================================================
+evaluation:
+  enabled: false
+  provider: "custom"  # Options: ragas, deepeval, custom
+  metrics:
+    - "hit_rate"
+    - "mrr"
+    - "faithfulness"
+
+# =============================================================================
+# Observability Configuration
+# =============================================================================
+observability:
+  log_level: "INFO"  # Options: DEBUG, INFO, WARNING, ERROR
+  trace_enabled: true
+  trace_file: "./logs/traces.jsonl"
+  structured_logging: true
+
+# =============================================================================
+# Ingestion Configuration
+# =============================================================================
+ingestion:
+  chunk_size: 1000
+  chunk_overlap: 200
+  splitter: "structure"  # Options: recursive, semantic, structure
+  batch_size: 20
+
+  chunk_refiner:
+    use_llm: false
+    parent_child_enabled: true
+    parent_chunk_size: 2400
+    parent_chunk_overlap: 200
+    semantic_splitter:
+      similarity_threshold: 0.5
+      min_chunk_size: 100
+      max_chunk_size: 1500
+
+  metadata_enricher:
+    use_llm: false
+
+# =============================================================================
+# Agent Configuration
+# =============================================================================
+agent:
+  max_tool_iterations: 10
+  stream_responses: true
+  tool_timeout: 30
+  max_context_messages: 40
+  max_context_tokens: 8000
+  temperature: 0.7
+  system_prompt_path: "config/prompts/system_prompt.txt"
+  skills_dir: "src/agent/skills/definitions"
+  memory_enabled: true
+  conversation_store_dir: "data/conversations"
+  default_collection: "computer_network"
+  auto_ingest_dir: "docs/computer_internet"  # startup auto-ingest directory
+
+# =============================================================================
+# Server Configuration
+# =============================================================================
+server:
+  host: "0.0.0.0"
+  port: 8000
+  cors_origins: ["*"]
+  max_upload_size_mb: 50
+  upload_dir: "data/uploads"
+
+# =============================================================================
+# Memory Configuration
+# =============================================================================
+memory:
+  enabled: true
+  db_dir: "data/memory"
+  profile_enabled: true
+  error_memory_enabled: true
+  knowledge_map_enabled: true
+  skill_memory_enabled: true
+  session_memory_enabled: true
+  decay_interval_hours: 24
+  extraction_mode: "both"        # llm / rule / both (LLM优先，失败回退rule)
+  write_gating_enabled: true
+  session_write_min_confidence: 0.2
+  preference_write_min_confidence: 0.65
+  preference_conflict_guard: true
+  review_schedule_enabled: true  # 启用主动复习推荐
+  decay_on_session_start: true   # 新会话开始时触发 Ebbinghaus 衰减
+  compaction_enabled: true       # 启用上下文压缩 (CoPaw-style Compaction)
+  compaction_threshold_messages: 30  # 超过此消息数时触发压缩
+
+# =============================================================================
+# Routing Configuration (Adaptive Retrieval Router)
+# =============================================================================
+routing:
+  enabled: true
+  mode: "hybrid"          # rule / hybrid / embedding (hybrid = 规则优先 + embedding 兜底)
+  fallback_to_llm: true   # RAG 无结果时是否 fallback 到纯 LLM
+  embedding_threshold: 0.75  # Layer 2 embedding cosine 相似度阈值
+
+# =============================================================================
+# Semantic Cache Configuration
+# =============================================================================
+semantic_cache:
+  enabled: true
+  similarity_threshold: 0.92   # 余弦相似度阈值，越高越严格
+  ttl_seconds: 3600            # 缓存过期时间 (秒)
+  max_size: 500                # 最大缓存条目数 (LRU 淘汰)
+  provider: "redis"            # memory / redis
+
+# =============================================================================
+# Self-Reflection (Anti-Hallucination)
+# =============================================================================
+reflection:
+  enabled: true
+  mode: "rule"                 # rule (词汇重叠) / llm (LLM 判断)
+  groundedness_threshold: 0.3  # 低于此值追加 warning
+  append_warning: true
+
+# =============================================================================
+# Security Guardrails
+# =============================================================================
+guardrails:
+  enabled: true
+  input_filtering: true        # 增强 prompt injection 检测
+  output_redaction: true       # 输出敏感信息脱敏
+  block_on_high_risk: true     # 高风险输入直接拦截
+
+# =============================================================================
+# Conflict Detection Configuration
+# =============================================================================
+conflict_detection:
+  enabled: true
+  rule_based: true          # 零 LLM 调用的规则策略 (数值/定义/来源)
+  embedding_sim: true       # 嵌入相似度策略
+  llm_nli: false            # LLM NLI 策略 (消耗额外 token, 按需启用)
+  sim_threshold: 0.90       # embedding 策略的余弦相似度阈值
+  nli_max_pairs: 5          # NLI 策略最多比较的片段对数

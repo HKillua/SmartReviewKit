@@ -1,6 +1,7 @@
 """Entrypoint to start the Database Course Agent server."""
 
 import logging
+import os
 import sys
 
 import uvicorn
@@ -13,7 +14,7 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    settings_path = "config/settings.yaml"
+    settings_path = os.environ.get("MODULAR_RAG_SETTINGS_PATH", "config/settings.yaml")
     try:
         with open(settings_path, encoding="utf-8") as f:
             settings = yaml.safe_load(f) or {}

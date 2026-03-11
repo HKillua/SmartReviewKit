@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -52,8 +53,13 @@ from src.storage.runtime import (
 logger = logging.getLogger(__name__)
 
 
+def _resolve_settings_path(path: str = "config/settings.yaml") -> str:
+    return os.environ.get("MODULAR_RAG_SETTINGS_PATH", path)
+
+
 def _load_settings(path: str = "config/settings.yaml") -> dict:
-    with open(path, encoding="utf-8") as f:
+    settings_path = _resolve_settings_path(path)
+    with open(settings_path, encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
 
@@ -71,6 +77,7 @@ def _build_hybrid_search(collection: str = "computer_network", settings_path: st
     from src.libs.vector_store.vector_store_factory import VectorStoreFactory
     from src.libs.reranker.reranker_factory import RerankerFactory
 
+    settings_path = _resolve_settings_path(settings_path)
     core_settings = load_core_settings(settings_path)
     raw_embedding = EmbeddingFactory.create(core_settings)
 
@@ -123,7 +130,7 @@ def _build_hybrid_search(collection: str = "computer_network", settings_path: st
     return hybrid, embedding, query_enhancer
 
 
-def _auto_ingest(ingest_dir: str, collection: str) -> None:
+def _auto_ingest(ingest_dir: str, collection: str, settings_path: str = "config/settings.yaml") -> None:
     """Scan a directory and ingest any .pdf/.pptx files that haven't been processed."""
     from src.core.settings import load_settings as load_core_settings, resolve_path
 
@@ -143,7 +150,7 @@ def _auto_ingest(ingest_dir: str, collection: str) -> None:
     logger.info("Auto-ingest: found %d file(s) in %s", len(files), dir_path)
 
     from src.ingestion.pipeline import IngestionPipeline
-    core_settings = load_core_settings()
+    core_settings = load_core_settings(_resolve_settings_path(settings_path))
     pipeline = IngestionPipeline(core_settings, collection=collection)
 
     try:
@@ -164,6 +171,7 @@ def _auto_ingest(ingest_dir: str, collection: str) -> None:
 
 def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
     """Wire all components and return a configured FastAPI app."""
+    settings_path = _resolve_settings_path(settings_path)
     settings = _load_settings(settings_path)
     from src.core.settings import load_settings as load_core_settings
     core_settings = load_core_settings(settings_path)
@@ -396,7 +404,7 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
     async def _startup_auto_ingest() -> None:
         if agent_cfg.auto_ingest_dir:
             logger.info("Running startup auto-ingestion from: %s", agent_cfg.auto_ingest_dir)
-            _auto_ingest(agent_cfg.auto_ingest_dir, collection)
+            _auto_ingest(agent_cfg.auto_ingest_dir, collection, settings_path=settings_path)
 
     # --- Shutdown: close DB connections and resources ---
     @app.on_event("shutdown")

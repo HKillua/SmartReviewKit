@@ -1,0 +1,126 @@
+name: modular-rag-storage
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: modular_rag
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d modular_rag"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks:
+      - storage
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks:
+      - storage
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - storage
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.15
+    command:
+      - etcd
+      - --advertise-client-urls=http://0.0.0.0:2379
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --data-dir=/etcd
+    volumes:
+      - etcd_data:/etcd
+    networks:
+      - storage
+
+  milvus:
+    image: milvusdb/milvus:v2.4.4
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY_ID: minioadmin
+      MINIO_SECRET_ACCESS_KEY: minioadmin
+    depends_on:
+      postgres:
+        condition: service_started
+      redis:
+        condition: service_started
+      minio:
+        condition: service_started
+      etcd:
+        condition: service_started
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    volumes:
+      - milvus_data:/var/lib/milvus
+    networks:
+      - storage
+
+  opensearch:
+    image: opensearchproject/opensearch:2.14.0
+    environment:
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+      bootstrap.memory_lock: "true"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "9200:9200"
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    networks:
+      - storage
+
+networks:
+  storage:
+    name: modular-rag-storage-network
+
+volumes:
+  postgres_data:
+    name: modular-rag-storage-postgres-data
+  redis_data:
+    name: modular-rag-storage-redis-data
+  minio_data:
+    name: modular-rag-storage-minio-data
+  etcd_data:
+    name: modular-rag-storage-etcd-data
+  milvus_data:
+    name: modular-rag-storage-milvus-data
+  opensearch_data:
+    name: modular-rag-storage-opensearch-data

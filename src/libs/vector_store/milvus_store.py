@@ -85,18 +85,36 @@ class MilvusStore(BaseVectorStore):
 
     def _ensure_collection(self, name: str) -> None:
         if self.client.has_collection(name):
+            self._ensure_index(name)
+            self._ensure_loaded(name)
             return
         schema = self._build_schema()
         self.client.create_collection(
             collection_name=name,
             schema=schema,
         )
+        self._ensure_index(name)
+        self._ensure_loaded(name)
+        logger.info(f"Created Milvus collection '{name}' with HNSW index")
+
+    def _ensure_index(self, name: str) -> None:
+        existing = self.client.list_indexes(name)
+        if existing:
+            return
+        index_params = self.client.prepare_index_params(
+            field_name="vector",
+            index_name="vector_idx",
+            index_type="HNSW",
+            metric_type="COSINE",
+            params={"M": 32, "efConstruction": 200},
+        )
         self.client.create_index(
             collection_name=name,
-            field_name="vector",
-            index_params={"index_type": "HNSW", "metric_type": "COSINE", "params": {"M": 32, "efConstruction": 200}},
+            index_params=index_params,
         )
-        logger.info(f"Created Milvus collection '{name}' with HNSW index")
+
+    def _ensure_loaded(self, name: Optional[str] = None) -> None:
+        self.client.load_collection(collection_name=name or self.collection_name)
 
     def _build_schema(self) -> CollectionSchema:
         fields = [
@@ -119,6 +137,7 @@ class MilvusStore(BaseVectorStore):
     def get_or_switch_collection(self, collection_name: str) -> None:
         self._ensure_collection(collection_name)
         self.collection_name = collection_name
+        self._ensure_loaded(collection_name)
         logger.info(f"Switched to Milvus collection '{collection_name}'")
 
     def list_collections(self) -> List[str]:
@@ -135,6 +154,7 @@ class MilvusStore(BaseVectorStore):
         **kwargs: Any,
     ) -> None:
         self.validate_records(records)
+        self._ensure_loaded(self.collection_name)
 
         rows = []
         for r in records:
@@ -156,6 +176,8 @@ class MilvusStore(BaseVectorStore):
             })
 
         self.client.upsert(collection_name=self.collection_name, data=rows)
+        self.client.flush(self.collection_name)
+        self._ensure_loaded(self.collection_name)
         logger.debug(f"Upserted {len(rows)} records to Milvus")
 
     def query(
@@ -167,6 +189,7 @@ class MilvusStore(BaseVectorStore):
         **kwargs: Any,
     ) -> List[Dict[str, Any]]:
         self.validate_query_vector(vector, top_k)
+        self._ensure_loaded(self.collection_name)
 
         search_params = {"metric_type": "COSINE", "params": {"ef": 100}}
         filter_expr = self._build_filter_expr(filters) if filters else ""
@@ -207,6 +230,8 @@ class MilvusStore(BaseVectorStore):
         if not ids:
             raise ValueError("IDs list cannot be empty")
         self.client.delete(collection_name=self.collection_name, ids=ids)
+        self.client.flush(self.collection_name)
+        self._ensure_loaded(self.collection_name)
         logger.debug(f"Deleted {len(ids)} records from Milvus")
 
     def clear(
@@ -219,6 +244,7 @@ class MilvusStore(BaseVectorStore):
         if self.client.has_collection(name):
             self.client.drop_collection(name)
         self._ensure_collection(name)
+        self._ensure_loaded(name)
         logger.info(f"Cleared Milvus collection '{name}'")
 
     def get_by_ids(
