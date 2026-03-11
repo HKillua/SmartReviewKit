@@ -154,6 +154,23 @@ class MockSettings:
         self.retrieval.sparse_top_k = sparse_top_k
 
 
+class MockSparseAdapter:
+    """Adapter-style sparse index used by production runtime."""
+
+    def ensure_collection_ready(self, collection: str) -> bool:
+        return collection == "prod"
+
+    def query(
+        self,
+        query_terms: List[str],
+        top_k: int = 10,
+        collection: str = "default",
+        trace: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
+        assert collection == "prod"
+        return [{"chunk_id": "chunk_001", "score": 1.0}]
+
+
 # ============================================================================
 # Test: Initialization
 # ============================================================================
@@ -258,6 +275,17 @@ class TestSparseRetrieverRetrieve:
         
         assert len(results) == 3
         assert all(isinstance(r, RetrievalResult) for r in results)
+
+    def test_retrieve_supports_sparse_adapter_with_collection(self):
+        """Production sparse adapters can prepare/query by collection."""
+        adapter = MockSparseAdapter()
+        vs = MockVectorStore()
+        retriever = SparseRetriever(bm25_indexer=adapter, vector_store=vs, default_collection="prod")
+
+        results = retriever.retrieve(["machine"])
+
+        assert len(results) == 1
+        assert results[0].chunk_id == "chunk_001"
     
     def test_retrieve_results_have_correct_fields(self):
         """Test that results have all required fields."""

@@ -111,3 +111,77 @@ def test_missing_required_field_raises_error(tmp_path: Path) -> None:
 
     with pytest.raises(SettingsError, match="embedding.provider"):
         load_settings(settings_path)
+
+
+def test_load_settings_with_production_storage_sections(tmp_path: Path) -> None:
+    config = """
+    llm:
+      provider: openai
+      model: gpt-4o-mini
+      temperature: 0.0
+      max_tokens: 1024
+    embedding:
+      provider: openai
+      model: text-embedding-3-small
+      dimensions: 1536
+    vector_store:
+      provider: milvus
+      persist_directory: ./data/db/chroma
+      collection_name: knowledge_hub
+      milvus:
+        mode: service
+        uri: http://milvus:19530
+        dim: 1536
+    retrieval:
+      dense_top_k: 20
+      sparse_top_k: 20
+      fusion_top_k: 10
+      rrf_k: 60
+    rerank:
+      enabled: false
+      provider: none
+      model: cross-encoder/ms-marco-MiniLM-L-6-v2
+      top_k: 5
+    evaluation:
+      enabled: false
+      provider: custom
+      metrics:
+        - hit_rate
+    observability:
+      log_level: INFO
+      trace_enabled: true
+      trace_file: ./logs/traces.jsonl
+      structured_logging: true
+    postgres:
+      enabled: true
+      dsn: postgresql://postgres:postgres@localhost:5432/modular_rag
+    redis:
+      enabled: true
+      url: redis://localhost:6379/0
+      ttl_seconds: 120
+    object_store:
+      provider: minio
+      endpoint: localhost:9000
+      bucket: modular-rag
+      access_key: minio
+      secret_key: secret
+      secure: false
+    sparse_store:
+      provider: opensearch
+      index_dir: ./data/db/bm25
+    opensearch:
+      hosts:
+        - http://localhost:9200
+      index_prefix: modular-rag
+    """
+    settings_path = tmp_path / "settings.yaml"
+    _write_yaml(settings_path, config)
+
+    settings = load_settings(settings_path)
+
+    assert settings.milvus.mode == "service"
+    assert settings.postgres.enabled is True
+    assert settings.redis.ttl_seconds == 120
+    assert settings.object_store.provider == "minio"
+    assert settings.sparse_store.provider == "opensearch"
+    assert settings.opensearch.index_prefix == "modular-rag"

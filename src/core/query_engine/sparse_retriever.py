@@ -153,11 +153,19 @@ class SparseRetriever:
         
         # Step 2: Query BM25 index
         try:
-            bm25_results = self.bm25_indexer.query(
-                query_terms=keywords,
-                top_k=effective_top_k,
-                trace=trace,
-            )
+            try:
+                bm25_results = self.bm25_indexer.query(
+                    query_terms=keywords,
+                    top_k=effective_top_k,
+                    collection=effective_collection,
+                    trace=trace,
+                )
+            except TypeError:
+                bm25_results = self.bm25_indexer.query(
+                    query_terms=keywords,
+                    top_k=effective_top_k,
+                    trace=trace,
+                )
         except Exception as e:
             raise RuntimeError(
                 f"Failed to query BM25 index: {e}. "
@@ -226,6 +234,18 @@ class SparseRetriever:
         Reloads only when the underlying JSON file has been modified since the
         last successful load.
         """
+        if hasattr(self.bm25_indexer, "ensure_collection_ready"):
+            try:
+                return bool(self.bm25_indexer.ensure_collection_ready(collection))
+            except Exception as e:
+                logger.warning("Failed to prepare sparse index for collection '%s': %s", collection, e)
+                return False
+        if hasattr(self.bm25_indexer, "load") and not hasattr(self.bm25_indexer, "_get_index_path"):
+            try:
+                return bool(self.bm25_indexer.load(collection=collection))
+            except Exception as e:
+                logger.warning("Failed to load sparse index for collection '%s': %s", collection, e)
+                return False
         try:
             idx_path = self.bm25_indexer._get_index_path(collection)
             if idx_path.exists():

@@ -26,7 +26,6 @@ from src.core.trace.trace_context import TraceContext
 from src.observability.logger import get_logger
 
 # Libs layer imports
-from src.libs.loader.file_integrity import SQLiteIntegrityChecker
 from src.libs.loader.pdf_loader import PdfLoader
 from src.libs.loader.pptx_loader import PptxLoader
 try:
@@ -45,11 +44,10 @@ from src.ingestion.transform.image_captioner import ImageCaptioner
 from src.ingestion.embedding.dense_encoder import DenseEncoder
 from src.ingestion.embedding.sparse_encoder import SparseEncoder
 from src.ingestion.embedding.batch_processor import BatchProcessor
-from src.ingestion.storage.bm25_indexer import BM25Indexer
 from src.ingestion.storage.vector_upserter import VectorUpserter
-from src.ingestion.storage.image_storage import ImageStorage
 from src.ingestion.transform.contextual_enricher import ContextualEnricher
 from src.ingestion.transform.chunk_dedup import dedup_chunks
+from src.storage.runtime import create_ingestion_backends, create_sparse_index
 
 logger = get_logger(__name__)
 
@@ -148,8 +146,11 @@ class IngestionPipeline:
         # Initialize all components
         logger.info("Initializing Ingestion Pipeline components...")
         
-        # Stage 1: File Integrity
-        self.integrity_checker = SQLiteIntegrityChecker(db_path=str(resolve_path("data/db/ingestion_history.db")))
+        ingestion_backends = create_ingestion_backends(settings, collection=collection)
+        self.object_store = ingestion_backends.object_store
+        self.integrity_checker = ingestion_backends.integrity_checker
+        self.document_registry = ingestion_backends.document_registry
+        self.task_store = ingestion_backends.task_store
         logger.info("  ✓ FileIntegrityChecker initialized")
         
         # Stage 2: Loaders
@@ -209,13 +210,10 @@ class IngestionPipeline:
         self.vector_upserter = VectorUpserter(settings, collection_name=collection)
         logger.info(f"  ✓ VectorUpserter initialized (provider={settings.vector_store.provider}, collection={collection})")
         
-        self.bm25_indexer = BM25Indexer(index_dir=str(resolve_path(f"data/db/bm25/{collection}")))
-        logger.info("  ✓ BM25Indexer initialized")
-        
-        self.image_storage = ImageStorage(
-            db_path=str(resolve_path("data/db/image_index.db")),
-            images_root=str(resolve_path("data/images"))
-        )
+        self.bm25_indexer = create_sparse_index(settings, collection=collection)
+        logger.info("  ✓ Sparse index initialized (%s)", type(self.bm25_indexer).__name__)
+
+        self.image_storage = ingestion_backends.image_storage
         logger.info("  ✓ ImageStorage initialized")
         
         logger.info("Pipeline initialization complete!")
@@ -264,7 +262,8 @@ class IngestionPipeline:
         _total_stages = 6
 
         if source_type == "auto":
-            source_type = self.infer_source_type(file_path)
+            inferer = getattr(type(self), "infer_source_type", IngestionPipeline.infer_source_type)
+            source_type = inferer(file_path)
 
         def _notify(stage_name: str, step: int) -> None:
             if on_progress is not None:
@@ -310,7 +309,9 @@ class IngestionPipeline:
             
             _t0 = time.monotonic()
             suffix = file_path.suffix.lower()
-            if suffix == ".pptx":
+            if hasattr(self, "loader"):
+                document = self.loader.load(str(file_path))
+            elif suffix == ".pptx":
                 document = self.pptx_loader.load(str(file_path))
             elif suffix == ".docx" and self.docx_loader:
                 document = self.docx_loader.load(str(file_path))
@@ -418,7 +419,9 @@ class IngestionPipeline:
             logger.info("  4b2. Contextual Enrichment...")
             doc_title = document.metadata.get("title", file_path.stem)
             pre_ctx_count = len(chunks)
-            chunks = self.contextual_enricher.enrich(chunks, doc_title=doc_title)
+            contextual_enricher = getattr(self, "contextual_enricher", None)
+            if contextual_enricher is not None:
+                chunks = contextual_enricher.enrich(chunks, doc_title=doc_title)
             ctx_enriched = sum(1 for c in chunks if c.metadata.get("contextual_prefix"))
             logger.info(f"      Contextually enriched: {ctx_enriched}/{pre_ctx_count}")
             
@@ -430,7 +433,7 @@ class IngestionPipeline:
             
             # 4d: SimHash Dedup
             pre_dedup_count = len(chunks)
-            if self.dedup_enabled:
+            if getattr(self, "dedup_enabled", False):
                 logger.info("  4d. SimHash Dedup...")
                 chunks = dedup_chunks(chunks, threshold=3)
                 logger.info(f"      Dedup: {pre_dedup_count} -> {len(chunks)} chunks")
@@ -478,7 +481,7 @@ class IngestionPipeline:
             
             dense_vectors = batch_result.dense_vectors
             sparse_stats = batch_result.sparse_stats
-            failed_chunk_count = batch_result.failed_chunks
+            failed_chunk_count = int(getattr(batch_result, "failed_chunks", 0) or 0)
             
             # --- Handle encoding failures ---
             if not dense_vectors:
@@ -491,7 +494,7 @@ class IngestionPipeline:
                 _elapsed += (time.monotonic() - _t0_retry) * 1000.0
                 dense_vectors = batch_result.dense_vectors
                 sparse_stats = batch_result.sparse_stats
-                failed_chunk_count = batch_result.failed_chunks
+                failed_chunk_count = int(getattr(batch_result, "failed_chunks", 0) or 0)
                 if not dense_vectors:
                     raise RuntimeError(
                         f"Encoding failed for all {len(chunks)} chunks after retry"
@@ -504,10 +507,10 @@ class IngestionPipeline:
                     "Trimming chunks to match dense vectors.",
                     len(dense_vectors), len(chunks),
                 )
-                ok_indices = batch_result.successful_chunk_indices
+                ok_indices = getattr(batch_result, "successful_chunk_indices", list(range(len(dense_vectors))))
                 chunks = [chunks[i] for i in ok_indices]
                 # sparse_stats is already aligned by BatchProcessor
-                failed_chunk_count = batch_result.failed_chunks
+                failed_chunk_count = int(getattr(batch_result, "failed_chunks", 0) or 0)
             
             logger.info(f"  Dense vectors: {len(dense_vectors)} (dim={len(dense_vectors[0]) if dense_vectors else 0})")
             logger.info(f"  Sparse stats: {len(sparse_stats)} documents")
@@ -636,6 +639,22 @@ class IngestionPipeline:
             # Mark Success
             # ─────────────────────────────────────────────────────────────
             self.integrity_checker.mark_success(file_hash, str(file_path), self.collection)
+            document_registry = getattr(self, "document_registry", None)
+            if document_registry is not None:
+                try:
+                    document_registry.upsert_document(
+                        file_hash=file_hash,
+                        file_path=str(file_path),
+                        collection=self.collection,
+                        status="ready",
+                        metadata={
+                            "chunk_count": len(chunks),
+                            "image_count": len(images),
+                            "vector_ids_count": len(vector_ids),
+                        },
+                    )
+                except Exception:
+                    logger.warning("Failed to upsert document registry entry", exc_info=True)
             
             logger.info("\n" + "=" * 60)
             logger.info("✅ Pipeline completed successfully!")
@@ -663,6 +682,18 @@ class IngestionPipeline:
                     self.integrity_checker.mark_failed(resolved_hash, str(file_path), str(e))
                 except Exception:
                     logger.warning("Failed to record ingestion failure in integrity DB")
+                document_registry = getattr(self, "document_registry", None)
+                if document_registry is not None:
+                    try:
+                        document_registry.upsert_document(
+                            file_hash=resolved_hash,
+                            file_path=str(file_path),
+                            collection=self.collection,
+                            status="failed",
+                            metadata={"error": str(e)},
+                        )
+                    except Exception:
+                        logger.warning("Failed to upsert failed document registry entry", exc_info=True)
             
             return PipelineResult(
                 success=False,
@@ -695,6 +726,13 @@ class IngestionPipeline:
             logger.info("    Cleaned stale integrity record")
         except Exception as e:
             logger.warning("    Failed to clean stale integrity record: %s", e)
+        document_registry = getattr(self, "document_registry", None)
+        if document_registry is not None:
+            try:
+                document_registry.delete_document(file_hash)
+                logger.info("    Cleaned stale document registry record")
+            except Exception as e:
+                logger.warning("    Failed to clean stale document registry record: %s", e)
 
     def close(self) -> None:
         """Clean up resources."""

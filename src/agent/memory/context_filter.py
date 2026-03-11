@@ -56,6 +56,8 @@ class ContextEngineeringFilter(ConversationFilter):
         max_tokens: int = 0,
         tool_result_max_chars: int = 2000,
         offload_dir: str = "data/context_offload",
+        object_store: object | None = None,
+        object_prefix: str = "context",
         llm_service: object | None = None,
         compaction_threshold: int = 30,
         compaction_keep_recent: int = 10,
@@ -65,6 +67,8 @@ class ContextEngineeringFilter(ConversationFilter):
         self._tool_max = tool_result_max_chars
         self._offload_dir = Path(offload_dir)
         self._offload_dir.mkdir(parents=True, exist_ok=True)
+        self._object_store = object_store
+        self._object_prefix = object_prefix.strip("/") or "context"
         self._llm = llm_service
         self._compact_threshold = compaction_threshold
         self._compact_keep = compaction_keep_recent
@@ -208,6 +212,10 @@ class ContextEngineeringFilter(ConversationFilter):
         import os
         import tempfile
         ref_id = hashlib.sha256(content.encode()).hexdigest()[:12]
+        if self._object_store is not None:
+            key = f"{self._object_prefix}/{ref_id}.txt"
+            self._object_store.put_bytes(key, content.encode("utf-8"), content_type="text/plain")
+            return ref_id
         path = self._offload_dir / f"{ref_id}.txt"
         if not path.exists():
             fd, tmp = tempfile.mkstemp(dir=str(self._offload_dir), suffix=".tmp")
@@ -229,4 +237,10 @@ class ContextEngineeringFilter(ConversationFilter):
         path = self._offload_dir / f"{ref_id}.txt"
         if path.exists():
             return path.read_text(encoding="utf-8")
+        if self._object_store is not None:
+            key = f"{self._object_prefix}/{ref_id}.txt"
+            try:
+                return self._object_store.read_bytes(key).decode("utf-8")
+            except Exception:
+                logger.warning("Failed to load offloaded context from object store", exc_info=True)
         return None

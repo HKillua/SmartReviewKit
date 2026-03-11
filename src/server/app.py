@@ -21,18 +21,11 @@ from src.agent.config import (
     load_memory_config,
     load_server_config,
 )
-from src.agent.conversation import FileConversationStore
 from src.agent.llm.factory import create_llm_service
-from src.agent.hooks.rate_limit import RateLimitHook
 from src.agent.hooks.retry_middleware import RetryWithBackoffMiddleware
 from src.agent.hooks.review_schedule import ReviewScheduleHook
 from src.agent.memory.context_filter import ContextEngineeringFilter
 from src.agent.memory.enhancer import MemoryContextEnhancer, MemoryRecordHook
-from src.agent.memory.error_memory import ErrorMemory
-from src.agent.memory.knowledge_map import KnowledgeMapMemory
-from src.agent.memory.session_memory import SessionMemory
-from src.agent.memory.skill_memory import SkillMemory
-from src.agent.memory.student_profile import StudentProfileMemory
 from src.agent.planner import TaskPlanner
 from src.agent.prompt_builder import SystemPromptBuilder
 from src.agent.skills.registry import SkillRegistry
@@ -46,6 +39,15 @@ from src.agent.tools.review_summary import ReviewSummaryTool
 from src.core.trace.trace_collector import TraceCollector
 from src.server.chat_handler import ChatHandler
 from src.server.routes import configure_routes, router
+from src.storage.runtime import (
+    create_conversation_store,
+    create_feedback_store,
+    create_ingestion_backends,
+    create_memory_stores,
+    create_rate_limit_hook,
+    create_semantic_cache,
+    create_sparse_index,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,22 +57,21 @@ def _load_settings(path: str = "config/settings.yaml") -> dict:
         return yaml.safe_load(f) or {}
 
 
-def _build_hybrid_search(collection: str = "computer_network") -> tuple:
+def _build_hybrid_search(collection: str = "computer_network", settings_path: str = "config/settings.yaml") -> tuple:
     """Build a shared HybridSearch instance and return (hybrid, embedding, query_enhancer)."""
-    from src.core.settings import load_settings as load_core_settings, resolve_path
+    from src.core.settings import load_settings as load_core_settings
     from src.core.query_engine.query_processor import QueryProcessor
     from src.core.query_engine.hybrid_search import HybridSearch
     from src.core.query_engine.dense_retriever import create_dense_retriever
     from src.core.query_engine.sparse_retriever import create_sparse_retriever
     from src.core.query_engine.fusion import RRFFusion
     from src.core.query_engine.query_enhancer import QueryEnhancer
-    from src.ingestion.storage.bm25_indexer import BM25Indexer
     from src.libs.embedding.embedding_factory import EmbeddingFactory
     from src.libs.embedding.cached_embedding import CachedEmbedding
     from src.libs.vector_store.vector_store_factory import VectorStoreFactory
     from src.libs.reranker.reranker_factory import RerankerFactory
 
-    core_settings = load_core_settings()
+    core_settings = load_core_settings(settings_path)
     raw_embedding = EmbeddingFactory.create(core_settings)
 
     cache_size = 4096
@@ -85,7 +86,7 @@ def _build_hybrid_search(collection: str = "computer_network") -> tuple:
         embedding_client=embedding,
         vector_store=vector_store,
     )
-    bm25 = BM25Indexer(index_dir=str(resolve_path(f"data/db/bm25/{collection}")))
+    bm25 = create_sparse_index(core_settings, collection=collection)
     sparse = create_sparse_retriever(
         settings=core_settings,
         bm25_indexer=bm25,
@@ -164,19 +165,24 @@ def _auto_ingest(ingest_dir: str, collection: str) -> None:
 def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
     """Wire all components and return a configured FastAPI app."""
     settings = _load_settings(settings_path)
+    from src.core.settings import load_settings as load_core_settings
+    core_settings = load_core_settings(settings_path)
     agent_cfg = load_agent_config(settings)
     server_cfg = load_server_config(settings)
     memory_cfg = load_memory_config(settings)
+    collection = agent_cfg.default_collection
+    ingestion_backends = create_ingestion_backends(core_settings, collection=collection)
 
     # --- LLM ---
     llm = create_llm_service(settings)
 
     # --- Memory stores ---
-    profile_mem = StudentProfileMemory(memory_cfg.db_dir) if memory_cfg.profile_enabled else None
-    error_mem = ErrorMemory(memory_cfg.db_dir) if memory_cfg.error_memory_enabled else None
-    kmap_mem = KnowledgeMapMemory(memory_cfg.db_dir) if memory_cfg.knowledge_map_enabled else None
-    skill_mem = SkillMemory(memory_cfg.db_dir) if memory_cfg.skill_memory_enabled else None
-    session_mem = SessionMemory(memory_cfg.db_dir) if memory_cfg.session_memory_enabled else None
+    memory_stores = create_memory_stores(memory_cfg, settings)
+    profile_mem = memory_stores["profile"]
+    error_mem = memory_stores["error"]
+    kmap_mem = memory_stores["knowledge_map"]
+    skill_mem = memory_stores["skill"]
+    session_mem = memory_stores["session"]
 
     memory_enhancer = MemoryContextEnhancer(
         student_profile=profile_mem,
@@ -218,11 +224,12 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
             max_tokens=agent_cfg.max_context_tokens,
             llm_service=llm,
             compaction_threshold=memory_cfg.compaction_threshold_messages,
+            object_store=ingestion_backends.object_store,
+            object_prefix=core_settings.object_store.context_prefix,
         )
 
     # --- Shared HybridSearch ---
-    collection = agent_cfg.default_collection
-    hybrid_search, cached_embedding, query_enhancer = _build_hybrid_search(collection)
+    hybrid_search, cached_embedding, query_enhancer = _build_hybrid_search(collection, settings_path=settings_path)
     query_enhancer.llm_service = llm
 
     # --- Query Router (dual-layer: rule + embedding) ---
@@ -245,8 +252,8 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
     semantic_cache = None
     cache_cfg = settings.get("semantic_cache", {})
     if cache_cfg.get("enabled", False) and cached_embedding is not None:
-        from src.core.cache.semantic_cache import SemanticCache
-        semantic_cache = SemanticCache(
+        semantic_cache = create_semantic_cache(
+            core_settings,
             embedding_fn=lambda texts: cached_embedding.embed(texts),
             similarity_threshold=cache_cfg.get("similarity_threshold", 0.92),
             ttl_seconds=cache_cfg.get("ttl_seconds", 3600),
@@ -266,8 +273,11 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         semantic_cache=semantic_cache,
     ))
     tool_registry.register(DocumentIngestTool(
-        settings=settings,
+        settings=core_settings,
         semantic_cache=semantic_cache,
+        object_store=ingestion_backends.object_store,
+        document_registry=ingestion_backends.document_registry,
+        task_store=ingestion_backends.task_store,
     ))
     tool_registry.register(ReviewSummaryTool(
         hybrid_search=hybrid_search,
@@ -299,10 +309,10 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
     )
 
     # --- Conversation ---
-    conv_store = FileConversationStore(agent_cfg.conversation_store_dir)
+    conv_store = create_conversation_store(settings, agent_cfg)
 
     # --- Agent ---
-    rate_limit_hook = RateLimitHook(requests_per_minute=agent_cfg.rate_limit_rpm)
+    rate_limit_hook = create_rate_limit_hook(settings, agent_cfg.rate_limit_rpm)
     hooks: list = [rate_limit_hook, memory_hook]
     if review_hook:
         hooks.insert(0, review_hook)
@@ -364,12 +374,12 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         allow_headers=["*"],
     )
 
-    from src.agent.memory.feedback_store import FeedbackStore
-    feedback_store = FeedbackStore()
+    feedback_store = create_feedback_store(settings)
     configure_routes(
         chat_handler, agent,
         server_cfg.upload_dir, server_cfg.max_upload_size_mb,
         feedback_store=feedback_store,
+        object_store=ingestion_backends.object_store,
     )
     app.include_router(router)
 
@@ -400,7 +410,9 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
                     logger.warning("Failed to close memory store %s", type(store).__name__)
         if feedback_store:
             try:
-                feedback_store.close()
+                maybe = feedback_store.close()
+                if hasattr(maybe, "__await__"):
+                    await maybe
             except Exception:
                 logger.warning("Failed to close FeedbackStore")
         logger.info("Shutdown complete")

@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import shutil
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,7 @@ _agent = None
 _upload_dir = "data/uploads"
 _max_upload_mb = 50
 _feedback_store = None
+_object_store = None
 
 
 def configure_routes(
@@ -31,13 +33,15 @@ def configure_routes(
     upload_dir: str = "data/uploads",
     max_upload_mb: int = 50,
     feedback_store: Any = None,
+    object_store: Any = None,
 ) -> None:
-    global _chat_handler, _agent, _upload_dir, _max_upload_mb, _feedback_store
+    global _chat_handler, _agent, _upload_dir, _max_upload_mb, _feedback_store, _object_store
     _chat_handler = chat_handler
     _agent = agent
     _upload_dir = upload_dir
     _max_upload_mb = max_upload_mb
     _feedback_store = feedback_store
+    _object_store = object_store
 
 
 @router.post("/api/chat")
@@ -118,12 +122,24 @@ async def upload_file(file: UploadFile = File(...), user_id: str = "default_user
     if not str(save_path).startswith(str(save_dir.resolve())):
         raise HTTPException(status_code=400, detail="Invalid filename")
     save_path.write_bytes(content)
+    uploaded_object_key = ""
+    if _object_store is not None:
+        uploaded_object_key = f"uploads/{user_id}/{uuid.uuid4().hex[:12]}_{safe_filename}"
+        try:
+            _object_store.put_bytes(uploaded_object_key, content)
+        except Exception:
+            logger.warning("Failed to upload file to object store", exc_info=True)
+            uploaded_object_key = ""
 
     if _agent is None:
         return UploadResponse(success=True, filename=file.filename)
 
     from src.agent.types import ToolCallData, ToolContext
-    tool_ctx = ToolContext(user_id=user_id, conversation_id="upload")
+    tool_ctx = ToolContext(
+        user_id=user_id,
+        conversation_id="upload",
+        metadata={"uploaded_object_key": uploaded_object_key} if uploaded_object_key else {},
+    )
     tool_call = ToolCallData(id="upload", name="document_ingest", arguments={"file_path": str(save_path), "collection": collection})
     result = await _agent.tools.execute(tool_call, tool_ctx)
 
@@ -153,7 +169,7 @@ async def submit_feedback(
         raise HTTPException(status_code=503, detail="Feedback store not configured")
     if rating not in ("up", "down"):
         raise HTTPException(status_code=400, detail="rating must be 'up' or 'down'")
-    fb_id = _feedback_store.add(
+    fb_id = await _feedback_store.add(
         user_id=user_id,
         conversation_id=conversation_id,
         rating=rating,
@@ -170,7 +186,7 @@ async def feedback_stats():
     """Get aggregate feedback statistics."""
     if _feedback_store is None:
         raise HTTPException(status_code=503, detail="Feedback store not configured")
-    return _feedback_store.stats()
+    return await _feedback_store.stats()
 
 
 @router.get("/api/health", response_model=HealthResponse)

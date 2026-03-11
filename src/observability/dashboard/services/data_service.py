@@ -48,26 +48,19 @@ class DataService:
         ):
             return
 
-        from src.core.settings import load_settings, resolve_path
+        from src.core.settings import load_settings
         from src.ingestion.document_manager import DocumentManager
-        from src.ingestion.storage.bm25_indexer import BM25Indexer
-        from src.ingestion.storage.image_storage import ImageStorage
-        from src.libs.loader.file_integrity import SQLiteIntegrityChecker
         from src.libs.vector_store.vector_store_factory import VectorStoreFactory
+        from src.storage.runtime import create_image_storage, create_ingestion_backends, create_sparse_index
 
         settings = load_settings()
 
         chroma = VectorStoreFactory.create(
             settings, collection_name=target_collection
         )
-        bm25 = BM25Indexer(index_dir=str(resolve_path(f"data/db/bm25/{target_collection}")))
-        images = ImageStorage(
-            db_path=str(resolve_path("data/db/image_index.db")),
-            images_root=str(resolve_path("data/images")),
-        )
-        integrity = SQLiteIntegrityChecker(
-            db_path=str(resolve_path("data/db/ingestion_history.db"))
-        )
+        bm25 = create_sparse_index(settings, collection=target_collection)
+        images = create_image_storage(settings, target_collection)
+        integrity = create_ingestion_backends(settings, target_collection).integrity_checker
 
         self._chroma = chroma
         self._images = images
@@ -113,23 +106,27 @@ class DataService:
         """
         self._ensure_stores(collection)
         try:
-            results = self._chroma.collection.get(
-                where={"doc_hash": source_hash},
-                include=["documents", "metadatas"],
-            )
-            chunks: List[Dict[str, Any]] = []
-            ids = results.get("ids", [])
-            docs = results.get("documents", [])
-            metas = results.get("metadatas", [])
-            for i, cid in enumerate(ids):
-                chunks.append(
-                    {
-                        "id": cid,
-                        "text": docs[i] if docs else "",
-                        "metadata": metas[i] if metas else {},
-                    }
+            if hasattr(self._chroma, "list_by_metadata"):
+                return self._chroma.list_by_metadata({"doc_hash": source_hash})
+            if hasattr(self._chroma, "collection"):
+                results = self._chroma.collection.get(
+                    where={"doc_hash": source_hash},
+                    include=["documents", "metadatas"],
                 )
-            return chunks
+                chunks: List[Dict[str, Any]] = []
+                ids = results.get("ids", [])
+                docs = results.get("documents", [])
+                metas = results.get("metadatas", [])
+                for i, cid in enumerate(ids):
+                    chunks.append(
+                        {
+                            "id": cid,
+                            "text": docs[i] if docs else "",
+                            "metadata": metas[i] if metas else {},
+                        }
+                    )
+                return chunks
+            return []
         except Exception as exc:
             logger.warning("Failed to get chunks for %s: %s", source_hash, exc)
             return []

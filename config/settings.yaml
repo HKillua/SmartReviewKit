@@ -51,7 +51,49 @@ vector_store:
     search_ef: 100
   milvus:
     uri: "./data/db/milvus.db"
+    mode: "lite"              # lite / service
+    host: "127.0.0.1"
+    port: 19530
+    token: ""
+    user: ""
+    password: ""
+    db_name: ""
     dim: 768
+
+# =============================================================================
+# Production Shared Storage Configuration
+# =============================================================================
+postgres:
+  enabled: false
+  dsn: "postgresql://postgres:postgres@localhost:5432/modular_rag"
+
+redis:
+  enabled: false
+  url: "redis://localhost:6379/0"
+  ttl_seconds: 3600
+
+object_store:
+  provider: "local"          # local / minio
+  local_root: "./data/object_store"
+  endpoint: "127.0.0.1:9000"
+  bucket: "modular-rag"
+  access_key: "minioadmin"
+  secret_key: "minioadmin"
+  secure: false
+  uploads_prefix: "uploads"
+  images_prefix: "images"
+  context_prefix: "context"
+
+sparse_store:
+  provider: "bm25"           # bm25 / opensearch
+  index_dir: "./data/db/bm25"
+
+opensearch:
+  hosts:
+    - "http://localhost:9200"
+  index_prefix: "modular-rag"
+  username: ""
+  password: ""
 
 # =============================================================================
 # Retrieval Configuration
@@ -194,6 +236,7 @@ semantic_cache:
   similarity_threshold: 0.92   # 余弦相似度阈值，越高越严格
   ttl_seconds: 3600            # 缓存过期时间 (秒)
   max_size: 500                # 最大缓存条目数 (LRU 淘汰)
+  provider: "memory"           # memory / redis
 
 # =============================================================================
 # Self-Reflection (Anti-Hallucination)

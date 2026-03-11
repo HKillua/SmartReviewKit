@@ -1,8 +1,4 @@
-"""Milvus Lite vector store implementation (embedded / local mode).
-
-Uses ``pymilvus.MilvusClient`` with a local SQLite-based file to avoid
-any external server dependency.  Provides the same interface as ChromaStore.
-"""
+"""Milvus vector store implementation for both lite and service modes."""
 
 from __future__ import annotations
 
@@ -29,7 +25,7 @@ _DEFAULT_URI = "./data/db/milvus.db"
 
 
 class MilvusStore(BaseVectorStore):
-    """Milvus Lite (embedded) vector store implementation."""
+    """Milvus vector store implementation for local lite and remote service modes."""
 
     def __init__(self, settings: Settings, **kwargs: Any) -> None:
         if not PYMILVUS_AVAILABLE:
@@ -44,19 +40,41 @@ class MilvusStore(BaseVectorStore):
             getattr(vs_cfg, "collection_name", "knowledge_hub"),
         )
 
-        raw = getattr(settings, "_raw", None) or {}
-        milvus_cfg = raw.get("vector_store", {}).get("milvus", {}) if isinstance(raw, dict) else {}
-        self._dim = int(milvus_cfg.get("dim", _DEFAULT_DIM))
+        milvus_cfg = getattr(settings, "milvus", None)
+        self._dim = int(getattr(milvus_cfg, "dim", _DEFAULT_DIM))
+        mode = getattr(milvus_cfg, "mode", "lite")
 
         from src.core.settings import resolve_path
-        uri_str = milvus_cfg.get("uri", _DEFAULT_URI)
-        uri_path = resolve_path(uri_str)
-        uri_path.parent.mkdir(parents=True, exist_ok=True)
-        self._uri = str(uri_path)
 
-        logger.info(f"Initializing MilvusStore: uri={self._uri}, collection={self.collection_name}")
-
-        self.client = MilvusClient(uri=self._uri)
+        if mode == "service":
+            uri = getattr(milvus_cfg, "uri", "") or ""
+            if uri:
+                client_kwargs: Dict[str, Any] = {"uri": uri}
+            else:
+                host = getattr(milvus_cfg, "host", "")
+                port = int(getattr(milvus_cfg, "port", 19530))
+                client_kwargs = {"uri": f"http://{host}:{port}"}
+            token = getattr(milvus_cfg, "token", None)
+            user = getattr(milvus_cfg, "user", None)
+            password = getattr(milvus_cfg, "password", None)
+            db_name = getattr(milvus_cfg, "db_name", None)
+            if token:
+                client_kwargs["token"] = token
+            elif user:
+                client_kwargs["user"] = user
+                client_kwargs["password"] = password or ""
+            if db_name:
+                client_kwargs["db_name"] = db_name
+            self._uri = str(client_kwargs["uri"])
+            logger.info("Initializing MilvusStore in service mode: uri=%s, collection=%s", self._uri, self.collection_name)
+            self.client = MilvusClient(**client_kwargs)
+        else:
+            uri_str = getattr(milvus_cfg, "uri", _DEFAULT_URI)
+            uri_path = resolve_path(uri_str)
+            uri_path.parent.mkdir(parents=True, exist_ok=True)
+            self._uri = str(uri_path)
+            logger.info("Initializing MilvusStore in lite mode: uri=%s, collection=%s", self._uri, self.collection_name)
+            self.client = MilvusClient(uri=self._uri)
         self._ensure_collection(self.collection_name)
 
         logger.info("MilvusStore initialized successfully")
@@ -87,7 +105,11 @@ class MilvusStore(BaseVectorStore):
             FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=65535),
             FieldSchema(name="metadata_json", dtype=DataType.VARCHAR, max_length=65535),
             FieldSchema(name="source_path", dtype=DataType.VARCHAR, max_length=1024),
+            FieldSchema(name="source_ref", dtype=DataType.VARCHAR, max_length=512),
+            FieldSchema(name="source_type", dtype=DataType.VARCHAR, max_length=128),
             FieldSchema(name="content_type", dtype=DataType.VARCHAR, max_length=64),
+            FieldSchema(name="doc_hash", dtype=DataType.VARCHAR, max_length=128),
+            FieldSchema(name="page_num", dtype=DataType.INT64),
             FieldSchema(name="has_formula", dtype=DataType.BOOL),
             FieldSchema(name="is_parent", dtype=DataType.BOOL),
             FieldSchema(name="parent_chunk_id", dtype=DataType.VARCHAR, max_length=512),
@@ -123,7 +145,11 @@ class MilvusStore(BaseVectorStore):
                 "text": meta.get("text", str(r["id"])),
                 "metadata_json": json.dumps(meta, ensure_ascii=False, default=str),
                 "source_path": str(meta.get("source_path", "")),
+                "source_ref": str(meta.get("source_ref", "")),
+                "source_type": str(meta.get("source_type", "")),
                 "content_type": str(meta.get("content_type", "")),
+                "doc_hash": str(meta.get("doc_hash", "")),
+                "page_num": int(meta.get("page_num", meta.get("page", 0)) or 0),
                 "has_formula": bool(meta.get("has_formula", False)),
                 "is_parent": bool(meta.get("is_parent", False)),
                 "parent_chunk_id": str(meta.get("parent_chunk_id", "")),
@@ -149,7 +175,8 @@ class MilvusStore(BaseVectorStore):
             collection_name=self.collection_name,
             data=[vector],
             limit=top_k,
-            output_fields=["text", "metadata_json", "source_path", "content_type",
+            output_fields=["text", "metadata_json", "source_path", "source_ref", "source_type", "content_type",
+                           "doc_hash", "page_num",
                            "has_formula", "is_parent", "parent_chunk_id"],
             search_params=search_params,
             filter=filter_expr or "",
@@ -206,7 +233,7 @@ class MilvusStore(BaseVectorStore):
         results = self.client.get(
             collection_name=self.collection_name,
             ids=ids,
-            output_fields=["text", "metadata_json"],
+            output_fields=["text", "metadata_json", "source_path", "source_ref", "source_type", "content_type", "doc_hash", "page_num"],
         )
 
         id_map: Dict[str, Dict[str, Any]] = {}
@@ -223,6 +250,29 @@ class MilvusStore(BaseVectorStore):
             }
 
         return [id_map.get(i, {}) for i in ids]
+
+    def list_by_metadata(self, filter_dict: Dict[str, Any]) -> List[Dict[str, Any]]:
+        expr = self._build_filter_expr(filter_dict)
+        if not expr:
+            return []
+        results = self.client.query(
+            collection_name=self.collection_name,
+            filter=expr,
+            output_fields=["id", "text", "metadata_json"],
+        )
+        records: List[Dict[str, Any]] = []
+        for record in results:
+            meta_str = record.get("metadata_json", "{}")
+            try:
+                meta = json.loads(meta_str)
+            except (json.JSONDecodeError, TypeError):
+                meta = {}
+            records.append({
+                "id": record.get("id", ""),
+                "text": record.get("text", ""),
+                "metadata": meta,
+            })
+        return records
 
     def delete_by_metadata(
         self,

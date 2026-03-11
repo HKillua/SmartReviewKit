@@ -29,11 +29,17 @@ class DocumentIngestTool(Tool[DocumentIngestArgs]):
         pipeline: Any = None,
         allowed_dirs: list[str] | None = None,
         semantic_cache: Any = None,
+        object_store: Any = None,
+        document_registry: Any = None,
+        task_store: Any = None,
     ) -> None:
         self._settings = settings
         self._pipeline = pipeline
         self._allowed_dirs = allowed_dirs or ["data/uploads", "docs"]
         self._semantic_cache = semantic_cache
+        self._object_store = object_store
+        self._document_registry = document_registry
+        self._task_store = task_store
 
     @property
     def name(self) -> str:
@@ -77,6 +83,20 @@ class DocumentIngestTool(Tool[DocumentIngestArgs]):
         if ext not in (".pdf", ".pptx"):
             return ToolResult(success=False, error=f"不支持的文件格式: {ext}，仅支持 .pdf 和 .pptx")
 
+        uploaded_object_key = str(context.metadata.get("uploaded_object_key", "") or "")
+        task_id = ""
+        if self._task_store is not None:
+            try:
+                task_id = self._task_store.create_task(
+                    file_path=str(path),
+                    collection=args.collection,
+                    object_uri=self._object_store.uri_for(uploaded_object_key) if uploaded_object_key and self._object_store else "",
+                )
+                self._task_store.update_status(task_id, "running")
+            except Exception:
+                logger.warning("Failed to create ingestion task record", exc_info=True)
+                task_id = ""
+
         try:
             pipeline = self._get_pipeline(args.collection)
             result = await asyncio.to_thread(pipeline.run, str(path))
@@ -87,6 +107,27 @@ class DocumentIngestTool(Tool[DocumentIngestArgs]):
                         self._semantic_cache.invalidate_by_collection(args.collection)
                     except Exception:
                         logger.debug("Semantic cache invalidation failed", exc_info=True)
+                if self._document_registry is not None and result.doc_id:
+                    try:
+                        self._document_registry.upsert_document(
+                            file_hash=result.doc_id,
+                            file_path=str(path),
+                            collection=args.collection,
+                            status="ready",
+                            object_uri=self._object_store.uri_for(uploaded_object_key) if uploaded_object_key and self._object_store else "",
+                            metadata={
+                                "chunk_count": result.chunk_count,
+                                "image_count": result.image_count,
+                                "task_id": task_id,
+                            },
+                        )
+                    except Exception:
+                        logger.warning("Failed to upsert document registry entry", exc_info=True)
+                if task_id and self._task_store is not None:
+                    try:
+                        self._task_store.update_status(task_id, "succeeded")
+                    except Exception:
+                        logger.warning("Failed to update ingestion task status", exc_info=True)
 
                 return ToolResult(
                     success=True,
@@ -100,11 +141,23 @@ class DocumentIngestTool(Tool[DocumentIngestArgs]):
                         "doc_id": result.doc_id,
                         "chunk_count": result.chunk_count,
                         "image_count": result.image_count,
+                        "task_id": task_id,
+                        "object_uri": self._object_store.uri_for(uploaded_object_key) if uploaded_object_key and self._object_store else "",
                     },
                 )
             else:
+                if task_id and self._task_store is not None:
+                    try:
+                        self._task_store.update_status(task_id, "failed", result.error or "")
+                    except Exception:
+                        logger.warning("Failed to update ingestion task status", exc_info=True)
                 return ToolResult(success=False, error=f"入库失败: {result.error}")
 
         except Exception as exc:
             logger.exception("DocumentIngestTool failed")
+            if task_id and self._task_store is not None:
+                try:
+                    self._task_store.update_status(task_id, "failed", str(exc))
+                except Exception:
+                    logger.warning("Failed to update ingestion task status", exc_info=True)
             return ToolResult(success=False, error=f"入库异常: {exc}")

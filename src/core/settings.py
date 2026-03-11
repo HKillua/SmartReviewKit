@@ -124,6 +124,19 @@ class VectorStoreSettings:
 
 
 @dataclass(frozen=True)
+class MilvusServiceSettings:
+    uri: str
+    mode: str = "lite"
+    host: str = ""
+    port: int = 19530
+    token: Optional[str] = None
+    user: Optional[str] = None
+    password: Optional[str] = None
+    db_name: Optional[str] = None
+    dim: int = 768
+
+
+@dataclass(frozen=True)
 class RetrievalSettings:
     dense_top_k: int
     sparse_top_k: int
@@ -155,6 +168,47 @@ class ObservabilitySettings:
 
 
 @dataclass(frozen=True)
+class PostgresSettings:
+    enabled: bool = False
+    dsn: str = ""
+
+
+@dataclass(frozen=True)
+class RedisSettings:
+    enabled: bool = False
+    url: str = ""
+    ttl_seconds: int = 3600
+
+
+@dataclass(frozen=True)
+class ObjectStoreSettings:
+    provider: str = "local"
+    local_root: str = "./data/object_store"
+    endpoint: str = ""
+    bucket: str = "modular-rag"
+    access_key: str = ""
+    secret_key: str = ""
+    secure: bool = False
+    uploads_prefix: str = "uploads"
+    images_prefix: str = "images"
+    context_prefix: str = "context"
+
+
+@dataclass(frozen=True)
+class SparseStoreSettings:
+    provider: str = "bm25"
+    index_dir: str = "./data/db/bm25"
+
+
+@dataclass(frozen=True)
+class OpenSearchSettings:
+    hosts: List[str]
+    index_prefix: str = "modular-rag"
+    username: Optional[str] = None
+    password: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class VisionLLMSettings:
     enabled: bool
     provider: str
@@ -182,10 +236,16 @@ class Settings:
     llm: LLMSettings
     embedding: EmbeddingSettings
     vector_store: VectorStoreSettings
+    milvus: MilvusServiceSettings
     retrieval: RetrievalSettings
     rerank: RerankSettings
     evaluation: EvaluationSettings
     observability: ObservabilitySettings
+    postgres: PostgresSettings
+    redis: RedisSettings
+    object_store: ObjectStoreSettings
+    sparse_store: SparseStoreSettings
+    opensearch: OpenSearchSettings
     ingestion: Optional[IngestionSettings] = None
     vision_llm: Optional[VisionLLMSettings] = None
 
@@ -201,6 +261,12 @@ class Settings:
         rerank = _require_mapping(data, "rerank", "settings")
         evaluation = _require_mapping(data, "evaluation", "settings")
         observability = _require_mapping(data, "observability", "settings")
+        milvus_cfg = vector_store.get("milvus", {}) if isinstance(vector_store.get("milvus", {}), dict) else {}
+        postgres_cfg = data.get("postgres", {}) if isinstance(data.get("postgres", {}), dict) else {}
+        redis_cfg = data.get("redis", {}) if isinstance(data.get("redis", {}), dict) else {}
+        object_store_cfg = data.get("object_store", {}) if isinstance(data.get("object_store", {}), dict) else {}
+        sparse_store_cfg = data.get("sparse_store", {}) if isinstance(data.get("sparse_store", {}), dict) else {}
+        opensearch_cfg = data.get("opensearch", {}) if isinstance(data.get("opensearch", {}), dict) else {}
 
         ingestion_settings = None
         if "ingestion" in data:
@@ -256,6 +322,17 @@ class Settings:
                 persist_directory=_require_str(vector_store, "persist_directory", "vector_store"),
                 collection_name=_require_str(vector_store, "collection_name", "vector_store"),
             ),
+            milvus=MilvusServiceSettings(
+                uri=str(milvus_cfg.get("uri", "./data/db/milvus.db")),
+                mode=str(milvus_cfg.get("mode", "lite")),
+                host=str(milvus_cfg.get("host", "")),
+                port=int(milvus_cfg.get("port", 19530)),
+                token=milvus_cfg.get("token"),
+                user=milvus_cfg.get("user"),
+                password=milvus_cfg.get("password"),
+                db_name=milvus_cfg.get("db_name"),
+                dim=int(milvus_cfg.get("dim", 768)),
+            ),
             retrieval=RetrievalSettings(
                 dense_top_k=_require_int(retrieval, "dense_top_k", "retrieval"),
                 sparse_top_k=_require_int(retrieval, "sparse_top_k", "retrieval"),
@@ -278,6 +355,37 @@ class Settings:
                 trace_enabled=_require_bool(observability, "trace_enabled", "observability"),
                 trace_file=_require_str(observability, "trace_file", "observability"),
                 structured_logging=_require_bool(observability, "structured_logging", "observability"),
+            ),
+            postgres=PostgresSettings(
+                enabled=bool(postgres_cfg.get("enabled", False)),
+                dsn=str(postgres_cfg.get("dsn", "")),
+            ),
+            redis=RedisSettings(
+                enabled=bool(redis_cfg.get("enabled", False)),
+                url=str(redis_cfg.get("url", "")),
+                ttl_seconds=int(redis_cfg.get("ttl_seconds", 3600)),
+            ),
+            object_store=ObjectStoreSettings(
+                provider=str(object_store_cfg.get("provider", "local")),
+                local_root=str(object_store_cfg.get("local_root", "./data/object_store")),
+                endpoint=str(object_store_cfg.get("endpoint", "")),
+                bucket=str(object_store_cfg.get("bucket", "modular-rag")),
+                access_key=str(object_store_cfg.get("access_key", "")),
+                secret_key=str(object_store_cfg.get("secret_key", "")),
+                secure=bool(object_store_cfg.get("secure", False)),
+                uploads_prefix=str(object_store_cfg.get("uploads_prefix", "uploads")),
+                images_prefix=str(object_store_cfg.get("images_prefix", "images")),
+                context_prefix=str(object_store_cfg.get("context_prefix", "context")),
+            ),
+            sparse_store=SparseStoreSettings(
+                provider=str(sparse_store_cfg.get("provider", "bm25")),
+                index_dir=str(sparse_store_cfg.get("index_dir", "./data/db/bm25")),
+            ),
+            opensearch=OpenSearchSettings(
+                hosts=[str(item) for item in opensearch_cfg.get("hosts", ["http://localhost:9200"])],
+                index_prefix=str(opensearch_cfg.get("index_prefix", "modular-rag")),
+                username=opensearch_cfg.get("username"),
+                password=opensearch_cfg.get("password"),
             ),
             ingestion=ingestion_settings,
             vision_llm=vision_llm_settings,

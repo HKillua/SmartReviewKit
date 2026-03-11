@@ -492,6 +492,22 @@ class ChromaStore(BaseVectorStore):
             'name': self.collection_name,
             'metadata': self.collection.metadata
         }
+
+    def list_by_metadata(self, filter_dict: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Return all records matching a metadata filter."""
+        where = self._build_where_clause(filter_dict)
+        results = self.collection.get(where=where, include=["metadatas", "documents"])
+        output: List[Dict[str, Any]] = []
+        ids = results.get("ids", [])
+        docs = results.get("documents", [])
+        metas = results.get("metadatas", [])
+        for i, record_id in enumerate(ids):
+            output.append({
+                "id": record_id,
+                "text": docs[i] if docs else "",
+                "metadata": metas[i] if metas else {},
+            })
+        return output
     
     def get_by_ids(
         self,
