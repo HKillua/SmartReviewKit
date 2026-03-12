@@ -52,7 +52,7 @@ class SparseEncoder:
 
     def __init__(
         self,
-        min_term_length: int = 1,
+        min_term_length: int = 2,
         lowercase: bool = True,
         use_stopwords: bool = True,
     ):

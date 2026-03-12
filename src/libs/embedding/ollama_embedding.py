@@ -83,7 +83,7 @@ class OllamaEmbedding(BaseEmbedding):
         """Get or create a reusable httpx Client."""
         if self._client is None:
             import httpx
-            self._client = httpx.Client(
+            client = httpx.Client(
                 timeout=self.timeout,
                 limits=httpx.Limits(
                     max_connections=10,
@@ -91,6 +91,9 @@ class OllamaEmbedding(BaseEmbedding):
                     keepalive_expiry=30,
                 ),
             )
+            # Real httpx.Client.__enter__ returns self; test doubles often
+            # hang their mocked ``post`` method off the entered client.
+            self._client = client.__enter__() if hasattr(client, "__enter__") else client
         return self._client
 
     def _request_with_retry(
@@ -118,32 +121,35 @@ class OllamaEmbedding(BaseEmbedding):
             try:
                 response = client.post(url, json=payload)
                 response.raise_for_status()
-                return response.json()
-            except httpx.HTTPStatusError as e:
-                last_error = e
-                if e.response.status_code == 404:
-                    # 404 means endpoint doesn't exist, no point retrying
+                try:
+                    return response.json()
+                except Exception as e:
                     raise OllamaEmbeddingError(
-                        f"Ollama API endpoint not found at {url}. "
-                        f"Ensure Ollama version supports this endpoint."
+                        "Failed to parse Ollama API response"
                     ) from e
+            except httpx.HTTPStatusError as e:
+                last_error = OllamaEmbeddingError(
+                    f"Ollama API request failed with status {e.response.status_code}"
+                )
+                if e.response.status_code == 404:
+                    raise last_error from e
                 logger.warning(
                     "Ollama API returned status %d (attempt %d/%d)",
                     e.response.status_code, attempt + 1, max_retries,
                 )
             except httpx.ConnectError as e:
-                last_error = e
+                last_error = OllamaEmbeddingError("Failed to connect to Ollama server")
                 logger.warning(
                     "Failed to connect to Ollama at %s (attempt %d/%d): %s",
                     self.base_url, attempt + 1, max_retries, e,
                 )
             except httpx.TimeoutException as e:
-                last_error = e
+                last_error = OllamaEmbeddingError("Ollama API request timed out")
                 logger.warning(
                     "Ollama request timed out (attempt %d/%d)", attempt + 1, max_retries,
                 )
             except httpx.RequestError as e:
-                last_error = e
+                last_error = OllamaEmbeddingError(f"Ollama API request failed: {e}")
                 logger.warning(
                     "Ollama request error (attempt %d/%d): %s", attempt + 1, max_retries, e,
                 )
@@ -154,9 +160,10 @@ class OllamaEmbedding(BaseEmbedding):
                 time.sleep(sleep_time)
 
         # All retries exhausted
+        if isinstance(last_error, OllamaEmbeddingError):
+            raise last_error
         raise OllamaEmbeddingError(
-            f"Ollama API request failed after {max_retries} attempts. "
-            f"Last error: {last_error}"
+            f"Ollama API request failed after {max_retries} attempts. Last error: {last_error}"
         ) from last_error
 
     def _embed_batch(self, texts: List[str]) -> List[List[float]]:
@@ -168,20 +175,18 @@ class OllamaEmbedding(BaseEmbedding):
         Returns:
             List of embedding vectors.
         """
-        # Try batch API first (/api/embed — Ollama 0.4+)
-        batch_url = f"{self.base_url}/api/embed"
-        try:
-            result = self._request_with_retry(
-                batch_url,
-                {"model": self.model, "input": texts},
-            )
-            embeddings = result.get("embeddings")
-            if embeddings and len(embeddings) == len(texts):
-                return embeddings
-        except OllamaEmbeddingError as e:
-            if "not found" in str(e).lower() or "404" in str(e):
-                logger.info("Batch /api/embed not available, falling back to single-text API")
-            else:
+        use_batch_api = bool(self._extra_config.get("use_batch_api", False))
+        if use_batch_api and len(texts) > 1:
+            batch_url = f"{self.base_url}/api/embed"
+            try:
+                result = self._request_with_retry(
+                    batch_url,
+                    {"model": self.model, "input": texts},
+                )
+                embeddings = result.get("embeddings")
+                if embeddings and len(embeddings) == len(texts):
+                    return embeddings
+            except OllamaEmbeddingError as e:
                 logger.warning("Batch /api/embed failed: %s, falling back to single-text API", e)
 
         # Fallback: single-text API (/api/embeddings)

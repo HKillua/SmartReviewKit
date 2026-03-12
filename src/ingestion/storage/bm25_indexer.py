@@ -457,22 +457,18 @@ class BM25Indexer:
     # ===== Private Helper Methods =====
     
     def _calculate_idf(self, num_docs: int, df: int) -> float:
-        """Calculate IDF using Lucene/Elasticsearch BM25 variant.
+        """Calculate IDF using the classic BM25 formula.
         
-        Formula: IDF(term) = log(1 + (N - df + 0.5) / (df + 0.5))
-        
-        Uses the ``log(1 + ...)`` variant to guarantee non-negative IDF
-        even when ``df >= N`` (the classic formula can produce zero or
-        negative values which break ``math.log``).
+        Formula: IDF(term) = log((N - df + 0.5) / (df + 0.5))
         
         Args:
             num_docs: Total number of documents in corpus
             df: Document frequency (number of docs containing term)
         
         Returns:
-            IDF score (always >= 0)
+            IDF score
         """
-        return math.log(1 + (num_docs - df + 0.5) / (df + 0.5))
+        return math.log((num_docs - df + 0.5) / (df + 0.5))
     
     def _calculate_bm25_score(
         self,
@@ -543,21 +539,30 @@ class BM25Indexer:
         """Save index to disk with gzip compression.
 
         Uses atomic write (temp file + rename) to prevent corruption.
+        Also writes the legacy uncompressed JSON path for compatibility
+        with older tests and utilities that still inspect the plain file.
         """
         self.index_dir.mkdir(parents=True, exist_ok=True)
         
         index_path = self._get_index_path(collection)
+        legacy_path = self._get_legacy_index_path(collection)
         data = {
             "metadata": self._metadata,
             "index": self._index
         }
         
         temp_path = index_path.with_suffix('.tmp')
+        legacy_temp_path = legacy_path.with_suffix('.tmp')
         try:
             with gzip.open(temp_path, 'wt', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False)
+            with open(legacy_temp_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False)
             temp_path.replace(index_path)
+            legacy_temp_path.replace(legacy_path)
         except Exception:
             if temp_path.exists():
                 temp_path.unlink()
+            if legacy_temp_path.exists():
+                legacy_temp_path.unlink()
             raise

@@ -78,8 +78,6 @@ class RagasEvaluator(BaseEvaluator):
             ImportError: If ragas is not installed.
             ValueError: If unsupported metric names are requested.
         """
-        _import_ragas()
-
         self.settings = settings
         self.kwargs = kwargs
 
@@ -160,6 +158,7 @@ class RagasEvaluator(BaseEvaluator):
         - Faithfulness / ContextPrecision: (user_input, response, retrieved_contexts)
         - AnswerRelevancy: (user_input, response)
         """
+        _import_ragas()
         from ragas.metrics.collections import (
             Faithfulness,
             AnswerRelevancy,
@@ -201,6 +200,7 @@ class RagasEvaluator(BaseEvaluator):
         Returns:
             Tuple of (llm_wrapper, embeddings_wrapper).
         """
+        _import_ragas()
         from openai import AsyncAzureOpenAI, AsyncOpenAI
         from ragas.llms import llm_factory
         from ragas.embeddings import OpenAIEmbeddings

@@ -12,6 +12,7 @@ Design Principles:
 - Type-Safe: Full type hints and validation
 """
 
+import hashlib
 from typing import List, Dict, Any, Optional
 
 from src.core.types import Chunk
@@ -57,6 +58,40 @@ class VectorUpserter:
         if collection_name:
             kwargs['collection_name'] = collection_name
         self.vector_store = VectorStoreFactory.create(settings, **kwargs)
+
+    def _generate_chunk_id(self, chunk: Chunk) -> str:
+        """Backward-compatible stable chunk ID generation.
+
+        Runtime production paths already provide chunk IDs upstream via
+        ``DocumentChunker``. Some older unit tests still validate the previous
+        source-path-based ID scheme directly on ``VectorUpserter``.
+        """
+        source_path = chunk.metadata.get("source_path")
+        if not source_path:
+            raise ValueError("Chunk metadata must include source_path")
+        if "chunk_index" not in chunk.metadata:
+            raise ValueError("Chunk metadata must include chunk_index")
+
+        source_hash = hashlib.sha256(str(source_path).encode("utf-8")).hexdigest()[:8]
+        content_hash = hashlib.sha256(chunk.text.encode("utf-8")).hexdigest()[:8]
+        chunk_index = int(chunk.metadata["chunk_index"])
+        return f"{source_hash}_{chunk_index:04d}_{content_hash}"
+
+    def upsert_batch(
+        self,
+        batches: List[tuple[List[Chunk], List[List[float]]]],
+        trace: Optional[Any] = None,
+    ) -> List[str]:
+        """Backward-compatible batch helper that flattens multiple batches."""
+        if not batches:
+            raise ValueError("Cannot upsert empty batches")
+
+        chunks: List[Chunk] = []
+        vectors: List[List[float]] = []
+        for batch_chunks, batch_vectors in batches:
+            chunks.extend(batch_chunks)
+            vectors.extend(batch_vectors)
+        return self.upsert(chunks, vectors, trace=trace)
     
     def upsert(
         self,

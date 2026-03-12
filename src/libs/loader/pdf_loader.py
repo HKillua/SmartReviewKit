@@ -102,10 +102,10 @@ class PdfLoader(BaseLoader):
                 text_content, images_metadata = self._extract_and_process_images(
                     path, text_content, doc_hash
                 )
-                if images_metadata:
-                    metadata["images"] = images_metadata
+                metadata["images"] = images_metadata
             except Exception as e:
                 logger.warning(f"Image extraction failed for {path}, continuing text-only: {e}")
+                metadata["images"] = []
 
         # Structure detection → sections
         sections = self._detect_sections(text_content)
@@ -189,6 +189,10 @@ class PdfLoader(BaseLoader):
                 return line
         return None
 
+    @staticmethod
+    def _generate_image_id(doc_hash: str, page_num: int, img_index: int) -> str:
+        return f"{doc_hash[:8]}_{page_num}_{img_index}"
+
     def _extract_and_process_images(
         self, pdf_path: Path, text_content: str, doc_hash: str,
     ) -> tuple[str, List[Dict[str, Any]]]:
@@ -219,7 +223,7 @@ class PdfLoader(BaseLoader):
                             image_bytes = base_image["image"]
                             image_ext = base_image["ext"]
 
-                            image_id = f"{doc_hash[:8]}_{page_num + 1}_{img_index + 1}"
+                            image_id = self._generate_image_id(doc_hash, page_num + 1, img_index + 1)
                             image_path = image_dir / f"{image_id}.{image_ext}"
                             image_path.write_bytes(image_bytes)
 
