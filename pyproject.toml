@@ -71,6 +71,7 @@ markers = [
     "integration: Integration tests (may require external services)",
     "e2e: End-to-end tests (full system tests)",
     "llm: marks tests that require real LLM API calls (deselect with '-m \"not llm\"')",
+    "image: marks tests that exercise image-related flows",
     "slow: Slow tests that should be run less frequently",
 ]
 addopts = "-v --tb=short"

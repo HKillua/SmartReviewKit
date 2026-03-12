@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import logging
 import os
 from pathlib import Path
@@ -373,8 +374,34 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
 
     chat_handler = ChatHandler(agent)
 
+    feedback_store = create_feedback_store(settings)
+
+    @asynccontextmanager
+    async def _lifespan(_: FastAPI):
+        if agent_cfg.auto_ingest_dir:
+            logger.info("Running startup auto-ingestion from: %s", agent_cfg.auto_ingest_dir)
+            _auto_ingest(agent_cfg.auto_ingest_dir, collection, settings_path=settings_path)
+        try:
+            yield
+        finally:
+            logger.info("Shutting down — closing resources...")
+            for store in (profile_mem, error_mem, kmap_mem, skill_mem, session_mem):
+                if store and hasattr(store, "close"):
+                    try:
+                        await store.close()
+                    except Exception:
+                        logger.warning("Failed to close memory store %s", type(store).__name__)
+            if feedback_store:
+                try:
+                    maybe = feedback_store.close()
+                    if hasattr(maybe, "__await__"):
+                        await maybe
+                except Exception:
+                    logger.warning("Failed to close FeedbackStore")
+            logger.info("Shutdown complete")
+
     # --- FastAPI ---
-    app = FastAPI(title="Course Learning Agent", version="0.1.0")
+    app = FastAPI(title="Course Learning Agent", version="0.1.0", lifespan=_lifespan)
     app.state.agent = agent
     app.state.chat_handler = chat_handler
     app.state.settings_path = settings_path
@@ -387,7 +414,6 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         allow_headers=["*"],
     )
 
-    feedback_store = create_feedback_store(settings)
     configure_routes(
         chat_handler, agent,
         server_cfg.upload_dir, server_cfg.max_upload_size_mb,
@@ -404,32 +430,6 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         @app.get("/", response_class=HTMLResponse)
         async def index():
             return (web_dir / "index.html").read_text(encoding="utf-8")
-
-    # --- Startup: auto-ingest course materials ---
-    @app.on_event("startup")
-    async def _startup_auto_ingest() -> None:
-        if agent_cfg.auto_ingest_dir:
-            logger.info("Running startup auto-ingestion from: %s", agent_cfg.auto_ingest_dir)
-            _auto_ingest(agent_cfg.auto_ingest_dir, collection, settings_path=settings_path)
-
-    # --- Shutdown: close DB connections and resources ---
-    @app.on_event("shutdown")
-    async def _shutdown_cleanup() -> None:
-        logger.info("Shutting down — closing resources...")
-        for store in (profile_mem, error_mem, kmap_mem, skill_mem, session_mem):
-            if store and hasattr(store, "close"):
-                try:
-                    await store.close()
-                except Exception:
-                    logger.warning("Failed to close memory store %s", type(store).__name__)
-        if feedback_store:
-            try:
-                maybe = feedback_store.close()
-                if hasattr(maybe, "__await__"):
-                    await maybe
-            except Exception:
-                logger.warning("Failed to close FeedbackStore")
-        logger.info("Shutdown complete")
 
     logger.info(
         "Agent ready — tools: %s, skills: %s",
