@@ -192,12 +192,78 @@ class GetDocumentSummaryTool:
         self._chroma_client = VectorStoreFactory.create(self.settings)
         return self._chroma_client
 
+    def _should_use_chroma_client(self) -> bool:
+        provider = getattr(getattr(self._settings, "vector_store", None), "provider", None)
+        if provider is not None:
+            return str(provider).lower() == "chroma"
+        return self._config is not None
+
+    def _get_chroma_client(self) -> Any:
+        """Backward-compatible Chroma client accessor for legacy MCP tests."""
+        if self._chroma_client is not None:
+            return self._chroma_client
+        try:
+            import chromadb
+        except ImportError as exc:
+            raise ImportError("chromadb package is required for get_document_summary") from exc
+
+        persist_dir = Path(self.config.persist_directory)
+        persist_dir.mkdir(parents=True, exist_ok=True)
+        self._chroma_client = chromadb.PersistentClient(path=str(persist_dir))
+        return self._chroma_client
+
+    def _get_collection(self, collection_name: Optional[str] = None) -> Any:
+        name = collection_name or self.config.default_collection
+        try:
+            return self._get_chroma_client().get_collection(name=name)
+        except Exception as exc:
+            raise ValueError(f"Failed to get collection '{name}': {exc}") from exc
+
     def _find_document_chunks(
         self,
         doc_id: str,
         collection_name: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Find all chunks belonging to a document (provider-agnostic)."""
+        if self._should_use_chroma_client():
+            collection = self._get_collection(collection_name)
+            include = ["metadatas", "documents"]
+            try:
+                results = collection.get(where={"source_ref": doc_id}, include=include)
+            except Exception as e:
+                logger.debug(f"source_ref search failed: {e}")
+                results = {"ids": [], "documents": [], "metadatas": []}
+
+            if results and results.get("ids"):
+                return [
+                    {
+                        "id": results["ids"][i],
+                        "text": (results.get("documents") or [""])[i] or "",
+                        "metadata": (results.get("metadatas") or [{}])[i] or {},
+                    }
+                    for i in range(len(results["ids"]))
+                ]
+
+            try:
+                all_results = collection.get(include=include)
+            except Exception as e:
+                logger.debug(f"fallback chunk scan failed: {e}")
+                return []
+
+            matches: List[Dict[str, Any]] = []
+            ids = all_results.get("ids") or []
+            docs = all_results.get("documents") or []
+            metas = all_results.get("metadatas") or []
+            for i, chunk_id in enumerate(ids):
+                metadata = metas[i] if i < len(metas) else {}
+                if metadata.get("source_ref") == doc_id or str(chunk_id).startswith(doc_id):
+                    matches.append({
+                        "id": chunk_id,
+                        "text": docs[i] if i < len(docs) else "",
+                        "metadata": metadata or {},
+                    })
+            return matches
+
         store = self._get_store()
 
         if collection_name and hasattr(store, "get_or_switch_collection"):

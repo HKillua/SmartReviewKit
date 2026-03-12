@@ -116,6 +116,7 @@ class ListCollectionsTool:
         """
         self._settings = settings
         self._config = config
+        self._chroma_client = None
         
     @property
     def settings(self) -> Settings:
@@ -148,12 +149,52 @@ class ListCollectionsTool:
         from src.libs.vector_store import VectorStoreFactory
         return VectorStoreFactory.create(self.settings)
 
+    def _should_use_chroma_client(self) -> bool:
+        provider = getattr(getattr(self._settings, "vector_store", None), "provider", None)
+        if provider is not None:
+            return str(provider).lower() == "chroma"
+        return self._config is not None
+
+    def _get_chroma_client(self) -> Any:
+        """Backward-compatible Chroma client accessor for legacy MCP tests."""
+        if self._chroma_client is not None:
+            return self._chroma_client
+        try:
+            import chromadb
+        except ImportError as exc:
+            raise ImportError("chromadb package is required for list_collections") from exc
+
+        persist_dir = Path(self.config.persist_directory)
+        persist_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self._chroma_client = chromadb.PersistentClient(path=str(persist_dir))
+        except Exception as exc:
+            raise RuntimeError(f"Failed to initialize ChromaDB client: {exc}") from exc
+        return self._chroma_client
+
     def list_collections(
         self,
         include_stats: bool = True
     ) -> List[CollectionInfo]:
         """List all available collections."""
         try:
+            if self._should_use_chroma_client():
+                client = self._get_chroma_client()
+                collections_info: List[CollectionInfo] = []
+                for coll in client.list_collections():
+                    info = CollectionInfo(
+                        name=getattr(coll, "name", "unknown"),
+                        metadata=getattr(coll, "metadata", None),
+                    )
+                    if include_stats:
+                        try:
+                            info.count = coll.count()
+                        except Exception as e:
+                            logger.warning(f"Stats failed for '{info.name}': {e}")
+                    collections_info.append(info)
+                logger.info(f"Found {len(collections_info)} collections")
+                return collections_info
+
             store = self._get_store()
         except Exception as e:
             logger.error(f"Failed to create vector store: {e}")
@@ -243,7 +284,7 @@ class ListCollectionsTool:
             # Run blocking ChromaDB I/O in a thread to avoid blocking
             # the async event loop / MCP stdio transport
             collections = await asyncio.to_thread(
-                self.list_collections, include_stats,
+                self.list_collections, include_stats=include_stats,
             )
             response_text = self.format_response(collections)
             

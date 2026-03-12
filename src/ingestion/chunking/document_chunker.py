@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, List, Optional, Union
 
 from src.core.types import Chunk, Document
@@ -32,10 +33,12 @@ class DocumentChunker:
         self._parent_size = 2400
         self._parent_overlap = 200
         if hasattr(settings, "ingestion") and settings.ingestion:
-            raw = getattr(settings.ingestion, "chunk_refiner", None) or {}
+            raw = self._coerce_chunk_refiner_config(
+                getattr(settings.ingestion, "chunk_refiner", None)
+            )
             self._parent_child = bool(raw.get("parent_child_enabled", False))
-            self._parent_size = int(raw.get("parent_chunk_size", 2400))
-            self._parent_overlap = int(raw.get("parent_chunk_overlap", 200))
+            self._parent_size = self._safe_int(raw.get("parent_chunk_size"), 2400)
+            self._parent_overlap = self._safe_int(raw.get("parent_chunk_overlap"), 200)
 
     def split_document(
         self, document: Document, source_type: str = "slide",
@@ -144,6 +147,38 @@ class DocumentChunker:
     # ------------------------------------------------------------------
     # Shared helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _coerce_chunk_refiner_config(raw: object) -> dict:
+        """Coerce chunk refiner config into a plain dict.
+
+        Unit tests often pass ``Mock`` settings objects. Without guarding,
+        ``Mock.get(...)`` returns another mock, which then breaks ``int(...)``
+        coercion. Real settings may also be pydantic models instead of dicts.
+        """
+        if raw is None:
+            return {}
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, Mapping):
+            return dict(raw)
+        if hasattr(raw, "model_dump"):
+            try:
+                dumped = raw.model_dump()  # type: ignore[call-arg]
+                if isinstance(dumped, dict):
+                    return dumped
+            except Exception:
+                return {}
+        return {}
+
+    @staticmethod
+    def _safe_int(value: object, default: int) -> int:
+        try:
+            if value is None:
+                return default
+            return int(value)
+        except (TypeError, ValueError):
+            return default
 
     def _generate_chunk_id(
         self, doc_id: str, index: Union[int, str], text: str, prefix: str = ""

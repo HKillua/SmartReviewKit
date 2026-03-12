@@ -341,7 +341,9 @@ class HybridSearch:
         # Record retrieval quality summary for observability
         if trace is not None and final_results:
             scores = [r.score for r in final_results]
+            _t0_summary = time.monotonic()
             trace.record_stage("retrieval_summary", {
+                "method": "summary",
                 "total_results": len(final_results),
                 "score_max": round(max(scores), 4),
                 "score_min": round(min(scores), 4),
@@ -350,7 +352,7 @@ class HybridSearch:
                 "mmr_used": self.config.mmr_enabled,
                 "dedup_used": self.config.post_dedup_enabled,
                 "pipeline": "dense+sparse+rrf",
-            })
+            }, elapsed_ms=(time.monotonic() - _t0_summary) * 1000.0)
         
         logger.debug(f"HybridSearch: returning {len(final_results)} results")
         
@@ -687,12 +689,19 @@ class HybridSearch:
         weights = weights[:len(ranking_lists)]
         
         _t0 = time.monotonic()
-        fused = self.fusion.fuse_with_weights(
-            ranking_lists=ranking_lists,
-            weights=weights,
-            top_k=top_k,
-            trace=trace,
-        )
+        if hasattr(self.fusion, "fuse_with_weights"):
+            fused = self.fusion.fuse_with_weights(
+                ranking_lists=ranking_lists,
+                weights=weights,
+                top_k=top_k,
+                trace=trace,
+            )
+        else:
+            fused = self.fusion.fuse(
+                ranking_lists=ranking_lists,
+                top_k=top_k,
+                trace=trace,
+            )
         _elapsed = (time.monotonic() - _t0) * 1000.0
         if trace is not None:
             trace.record_stage("fusion", {
