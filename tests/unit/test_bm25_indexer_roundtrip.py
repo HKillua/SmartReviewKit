@@ -145,14 +145,14 @@ class TestIDFCalculation:
     def test_idf_calculation_formula(self, tmp_path):
         """Test that IDF is calculated correctly using BM25 formula.
         
-        Formula: IDF(term) = log((N - df + 0.5) / (df + 0.5))
+        Formula: IDF(term) = log(1 + ((N - df + 0.5) / (df + 0.5)))
         """
         indexer = BM25Indexer(index_dir=str(tmp_path))
         
         # N=3 docs, df=1 (term appears in 1 doc)
-        # Expected IDF = log((3 - 1 + 0.5) / (1 + 0.5)) = log(2.5 / 1.5) = log(1.6667)
+        # Expected IDF = log(1 + ((3 - 1 + 0.5) / (1 + 0.5))) = log(2.6667)
         import math
-        expected_idf = math.log((3 - 1 + 0.5) / (1 + 0.5))
+        expected_idf = math.log(1 + ((3 - 1 + 0.5) / (1 + 0.5)))
         
         actual_idf = indexer._calculate_idf(num_docs=3, df=1)
         

@@ -43,6 +43,20 @@ class OllamaLLM(BaseLLM):
     
     DEFAULT_BASE_URL = "http://localhost:11434"
     DEFAULT_TIMEOUT = 120.0  # Longer timeout for local inference
+
+    @staticmethod
+    def _coerce_float(value: Any, default: float) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _coerce_int(value: Any, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
     
     def __init__(
         self,
@@ -62,13 +76,20 @@ class OllamaLLM(BaseLLM):
         Raises:
             ValueError: If required configuration is missing.
         """
-        self.model = settings.llm.model
-        self.default_temperature = settings.llm.temperature
-        self.default_max_tokens = settings.llm.max_tokens
+        self.model = str(getattr(settings.llm, "model", "") or "llama3")
+        self.default_temperature = self._coerce_float(
+            getattr(settings.llm, "temperature", 0.3),
+            0.3,
+        )
+        self.default_max_tokens = self._coerce_int(
+            getattr(settings.llm, "max_tokens", 512),
+            512,
+        )
         
         # Base URL: explicit > env var > default
         self.base_url = (
             base_url 
+            or getattr(settings.llm, "base_url", None)
             or os.environ.get("OLLAMA_BASE_URL") 
             or self.DEFAULT_BASE_URL
         )
@@ -103,9 +124,15 @@ class OllamaLLM(BaseLLM):
         self.validate_messages(messages)
         
         # Prepare request parameters
-        temperature = kwargs.get("temperature", self.default_temperature)
-        max_tokens = kwargs.get("max_tokens", self.default_max_tokens)
-        model = kwargs.get("model", self.model)
+        temperature = self._coerce_float(
+            kwargs.get("temperature", self.default_temperature),
+            self.default_temperature,
+        )
+        max_tokens = self._coerce_int(
+            kwargs.get("max_tokens", self.default_max_tokens),
+            self.default_max_tokens,
+        )
+        model = str(kwargs.get("model", self.model) or self.model)
         
         # Convert messages to Ollama API format
         api_messages = [{"role": m.role, "content": m.content} for m in messages]

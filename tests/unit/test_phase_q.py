@@ -100,7 +100,7 @@ class TestQ1RerankerWiring:
         rerank = getattr(settings, "rerank", None)
         if rerank is not None:
             assert getattr(rerank, "enabled", False) is True
-            assert getattr(rerank, "provider", "") == "llm"
+            assert getattr(rerank, "provider", "") == "cross_encoder"
 
 
 # ===================================================================

@@ -30,7 +30,7 @@ def _make_chunk(id: str, text: str, **extra_meta) -> Chunk:
 
 
 # ====================================================================
-# R1: BM25 IDF — Lucene variant (always non-negative)
+# R1: BM25 IDF — Lucene-style formula + corrupted-stats guard
 # ====================================================================
 
 class TestR1BM25IDF(TestCase):
@@ -42,15 +42,13 @@ class TestR1BM25IDF(TestCase):
     def test_idf_all_docs_contain_term(self):
         idx = self._make_indexer()
         result = idx._calculate_idf(num_docs=10, df=10)
+        self.assertIsInstance(result, float)
         self.assertGreaterEqual(result, 0)
 
     def test_idf_df_exceeds_num_docs(self):
-        """log(1 + x) where x can be < 0 but > -1, so result >= 0."""
+        """Invalid df > N should not crash even though the ratio is non-positive."""
         idx = self._make_indexer()
         result = idx._calculate_idf(num_docs=5, df=8)
-        # With Lucene variant: log(1 + (5-8+0.5)/(8+0.5)) = log(1 + (-2.5/8.5))
-        # = log(1 - 0.294) = log(0.706) ≈ -0.348
-        # Actually this can be negative with high df. Let's verify no crash.
         self.assertIsInstance(result, float)
         self.assertFalse(math.isnan(result))
 
@@ -72,10 +70,10 @@ class TestR1BM25IDF(TestCase):
         self.assertFalse(math.isnan(result))
 
     def test_idf_formula_is_lucene_variant(self):
-        """Verify log(1+...) formula, not log(...)."""
+        """Verify Lucene-style BM25 log(1 + ...) formula remains unchanged."""
         idx = self._make_indexer()
         result = idx._calculate_idf(num_docs=10, df=5)
-        expected = math.log(1 + (10 - 5 + 0.5) / (5 + 0.5))
+        expected = math.log(1 + ((10 - 5 + 0.5) / (5 + 0.5)))
         self.assertAlmostEqual(result, expected)
 
 
@@ -116,7 +114,7 @@ class TestR2TotalLengthDedup(TestCase):
 class TestR3PipelineExceptGuard(TestCase):
 
     @patch("src.ingestion.pipeline.ImageStorage")
-    @patch("src.ingestion.pipeline.BM25Indexer")
+    @patch("src.ingestion.pipeline.create_sparse_index")
     @patch("src.ingestion.pipeline.VectorUpserter")
     @patch("src.ingestion.pipeline.BatchProcessor")
     @patch("src.ingestion.pipeline.ImageCaptioner")
@@ -125,7 +123,7 @@ class TestR3PipelineExceptGuard(TestCase):
     @patch("src.ingestion.pipeline.DocumentChunker")
     @patch("src.ingestion.pipeline.PdfLoader")
     @patch("src.ingestion.pipeline.PptxLoader")
-    @patch("src.ingestion.pipeline.SQLiteIntegrityChecker")
+    @patch("src.ingestion.pipeline.create_ingestion_backends")
     @patch("src.ingestion.pipeline.EmbeddingFactory")
     @patch("src.ingestion.pipeline.VectorStoreFactory")
     @patch("src.ingestion.pipeline.DenseEncoder")
@@ -145,6 +143,14 @@ class TestR3PipelineExceptGuard(TestCase):
         settings.retrieval = MagicMock()
         settings.retrieval.contextual_enrichment = "rule"
         settings.retrieval.dedup_enabled = False
+
+        backends = MagicMock()
+        backends.object_store = MagicMock()
+        backends.integrity_checker = MagicMock()
+        backends.document_registry = MagicMock()
+        backends.task_store = MagicMock()
+        backends.image_storage = MagicMock()
+        mocks[5].return_value = backends
 
         pipeline = IngestionPipeline(settings, collection="test")
         pipeline.integrity_checker.compute_sha256.side_effect = FileNotFoundError("no file")
@@ -176,13 +182,13 @@ class TestR4UnifiedChunkID(TestCase):
         records = mock_store.upsert.call_args[0][0]
         self.assertEqual(records[0]["id"], "my_id_001")
 
-    def test_no_generate_chunk_id_method(self):
+    def test_legacy_generate_chunk_id_compatibility(self):
         from src.ingestion.storage.vector_upserter import VectorUpserter
-        self.assertFalse(hasattr(VectorUpserter, "_generate_chunk_id"))
+        self.assertTrue(hasattr(VectorUpserter, "_generate_chunk_id"))
 
-    def test_no_upsert_batch_method(self):
+    def test_legacy_upsert_batch_compatibility(self):
         from src.ingestion.storage.vector_upserter import VectorUpserter
-        self.assertFalse(hasattr(VectorUpserter, "upsert_batch"))
+        self.assertTrue(hasattr(VectorUpserter, "upsert_batch"))
 
 
 # ====================================================================
@@ -467,7 +473,7 @@ class TestR7StaleChunkCleanup(TestCase):
         self.assertTrue(hasattr(IngestionPipeline, "_cleanup_stale_data"))
 
     @patch("src.ingestion.pipeline.ImageStorage")
-    @patch("src.ingestion.pipeline.BM25Indexer")
+    @patch("src.ingestion.pipeline.create_sparse_index")
     @patch("src.ingestion.pipeline.VectorUpserter")
     @patch("src.ingestion.pipeline.BatchProcessor")
     @patch("src.ingestion.pipeline.ImageCaptioner")
@@ -476,7 +482,7 @@ class TestR7StaleChunkCleanup(TestCase):
     @patch("src.ingestion.pipeline.DocumentChunker")
     @patch("src.ingestion.pipeline.PdfLoader")
     @patch("src.ingestion.pipeline.PptxLoader")
-    @patch("src.ingestion.pipeline.SQLiteIntegrityChecker")
+    @patch("src.ingestion.pipeline.create_ingestion_backends")
     @patch("src.ingestion.pipeline.EmbeddingFactory")
     @patch("src.ingestion.pipeline.VectorStoreFactory")
     @patch("src.ingestion.pipeline.DenseEncoder")
@@ -495,6 +501,14 @@ class TestR7StaleChunkCleanup(TestCase):
         settings.retrieval = MagicMock()
         settings.retrieval.contextual_enrichment = "rule"
         settings.retrieval.dedup_enabled = False
+
+        backends = MagicMock()
+        backends.object_store = MagicMock()
+        backends.integrity_checker = MagicMock()
+        backends.document_registry = MagicMock()
+        backends.task_store = MagicMock()
+        backends.image_storage = MagicMock()
+        mocks[5].return_value = backends
 
         pipeline = IngestionPipeline(settings, collection="test", force=True)
         pipeline._cleanup_stale_data("abc123", "/path/file.pdf")

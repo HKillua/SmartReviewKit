@@ -49,7 +49,7 @@ class BM25Indexer:
         }
     
     BM25 IDF Formula:
-        IDF(term) = log((N - df + 0.5) / (df + 0.5))
+        IDF(term) = log(1 + ((N - df + 0.5) / (df + 0.5)))
         
         Where:
         - N = total number of documents
@@ -457,9 +457,9 @@ class BM25Indexer:
     # ===== Private Helper Methods =====
     
     def _calculate_idf(self, num_docs: int, df: int) -> float:
-        """Calculate IDF using the classic BM25 formula.
+        """Calculate IDF using the Lucene-style BM25 formula.
         
-        Formula: IDF(term) = log((N - df + 0.5) / (df + 0.5))
+        Formula: IDF(term) = log(1 + ((N - df + 0.5) / (df + 0.5)))
         
         Args:
             num_docs: Total number of documents in corpus
@@ -468,7 +468,18 @@ class BM25Indexer:
         Returns:
             IDF score
         """
-        return math.log((num_docs - df + 0.5) / (df + 0.5))
+        if num_docs <= 0 or df < 0:
+            return 0.0
+        denominator = df + 0.5
+        if denominator <= 0:
+            return 0.0
+        ratio = (num_docs - df + 0.5) / denominator
+        guarded = 1.0 + ratio
+        if guarded <= 0:
+            # Guard against corrupted statistics (e.g. wildly invalid df > N)
+            # without crashing retrieval.
+            guarded = 1e-12
+        return math.log(guarded)
     
     def _calculate_bm25_score(
         self,

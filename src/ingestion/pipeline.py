@@ -28,6 +28,7 @@ from src.observability.logger import get_logger
 # Libs layer imports
 from src.libs.loader.pdf_loader import PdfLoader
 from src.libs.loader.pptx_loader import PptxLoader
+from src.libs.loader.file_integrity import SQLiteIntegrityChecker
 try:
     from src.libs.loader.docx_loader import DocxLoader
     DOCX_AVAILABLE = True
@@ -45,6 +46,7 @@ from src.ingestion.embedding.dense_encoder import DenseEncoder
 from src.ingestion.embedding.sparse_encoder import SparseEncoder
 from src.ingestion.embedding.batch_processor import BatchProcessor
 from src.ingestion.storage.vector_upserter import VectorUpserter
+from src.ingestion.storage.image_storage import ImageStorage
 from src.ingestion.transform.contextual_enricher import ContextualEnricher
 from src.ingestion.transform.chunk_dedup import dedup_chunks
 from src.ingestion.document_manager import DocumentManager

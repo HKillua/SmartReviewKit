@@ -129,6 +129,8 @@ class TraceCollector:
                 sink_mode=sink_mode,
             )
         self._path = Path(traces_path)
+        # Backward-compatible lock surface for tests and legacy callers.
+        self._write_lock = getattr(self._sink, "_write_lock", threading.Lock())
 
     @staticmethod
     def _build_sink(*, traces_path: str | Path, postgres_dsn: str, sink_mode: str) -> TraceSink:

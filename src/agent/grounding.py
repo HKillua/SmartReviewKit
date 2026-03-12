@@ -261,6 +261,8 @@ class GroundingEvaluator:
         ]
         if bundle.evidence_texts:
             cited_snippets.extend(bundle.evidence_texts)
+        if not cited_snippets and bundle.evidence_summary:
+            cited_snippets.append(bundle.evidence_summary)
         cited_snippets = [snippet for snippet in cited_snippets if snippet]
         snippet_match = max((_snippet_match_score(answer_core, snippet) for snippet in cited_snippets), default=0.0)
         segment_match = max(
