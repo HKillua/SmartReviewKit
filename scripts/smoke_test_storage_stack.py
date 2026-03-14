@@ -250,6 +250,14 @@ def _exercise_vector_store(settings: Any) -> dict[str, Any]:
     }
 
 
+def _milvus_ready(settings: Any) -> bool:
+    # Fresh CI environments legitimately start with zero collections. Readiness
+    # should validate connectivity, not pre-existing data.
+    store = VectorStoreFactory.create(settings, collection_name="storage_smoke_health")
+    store.list_collections()
+    return True
+
+
 async def _exercise_cache_and_rate_limit(settings: Any, raw_settings: dict[str, Any]) -> dict[str, Any]:
     def _fake_embed(text: Any) -> list[float]:
         if isinstance(text, list):
@@ -299,7 +307,7 @@ def main() -> None:
     _wait_for("redis", lambda: redis.Redis.from_url(settings.redis.url, decode_responses=True).ping())
     _wait_for("minio", lambda: create_ingestion_backends(settings, collection="storage-smoke").object_store is not None)
     _wait_for("opensearch", lambda: create_sparse_index(settings, collection="storage-smoke-check").ensure_collection_ready("storage-smoke-check"))
-    _wait_for("milvus", lambda: bool(VectorStoreFactory.create(settings, collection_name="storage_smoke_health").list_collections()))
+    _wait_for("milvus", lambda: _milvus_ready(settings))
 
     summary: dict[str, Any] = {}
     summary["postgres"] = _exercise_postgres(settings)

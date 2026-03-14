@@ -87,7 +87,7 @@ dmypy.json
 
 # Project-specific
 data/
-cache/
+/cache/
 logs/
 *.log
 traces.jsonl
