@@ -160,6 +160,20 @@ class TestQueryRouter(unittest.TestCase):
         self.assertEqual(decision.intent.value, "general_chat")
         self.assertFalse(decision.need_rag)
 
+    def test_knowledge_query_context_treats_router_as_retrieval_policy(self):
+        decision = self.router.route("你好", planner_task_intent="knowledge_query")
+        self.assertEqual(decision.intent.value, "deep_understanding")
+        self.assertTrue(decision.need_rag)
+        self.assertEqual(decision.preferred_sources, ["textbook", "slide"])
+        self.assertIn("planner_context", decision.match_method)
+
+    def test_non_knowledge_planner_context_returns_passthrough_policy(self):
+        decision = self.router.route("帮我复习TCP考点", planner_task_intent="review_summary")
+        self.assertEqual(decision.intent.value, "deep_understanding")
+        self.assertFalse(decision.need_rag)
+        self.assertEqual(decision.preferred_sources, [])
+        self.assertEqual(decision.match_method, "planner_context")
+
     def test_metadata_filter_single(self):
         from src.core.query_engine.query_router import RoutingDecision, QueryIntent
         rd = RoutingDecision(intent=QueryIntent.QUIZ_REQUEST, preferred_sources=["question_bank"])

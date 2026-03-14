@@ -146,17 +146,18 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                 or self._current_collection
                 or "computer_network"
             )
+            planner_task_intent = str(context.metadata.get("planner_task_intent", "") or "").strip()
+            matched_skill = str(context.metadata.get("matched_skill", "") or "").strip()
             # --- Adaptive routing ---
             routing = None
             if self._query_router is not None:
                 try:
-                    routing = self._query_router.route(args.query, context.recent_messages)
-                    if not routing.need_rag:
-                        return ToolResult(
-                            success=True,
-                            result_for_llm="该问题不需要知识库检索，请直接回答用户。",
-                            metadata={"routed_intent": routing.intent.value},
-                        )
+                    routing = self._query_router.route(
+                        args.query,
+                        context.recent_messages,
+                        planner_task_intent=planner_task_intent or None,
+                        matched_skill=matched_skill or None,
+                    )
                 except Exception:
                     logger.warning("QueryRouter failed, using default retrieval", exc_info=True)
 
@@ -190,6 +191,7 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                         "collection": effective_collection,
                         "source": "agent",
                         "parent_agent_trace_id": context.metadata.get("agent_trace_id", ""),
+                        "planner_task_intent": planner_task_intent,
                     }
                 )
 
@@ -253,8 +255,29 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
 
             if query_trace is not None:
                 query_trace.metadata["sub_query_count"] = len(queries)
+                if routing is not None:
+                    query_trace.metadata["preferred_sources"] = list(routing.preferred_sources)
+                    query_trace.metadata["retrieval_strategy"] = routing.retrieval_strategy
+                    query_trace.metadata["router_match_method"] = routing.match_method
+                    query_trace.metadata["router_confidence"] = round(float(routing.confidence), 3)
+                    query_trace.metadata["fallback_to_llm"] = bool(routing.fallback_to_llm)
                 if route_filter:
                     query_trace.metadata["route_filter"] = route_filter
+                if routing is not None:
+                    query_trace.record_stage(
+                        "retrieval_policy",
+                        {
+                            "planner_task_intent": planner_task_intent,
+                            "matched_skill": matched_skill,
+                            "preferred_sources": list(routing.preferred_sources),
+                            "source_filter": route_filter or routing.source_filter,
+                            "retrieval_strategy": routing.retrieval_strategy,
+                            "fallback_to_llm": routing.fallback_to_llm,
+                            "need_rag": routing.need_rag,
+                            "confidence": round(float(routing.confidence), 3),
+                            "method": routing.match_method,
+                        },
+                    )
 
             # P3+P6: run searches via asyncio.to_thread to avoid blocking
             # the event loop, and run sub-queries in parallel.

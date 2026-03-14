@@ -1,13 +1,12 @@
-"""Adaptive query router — dual-layer intent classification.
+"""Adaptive retrieval-policy router for ``knowledge_query``.
 
-**Layer 1 (Rule):** Fast keyword regex matching for explicit intents.
-**Layer 2 (Embedding):** Cosine similarity against pre-computed intent
-prototype embeddings for implicit/ambiguous intents.
+**Layer 1 (Rule):** Fast keyword regex matching for retrieval preferences.
+**Layer 2 (Embedding):** Cosine similarity against pre-computed prototype
+embeddings for ambiguous knowledge-query variants.
 
-The router produces a :class:`RoutingDecision` that tells downstream tools:
-- Whether RAG retrieval is needed
-- Which ``source_type`` collections to prefer
-- Whether LLM fallback is allowed when no RAG results are found
+The router does **not** own top-level task selection; that remains the job of
+``TaskPlanner``. This module only derives retrieval policy for knowledge
+queries, such as preferred ``source_type`` collections and fallback strategy.
 """
 
 from __future__ import annotations
@@ -23,7 +22,11 @@ logger = logging.getLogger(__name__)
 
 
 class QueryIntent(str, Enum):
-    """Recognised user intents."""
+    """Internal retrieval-policy labels.
+
+    These labels are used only to derive retrieval policy inside
+    ``knowledge_query`` and are not a second top-level user intent system.
+    """
 
     QUIZ_REQUEST = "quiz_request"
     CONCEPT_REVIEW = "concept_review"
@@ -33,7 +36,7 @@ class QueryIntent(str, Enum):
 
 @dataclass
 class RoutingDecision:
-    """Output of the query router."""
+    """Output of the retrieval-policy router."""
 
     intent: QueryIntent
     need_rag: bool = True
@@ -217,30 +220,42 @@ class QueryRouter:
         self,
         query: str,
         context: Optional[List[Dict]] = None,
+        *,
+        planner_task_intent: str | None = None,
+        matched_skill: str | None = None,
     ) -> RoutingDecision:
-        """Classify *query* and return a routing decision.
+        """Derive retrieval policy for *query* and return a routing decision.
 
-        Layer 1 (rule) is tried first.  On miss, Layer 2 (embedding) runs
-        if an ``embedding_fn`` was provided.
+        Layer 1 (rule) is tried first. On miss, Layer 2 (embedding) runs
+        if an ``embedding_fn`` was provided. When upstream planner context is
+        provided and is not ``knowledge_query``, the router becomes a no-op
+        retrieval-policy passthrough instead of acting like a second task
+        classifier.
         """
         q = query.strip()
+        planner_intent = str(planner_task_intent or "").strip()
+        if planner_intent and planner_intent != "knowledge_query":
+            return self._build_passthrough_decision(method="planner_context")
 
         # ── Layer 1: rule fast-path ──
         rule_result = self._rule_match(q)
         if rule_result is not None:
-            return rule_result
+            return self._apply_planner_context(rule_result, planner_intent)
 
         # ── Layer 2: embedding classification ──
         if self._embedding_ready and self._embed_fn is not None:
             embed_result = self._embedding_match(q)
             if embed_result is not None:
-                return embed_result
+                return self._apply_planner_context(embed_result, planner_intent)
 
         # ── Default fallback ──
-        return self._build_decision(
-            QueryIntent.DEEP_UNDERSTANDING,
-            confidence=0.0,
-            method="default",
+        return self._apply_planner_context(
+            self._build_decision(
+                QueryIntent.DEEP_UNDERSTANDING,
+                confidence=0.0,
+                method="default",
+            ),
+            planner_intent,
         )
 
     # ── Layer 1: Rule matching ─────────────────────────────────────────
@@ -309,6 +324,39 @@ class QueryRouter:
             confidence=confidence,
             match_method=method,
         )
+
+    def _build_passthrough_decision(self, *, method: str) -> RoutingDecision:
+        return RoutingDecision(
+            intent=QueryIntent.DEEP_UNDERSTANDING,
+            need_rag=False,
+            preferred_sources=[],
+            retrieval_strategy="full",
+            fallback_to_llm=self._fallback,
+            confidence=1.0,
+            match_method=method,
+        )
+
+    def _apply_planner_context(
+        self,
+        decision: RoutingDecision,
+        planner_task_intent: str,
+    ) -> RoutingDecision:
+        if planner_task_intent and planner_task_intent != "knowledge_query":
+            return self._build_passthrough_decision(method="planner_context")
+
+        if planner_task_intent == "knowledge_query" and not decision.need_rag:
+            return RoutingDecision(
+                intent=QueryIntent.DEEP_UNDERSTANDING,
+                need_rag=True,
+                preferred_sources=["textbook", "slide"],
+                retrieval_strategy=decision.retrieval_strategy,
+                fallback_to_llm=decision.fallback_to_llm,
+                source_filter=decision.source_filter,
+                confidence=decision.confidence,
+                match_method=f"{decision.match_method}+planner_context",
+            )
+
+        return decision
 
     # ── Introspection ──────────────────────────────────────────────────
 

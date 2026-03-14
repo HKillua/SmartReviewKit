@@ -273,6 +273,44 @@ class TestQ2ConfigDrivenEnhancement:
         await tool.execute(ctx, args)
         mock_enhancer.decompose.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_query_router_receives_planner_context_and_does_not_short_circuit(self):
+        from src.agent.tools.knowledge_query import KnowledgeQueryTool, KnowledgeQueryArgs
+        from src.agent.types import ToolContext
+        from src.core.query_engine.query_router import QueryRouter
+
+        mock_hs = MagicMock()
+        mock_hs.search = MagicMock(
+            return_value=[
+                RetrievalResult(
+                    chunk_id="chunk_1",
+                    score=0.91,
+                    text="TCP 通过三次握手建立连接。",
+                    metadata={"source_path": "network.md", "title": "TCP"},
+                )
+            ]
+        )
+        router = QueryRouter()
+        tool = KnowledgeQueryTool(
+            settings=self._make_settings(),
+            hybrid_search=mock_hs,
+            query_router=router,
+        )
+        tool._current_collection = "computer_network"
+
+        result = await tool.execute(
+            ToolContext(
+                user_id="u",
+                conversation_id="c",
+                metadata={"planner_task_intent": "knowledge_query"},
+            ),
+            KnowledgeQueryArgs(query="你好", collection="computer_network"),
+        )
+
+        assert result.success is True
+        assert mock_hs.search.called
+        assert result.metadata["source_count"] == 1
+
 
 # ===================================================================
 # Q3: Conversation-aware rewriting

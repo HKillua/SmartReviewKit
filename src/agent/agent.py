@@ -429,6 +429,8 @@ class Agent:
                 tool_metadata["agent_trace_id"] = agent_trace.trace_id
             if planner_decision is not None:
                 tool_metadata.update(_planner_metadata(planner_decision))
+            if matched_skill:
+                tool_metadata["matched_skill"] = matched_skill
             tool_ctx = ToolContext(
                 user_id=user_id,
                 conversation_id=conversation.id,

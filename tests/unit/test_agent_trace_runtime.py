@@ -576,6 +576,54 @@ async def test_knowledge_query_returns_query_trace_id_and_parent_link(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_knowledge_query_trace_records_retrieval_policy(tmp_path: Path) -> None:
+    from src.agent.tools.knowledge_query import KnowledgeQueryArgs, KnowledgeQueryTool
+    from src.agent.types import ToolContext
+    from src.core.query_engine.query_router import QueryRouter
+
+    trace_path = tmp_path / "traces.jsonl"
+    hybrid_search = MagicMock()
+    hybrid_search.search.return_value = [
+        RetrievalResult(
+            chunk_id="chunk_1",
+            score=0.95,
+            text="TCP 题库练习。",
+            metadata={"source_path": "question_bank.md", "title": "TCP练习"},
+        )
+    ]
+
+    tool = KnowledgeQueryTool(
+        settings={"observability": {"trace_enabled": True}},
+        hybrid_search=hybrid_search,
+        query_router=QueryRouter(),
+    )
+    tool._current_collection = "computer_network"
+    tool._trace_collector = TraceCollector(traces_path=trace_path)
+
+    result = await tool.execute(
+        ToolContext(
+            user_id="u1",
+            conversation_id="conv_1",
+            metadata={
+                "agent_trace_id": "agent-trace-xyz",
+                "planner_task_intent": "knowledge_query",
+            },
+        ),
+        KnowledgeQueryArgs(query="出一道TCP的练习题", collection="computer_network"),
+    )
+
+    trace = TraceService(trace_path).get_trace(result.metadata["query_trace_id"])
+    assert trace is not None
+    assert trace["metadata"]["planner_task_intent"] == "knowledge_query"
+    assert "question_bank" in trace["metadata"]["preferred_sources"]
+    assert trace["metadata"]["retrieval_strategy"] == "full"
+    assert trace["metadata"]["router_match_method"] == "rule"
+    policy_stage = next(stage for stage in trace["stages"] if stage["stage"] == "retrieval_policy")
+    assert policy_stage["data"]["preferred_sources"][0] == "question_bank"
+    assert policy_stage["data"]["method"] == "rule"
+
+
+@pytest.mark.asyncio
 async def test_knowledge_query_uses_default_collection_from_tool_context(tmp_path: Path) -> None:
     from src.agent.tools.knowledge_query import KnowledgeQueryArgs, KnowledgeQueryTool
     from src.agent.types import ToolContext

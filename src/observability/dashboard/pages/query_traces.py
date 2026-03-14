@@ -122,6 +122,18 @@ def render() -> None:
                 st.markdown(f"**Source:** {source_emoji} `{source}`")
                 st.markdown(f"**Top-K:** `{meta.get('top_k', '—')}`")
                 st.markdown(f"**Collection:** `{meta.get('collection', '—')}`")
+                if meta.get("planner_task_intent"):
+                    st.markdown(f"**Planner Intent:** `{meta.get('planner_task_intent', '—')}`")
+                if meta.get("retrieval_strategy"):
+                    st.markdown(f"**Retrieval Strategy:** `{meta.get('retrieval_strategy', '—')}`")
+                preferred_sources = meta.get("preferred_sources", [])
+                if preferred_sources:
+                    st.markdown(f"**Preferred Sources:** `{', '.join(preferred_sources)}`")
+                if meta.get("router_match_method"):
+                    st.markdown(
+                        f"**Router Match:** `{meta.get('router_match_method', '—')}` "
+                        f"({meta.get('router_confidence', '—')})"
+                    )
 
             st.divider()
 

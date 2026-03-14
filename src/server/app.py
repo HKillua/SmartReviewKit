@@ -243,7 +243,7 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
     hybrid_search, cached_embedding, query_enhancer = _build_hybrid_search(collection, settings_path=settings_path)
     query_enhancer.llm_service = llm
 
-    # --- Query Router (dual-layer: rule + embedding) ---
+    # --- Query Router (retrieval policy: rule + embedding fallback) ---
     from src.core.query_engine.query_router import QueryRouter
     routing_cfg = settings.get("routing", {})
     if routing_cfg.get("enabled", True):
@@ -253,9 +253,12 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
             similarity_threshold=routing_cfg.get("embedding_threshold", 0.75),
         )
         if query_router.embedding_ready:
-            logger.info("QueryRouter: dual-layer mode (rule + embedding, %d prototypes)", query_router.prototype_count)
+            logger.info(
+                "QueryRouter: retrieval-policy mode (rule + embedding, %d prototypes)",
+                query_router.prototype_count,
+            )
         else:
-            logger.info("QueryRouter: rule-only mode (no embedding_fn)")
+            logger.info("QueryRouter: rule-only retrieval-policy mode")
     else:
         query_router = None
 
