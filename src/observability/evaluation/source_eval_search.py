@@ -38,7 +38,11 @@ class SparseSourceEvalSearch:
     ) -> List[RetrievalResult]:
         collection = str((filters or {}).get("collection") or self._default_collection)
         processed = self._query_processor.process(query)
-        query_terms = list(processed.keywords or [query])
+        query_terms = list(processed.keywords or [])
+        if query and query not in query_terms:
+            query_terms.append(query)
+        if not query_terms:
+            query_terms = [query]
         hits = self._sparse_index.query(query_terms=query_terms, top_k=top_k, collection=collection)
         results: List[RetrievalResult] = []
         for hit in hits:
