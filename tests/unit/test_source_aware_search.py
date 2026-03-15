@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from src.core.trace.trace_context import TraceContext
 from src.core.query_engine.source_aware_search import SourceAwareSearch
 from src.core.types import RetrievalResult
 
@@ -205,3 +206,38 @@ def test_explanatory_profile_orders_textbook_before_question_bank() -> None:
 
     assert [unit.source_type for unit in result.answer_units[:2]] == ["textbook", "question_bank"]
     assert result.routing_metadata["evidence_profile"] == "explanatory"
+
+
+def test_trace_is_forwarded_to_underlying_hybrid_search() -> None:
+    observed_trace = None
+
+    def _search(*, query, top_k, filters=None, query_vector=None, trace=None):
+        nonlocal observed_trace
+        observed_trace = trace
+        if trace is not None:
+            trace.record_stage(
+                "rerank",
+                {"method": "fake_reranker", "input_count": 1, "output_count": 1},
+            )
+        return [
+            _result(
+                "doc_1",
+                "TCP 通过三次握手建立连接。",
+                source_type="textbook",
+                is_parent=True,
+            )
+        ]
+
+    svc = SourceAwareSearch(_hybrid_with_search(_search))
+    trace = TraceContext(trace_type="query")
+    result = svc.search(
+        query="TCP",
+        task_intent="knowledge_query",
+        top_k=2,
+        trace=trace,
+        allowed_sources=["textbook"],
+    )
+
+    assert observed_trace is trace
+    assert result.answer_units
+    assert "rerank" in [stage["stage"] for stage in trace.stages]

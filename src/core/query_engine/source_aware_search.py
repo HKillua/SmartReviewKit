@@ -100,6 +100,7 @@ class SourceAwareSearch:
                 top_k=raw_k,
                 filters=source_filters,
                 query_vector=query_vector,
+                trace=trace,
             )
             raw_candidate_counts[source_type] = len(raw_results)
             normalized_units, stats = self._normalize_source_results(source_type, raw_results)
@@ -118,6 +119,7 @@ class SourceAwareSearch:
                 top_k=max(top_k, max(source_budgets.values(), default=top_k)),
                 filters=filters,
                 query_vector=query_vector,
+                trace=trace,
             )
             if fallback_results:
                 fallback_global_used = True
@@ -314,6 +316,7 @@ class SourceAwareSearch:
         top_k: int,
         filters: Optional[Dict[str, Any]],
         query_vector: Optional[List[float]],
+        trace: Optional[Any],
     ) -> list[RetrievalResult]:
         try:
             results = self._hybrid_search.search(
@@ -321,13 +324,22 @@ class SourceAwareSearch:
                 top_k=top_k,
                 filters=filters,
                 query_vector=query_vector,
+                trace=trace,
             )
         except TypeError:
-            results = self._hybrid_search.search(
-                query=query,
-                top_k=top_k,
-                filters=filters,
-            )
+            try:
+                results = self._hybrid_search.search(
+                    query=query,
+                    top_k=top_k,
+                    filters=filters,
+                    trace=trace,
+                )
+            except TypeError:
+                results = self._hybrid_search.search(
+                    query=query,
+                    top_k=top_k,
+                    filters=filters,
+                )
         return results if isinstance(results, list) else []
 
     def _normalize_source_results(
