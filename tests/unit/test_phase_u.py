@@ -169,10 +169,14 @@ class TestQueryRouter(unittest.TestCase):
 
     def test_non_knowledge_planner_context_returns_passthrough_policy(self):
         decision = self.router.route("帮我复习TCP考点", planner_task_intent="review_summary")
-        self.assertEqual(decision.intent.value, "deep_understanding")
-        self.assertFalse(decision.need_rag)
-        self.assertEqual(decision.preferred_sources, [])
+        self.assertEqual(decision.intent.value, "concept_review")
+        self.assertTrue(decision.need_rag)
+        self.assertEqual(decision.preferred_sources, ["slide", "textbook", "question_bank"])
         self.assertEqual(decision.match_method, "planner_context")
+        self.assertEqual(
+            decision.source_weights,
+            {"slide": 0.45, "textbook": 0.4, "question_bank": 0.15},
+        )
 
     def test_metadata_filter_single(self):
         from src.core.query_engine.query_router import RoutingDecision, QueryIntent
@@ -202,6 +206,13 @@ class TestQueryRouter(unittest.TestCase):
         router = QueryRouter()
         decision = router.route("TCP拥塞窗口如何保证公平性")
         self.assertIn(decision.match_method, ("rule", "default"))
+
+    def test_source_budget_allocation_uses_largest_remainder(self):
+        decision = self.router.route("帮我复习TCP考点", planner_task_intent="review_summary")
+        budgets = decision.compute_source_unit_budgets(5)
+        self.assertEqual(sum(budgets.values()), 5)
+        self.assertGreaterEqual(budgets["slide"], budgets["textbook"])
+        self.assertGreaterEqual(budgets["textbook"], budgets["question_bank"])
 
 
 # ---------------------------------------------------------------------------

@@ -129,6 +129,13 @@ def render() -> None:
                 preferred_sources = meta.get("preferred_sources", [])
                 if preferred_sources:
                     st.markdown(f"**Preferred Sources:** `{', '.join(preferred_sources)}`")
+                source_weights = meta.get("source_weights", {})
+                if source_weights:
+                    formatted = ", ".join(
+                        f"{key}:{float(value):.2f}"
+                        for key, value in source_weights.items()
+                    )
+                    st.markdown(f"**Source Weights:** `{formatted}`")
                 if meta.get("router_match_method"):
                     st.markdown(
                         f"**Router Match:** `{meta.get('router_match_method', '—')}` "
@@ -154,13 +161,24 @@ def render() -> None:
             sparse_d = (stages_by_name.get("sparse_retrieval", {}).get("data") or {})
             fusion_d = (stages_by_name.get("fusion", {}).get("data") or {})
             rerank_d = (stages_by_name.get("rerank", {}).get("data") or {})
+            source_alloc_d = (stages_by_name.get("source_allocation", {}).get("data") or {})
+            unit_norm_d = (stages_by_name.get("answer_unit_normalization", {}).get("data") or {})
 
             dense_count = dense_d.get("result_count", 0)
             sparse_count = sparse_d.get("result_count", 0)
             fusion_count = fusion_d.get("result_count", 0)
             rerank_count = rerank_d.get("output_count", 0)
+            normalized_units = sum(
+                int(value)
+                for value in (meta.get("source_normalized_unit_counts", {}) or {}).values()
+                if isinstance(value, (int, float))
+            ) or sum(
+                int(value)
+                for value in unit_norm_d.get("source_normalized_unit_counts", {}).values()
+                if isinstance(value, (int, float))
+            )
 
-            rc1, rc2, rc3, rc4, rc5 = st.columns(5)
+            rc1, rc2, rc3, rc4, rc5, rc6 = st.columns(6)
             with rc1:
                 st.metric("Dense Hits", dense_count)
             with rc2:
@@ -170,12 +188,75 @@ def render() -> None:
             with rc4:
                 st.metric("After Rerank", rerank_count if rerank_d else "—")
             with rc5:
+                st.metric("Answer Units", normalized_units or "—")
+            with rc6:
                 st.metric("Total Time", total_label)
 
             st.divider()
 
+            if source_alloc_d or unit_norm_d:
+                st.markdown("#### 🧭 Source-Aware Allocation")
+                alloc_col1, alloc_col2 = st.columns(2)
+                with alloc_col1:
+                    if source_alloc_d.get("preferred_sources"):
+                        st.markdown(
+                            f"**Preferred Sources:** `{', '.join(source_alloc_d.get('preferred_sources', []))}`"
+                        )
+                    if source_alloc_d.get("source_weights"):
+                        st.json(source_alloc_d.get("source_weights", {}), expanded=False)
+                    if source_alloc_d.get("source_unit_budgets"):
+                        st.markdown("**Unit Budgets**")
+                        st.json(source_alloc_d.get("source_unit_budgets", {}), expanded=False)
+                with alloc_col2:
+                    if source_alloc_d.get("source_raw_overfetch"):
+                        st.markdown("**Raw Overfetch**")
+                        st.json(source_alloc_d.get("source_raw_overfetch", {}), expanded=False)
+                    if meta.get("evidence_source_order"):
+                        st.markdown(
+                            f"**Evidence Order:** `{', '.join(meta.get('evidence_source_order', []))}`"
+                        )
+                    if meta.get("normalization_profile"):
+                        st.markdown(f"**Normalization:** `{meta.get('normalization_profile', '—')}`")
+                if unit_norm_d:
+                    stat_cols = st.columns(3)
+                    with stat_cols[0]:
+                        st.metric("Child Hits", unit_norm_d.get("child_hit_count", 0))
+                    with stat_cols[1]:
+                        st.metric("Parent Promotions", unit_norm_d.get("parent_promotions", 0))
+                    with stat_cols[2]:
+                        st.metric("Collapsed Parents", unit_norm_d.get("collapsed_parent_count", 0))
+                    if unit_norm_d.get("source_raw_candidate_counts") or meta.get("source_raw_candidate_counts"):
+                        st.markdown("**Raw Candidate Counts**")
+                        st.json(
+                            unit_norm_d.get("source_raw_candidate_counts")
+                            or meta.get("source_raw_candidate_counts", {}),
+                            expanded=False,
+                        )
+                    if unit_norm_d.get("source_normalized_unit_counts") or meta.get("source_normalized_unit_counts"):
+                        st.markdown("**Normalized Unit Counts**")
+                        st.json(
+                            unit_norm_d.get("source_normalized_unit_counts")
+                            or meta.get("source_normalized_unit_counts", {}),
+                            expanded=False,
+                        )
+                    if meta.get("unit_kind_distribution"):
+                        st.markdown("**Unit Kind Distribution**")
+                        st.json(meta.get("unit_kind_distribution", {}), expanded=False)
+
+                st.divider()
+
             # ── 3. Stage timing waterfall ──────────────────────
-            main_stage_names = ("query_processing", "dense_retrieval", "sparse_retrieval", "fusion", "rerank")
+            main_stage_names = (
+                "query_processing",
+                "source_allocation",
+                "dense_retrieval",
+                "sparse_retrieval",
+                "fusion",
+                "answer_unit_normalization",
+                "rerank",
+                "answer_unit_rerank",
+                "answer_unit_dedup",
+            )
             main_timings = [t for t in timings if t["stage_name"] in main_stage_names]
             if main_timings:
                 st.markdown("#### ⏱️ Stage Timings")
@@ -203,8 +284,16 @@ def render() -> None:
                 tab_defs.append(("🟨 Sparse Retrieval", "sparse_retrieval"))
             if "fusion" in stages_by_name:
                 tab_defs.append(("🟩 Fusion (RRF)", "fusion"))
+            if "source_allocation" in stages_by_name:
+                tab_defs.append(("🧭 Source Allocation", "source_allocation"))
+            if "answer_unit_normalization" in stages_by_name:
+                tab_defs.append(("🧱 Answer Units", "answer_unit_normalization"))
             if "rerank" in stages_by_name:
                 tab_defs.append(("🟪 Rerank", "rerank"))
+            if "answer_unit_rerank" in stages_by_name:
+                tab_defs.append(("🟣 Unit Rerank", "answer_unit_rerank"))
+            if "answer_unit_dedup" in stages_by_name:
+                tab_defs.append(("🧹 Unit Dedup", "answer_unit_dedup"))
 
             if tab_defs:
                 tabs = st.tabs([label for label, _ in tab_defs])
@@ -224,8 +313,16 @@ def render() -> None:
                             _render_retrieval_stage(data, "Sparse")
                         elif key == "fusion":
                             _render_fusion_stage(data)
+                        elif key == "source_allocation":
+                            _render_source_allocation_stage(data)
+                        elif key == "answer_unit_normalization":
+                            _render_answer_unit_stage(data)
                         elif key == "rerank":
                             _render_rerank_stage(data)
+                        elif key == "answer_unit_rerank":
+                            _render_rerank_stage(data)
+                        elif key == "answer_unit_dedup":
+                            _render_answer_unit_stage(data)
             else:
                 st.info("No stage details available.")
 
@@ -499,6 +596,43 @@ def _render_rerank_stage(data: Dict[str, Any]) -> None:
         _render_chunk_list(chunks, prefix="rerank_chunk")
     else:
         st.info("No reranked results.")
+
+
+def _render_source_allocation_stage(data: Dict[str, Any]) -> None:
+    """Render source-aware allocation detail."""
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Preferred Sources**")
+        st.code(", ".join(data.get("preferred_sources", [])) or "—")
+        st.markdown("**Source Weights**")
+        st.json(data.get("source_weights", {}), expanded=False)
+    with c2:
+        st.markdown("**Unit Budgets**")
+        st.json(data.get("source_unit_budgets", {}), expanded=False)
+        st.markdown("**Raw Overfetch**")
+        st.json(data.get("source_raw_overfetch", {}), expanded=False)
+
+
+def _render_answer_unit_stage(data: Dict[str, Any]) -> None:
+    """Render answer-unit normalization or dedup stage."""
+    cols = st.columns(3)
+    with cols[0]:
+        st.metric("Child Hits", data.get("child_hit_count", 0))
+    with cols[1]:
+        st.metric("Parent Promotions", data.get("parent_promotions", 0))
+    with cols[2]:
+        st.metric("Collapsed Parents", data.get("collapsed_parent_count", 0))
+
+    if data.get("source_raw_candidate_counts"):
+        st.markdown("**Raw Candidate Counts**")
+        st.json(data.get("source_raw_candidate_counts", {}), expanded=False)
+    if data.get("source_normalized_unit_counts"):
+        st.markdown("**Normalized Unit Counts**")
+        st.json(data.get("source_normalized_unit_counts", {}), expanded=False)
+    if data.get("input_count") is not None or data.get("output_count") is not None:
+        st.markdown(
+            f"**Input / Output:** `{data.get('input_count', '—')}` → `{data.get('output_count', '—')}`"
+        )
 
 
 def _render_chunk_list(chunks: List[Dict[str, Any]], prefix: str = "chunk") -> None:

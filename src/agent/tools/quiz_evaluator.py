@@ -114,6 +114,7 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
         error_memory: Any = None,
         knowledge_map: Any = None,
         hybrid_search: Any = None,
+        source_aware_search: Any = None,
         trace_enabled: bool = False,
         trace_collector: TraceCollector | None = None,
     ) -> None:
@@ -121,6 +122,7 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
         self._error_memory = error_memory
         self._knowledge_map = knowledge_map
         self._search = hybrid_search
+        self._source_aware_search = source_aware_search
         self._citation_generator = CitationGenerator(snippet_max_length=220)
         self._trace_enabled = trace_enabled
         self._trace_collector = trace_collector or (TraceCollector() if trace_enabled else None)
@@ -135,6 +137,16 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
 
     def get_args_schema(self) -> type[QuizEvaluatorArgs]:
         return QuizEvaluatorArgs
+
+    def _ensure_source_aware_search(self) -> Any | None:
+        if self._source_aware_search is not None:
+            return self._source_aware_search
+        if self._search is None:
+            return None
+        from src.core.query_engine.source_aware_search import SourceAwareSearch
+
+        self._source_aware_search = SourceAwareSearch(hybrid_search=self._search)
+        return self._source_aware_search
 
     async def execute(self, context: ToolContext, args: QuizEvaluatorArgs) -> ToolResult:
         composite_mode = bool(context.metadata.get("composite_mode", False))
@@ -332,13 +344,26 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
                     }
                 )
         try:
-            results = await asyncio.to_thread(
-                self._search.search,
-                query=search_query,
-                top_k=4,
-                trace=query_trace,
-            )
-            result_list = results if isinstance(results, list) else []
+            source_aware = self._ensure_source_aware_search()
+            if source_aware is not None:
+                normalized = await asyncio.to_thread(
+                    source_aware.search,
+                    query=search_query,
+                    task_intent="quiz_evaluator",
+                    top_k=4,
+                    trace=query_trace,
+                )
+                result_list = list(normalized.results)
+                if query_trace is not None:
+                    query_trace.metadata.update(normalized.routing_metadata)
+            else:
+                results = await asyncio.to_thread(
+                    self._search.search,
+                    query=search_query,
+                    top_k=4,
+                    trace=query_trace,
+                )
+                result_list = results if isinstance(results, list) else []
             if query_trace is not None:
                 query_trace.metadata["result_count"] = len(result_list)
                 self._trace_collector.collect(query_trace)

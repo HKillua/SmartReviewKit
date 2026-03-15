@@ -93,6 +93,7 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
     def __init__(
         self,
         hybrid_search: Any = None,
+        source_aware_search: Any = None,
         llm_service: Any = None,
         error_memory: Any = None,
         knowledge_map: Any = None,
@@ -100,6 +101,7 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
         trace_collector: TraceCollector | None = None,
     ) -> None:
         self._search = hybrid_search
+        self._source_aware_search = source_aware_search
         self._llm = llm_service
         self._error_memory = error_memory
         self._knowledge_map = knowledge_map
@@ -118,8 +120,19 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
     def get_args_schema(self) -> type[ReviewSummaryArgs]:
         return ReviewSummaryArgs
 
+    def _ensure_source_aware_search(self) -> Any | None:
+        if self._source_aware_search is not None:
+            return self._source_aware_search
+        if self._search is None:
+            return None
+        from src.core.query_engine.source_aware_search import SourceAwareSearch
+
+        self._source_aware_search = SourceAwareSearch(hybrid_search=self._search)
+        return self._source_aware_search
+
     async def execute(self, context: ToolContext, args: ReviewSummaryArgs) -> ToolResult:
         query_trace: TraceContext | None = None
+        normalized_metadata: dict[str, Any] = {}
         composite_mode = bool(context.metadata.get("composite_mode", False))
         composite_parent_request_id = str(
             context.metadata.get("composite_parent_request_id", "") or ""
@@ -158,12 +171,24 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
                 )
 
         try:
-            results = await asyncio.to_thread(
-                self._search.search,
-                query=args.topic,
-                top_k=8,
-                trace=query_trace,
-            )
+            source_aware = self._ensure_source_aware_search()
+            if source_aware is not None:
+                normalized = await asyncio.to_thread(
+                    source_aware.search,
+                    query=args.topic,
+                    task_intent="review_summary",
+                    top_k=8,
+                    trace=query_trace,
+                )
+                results = normalized.results
+                normalized_metadata = dict(normalized.routing_metadata)
+            else:
+                results = await asyncio.to_thread(
+                    self._search.search,
+                    query=args.topic,
+                    top_k=8,
+                    trace=query_trace,
+                )
         except Exception as exc:
             logger.exception("HybridSearch failed in ReviewSummaryTool")
             if query_trace is not None:
@@ -196,6 +221,8 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
         if query_trace is not None:
             query_trace.metadata["result_count"] = len(results)
             query_trace.metadata["effective_source_count"] = len(citations)
+            if normalized_metadata:
+                query_trace.metadata.update(normalized_metadata)
             self._trace_collector.collect(query_trace)
 
         if not knowledge_text:
@@ -208,6 +235,7 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
                 "query_trace_ids": [query_trace.trace_id] if query_trace is not None else [],
                 "final_response_preferred": True,
                 "grounding_passthrough": True,
+                **normalized_metadata,
             }
             if composite_mode:
                 metadata.update(
@@ -259,6 +287,7 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
                     "composite_parent_request_id": composite_parent_request_id if composite_mode else "",
                     "composite_subtask_index": composite_subtask_index if composite_mode else -1,
                     "composite_subtask_intent": composite_subtask_intent if composite_mode else "",
+                    **normalized_metadata,
                 },
             )
 
@@ -305,6 +334,7 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
                     "composite_parent_request_id": composite_parent_request_id if composite_mode else "",
                     "composite_subtask_index": composite_subtask_index if composite_mode else -1,
                     "composite_subtask_intent": composite_subtask_intent if composite_mode else "",
+                    **normalized_metadata,
                 },
             )
         except Exception as exc:
@@ -324,5 +354,6 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
                     "composite_parent_request_id": composite_parent_request_id if composite_mode else "",
                     "composite_subtask_index": composite_subtask_index if composite_mode else -1,
                     "composite_subtask_intent": composite_subtask_intent if composite_mode else "",
+                    **normalized_metadata,
                 },
             )

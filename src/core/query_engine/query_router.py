@@ -44,6 +44,10 @@ class RoutingDecision:
     retrieval_strategy: str = "full"  # full | dense_only | sparse_only
     fallback_to_llm: bool = True
     source_filter: Optional[Dict] = None
+    source_weights: Dict[str, float] = field(default_factory=dict)
+    source_raw_overfetch: Dict[str, int] = field(default_factory=dict)
+    normalization_profile: str = "source_aware_units"
+    evidence_profile: str = "default"
     confidence: float = 1.0
     match_method: str = "rule"  # rule | embedding | default
 
@@ -54,6 +58,69 @@ class RoutingDecision:
         if len(self.preferred_sources) == 1:
             return {"source_type": self.preferred_sources[0]}
         return {"source_type": {"$in": self.preferred_sources}}
+
+    def compute_source_unit_budgets(self, top_k: int) -> Dict[str, int]:
+        """Allocate per-source answer-unit budget using largest remainder."""
+        if top_k <= 0:
+            return {}
+        positive = {
+            source: float(weight)
+            for source, weight in (self.source_weights or {}).items()
+            if float(weight) > 0.0
+        }
+        if not positive:
+            ordered = list(self.preferred_sources)
+            if not ordered:
+                return {}
+            return {source: int(index < top_k) for index, source in enumerate(ordered)}
+
+        total_weight = sum(positive.values()) or 1.0
+        normalized = {
+            source: weight / total_weight for source, weight in positive.items()
+        }
+
+        base_allocations: Dict[str, int] = {}
+        remainders: list[tuple[float, str]] = []
+        reserved = 0
+        min_slots = min(top_k, len(normalized))
+        ordered_sources = self.preferred_sources or sorted(
+            normalized,
+            key=lambda key: normalized[key],
+            reverse=True,
+        )
+
+        for source in ordered_sources:
+            if source not in normalized:
+                continue
+            quota = normalized[source] * top_k
+            floor_value = int(math.floor(quota))
+            if min_slots >= len(normalized):
+                floor_value = max(floor_value, 1)
+            base_allocations[source] = floor_value
+            reserved += floor_value
+            remainders.append((quota - math.floor(quota), source))
+
+        while reserved < top_k:
+            remainders.sort(key=lambda item: (-item[0], ordered_sources.index(item[1])))
+            remainder, source = remainders[0]
+            base_allocations[source] = base_allocations.get(source, 0) + 1
+            reserved += 1
+            remainders[0] = (0.0 if remainder > 0 else remainder, source)
+
+        while reserved > top_k:
+            removable = [
+                source
+                for source in ordered_sources
+                if base_allocations.get(source, 0) > 0
+                and not (min_slots >= len(normalized) and base_allocations[source] <= 1)
+            ]
+            if not removable:
+                break
+            source = removable[-1]
+            base_allocations[source] -= 1
+            reserved -= 1
+
+        return {source: value for source, value in base_allocations.items() if value > 0}
 
 
 # ── Intent prototype queries for embedding classification ──────────────
@@ -121,6 +188,38 @@ _INTENT_DECISION_MAP: Dict[QueryIntent, Dict] = {
         need_rag=True,
         preferred_sources=["textbook", "slide"],
     ),
+}
+
+_DEFAULT_SOURCE_RAW_OVERFETCH: Dict[str, int] = {
+    "question_bank": 2,
+    "slide": 2,
+    "textbook": 4,
+}
+
+_TASK_SOURCE_PROFILES: Dict[str, Dict[str, object]] = {
+    "knowledge_query": {
+        "source_weights": {"textbook": 0.55, "slide": 0.30, "question_bank": 0.15},
+        "evidence_profile": "explanatory",
+    },
+    "review_summary": {
+        "source_weights": {"slide": 0.45, "textbook": 0.40, "question_bank": 0.15},
+        "evidence_profile": "summary",
+    },
+    "quiz_generator": {
+        "source_weights": {"question_bank": 0.60, "textbook": 0.25, "slide": 0.15},
+        "evidence_profile": "practice_generation",
+    },
+    "quiz_evaluator": {
+        "source_weights": {"question_bank": 0.50, "textbook": 0.30, "slide": 0.20},
+        "evidence_profile": "answer_grading",
+    },
+}
+
+_TASK_DEFAULT_INTENT: Dict[str, QueryIntent] = {
+    "knowledge_query": QueryIntent.DEEP_UNDERSTANDING,
+    "review_summary": QueryIntent.CONCEPT_REVIEW,
+    "quiz_generator": QueryIntent.QUIZ_REQUEST,
+    "quiz_evaluator": QueryIntent.QUIZ_REQUEST,
 }
 
 # ── Regex patterns for Layer 1 (fast path) ─────────────────────────────
@@ -234,8 +333,16 @@ class QueryRouter:
         """
         q = query.strip()
         planner_intent = str(planner_task_intent or "").strip()
-        if planner_intent and planner_intent != "knowledge_query":
+        if planner_intent and planner_intent not in _TASK_SOURCE_PROFILES:
             return self._build_passthrough_decision(method="planner_context")
+
+        if planner_intent and planner_intent != "knowledge_query":
+            decision = self._build_decision(
+                _TASK_DEFAULT_INTENT[planner_intent],
+                confidence=1.0,
+                method="planner_context",
+            )
+            return self._apply_planner_context(decision, planner_intent)
 
         # ── Layer 1: rule fast-path ──
         rule_result = self._rule_match(q)
@@ -321,6 +428,7 @@ class QueryRouter:
             need_rag=template.get("need_rag", True),
             preferred_sources=list(template.get("preferred_sources", ["slide", "textbook"])),
             fallback_to_llm=template.get("fallback_to_llm", self._fallback),
+            source_raw_overfetch=dict(_DEFAULT_SOURCE_RAW_OVERFETCH),
             confidence=confidence,
             match_method=method,
         )
@@ -332,6 +440,7 @@ class QueryRouter:
             preferred_sources=[],
             retrieval_strategy="full",
             fallback_to_llm=self._fallback,
+            source_raw_overfetch={},
             confidence=1.0,
             match_method=method,
         )
@@ -342,21 +451,57 @@ class QueryRouter:
         planner_task_intent: str,
     ) -> RoutingDecision:
         if planner_task_intent and planner_task_intent != "knowledge_query":
-            return self._build_passthrough_decision(method="planner_context")
+            if planner_task_intent not in _TASK_SOURCE_PROFILES:
+                return self._build_passthrough_decision(method="planner_context")
 
         if planner_task_intent == "knowledge_query" and not decision.need_rag:
-            return RoutingDecision(
+            decision = RoutingDecision(
                 intent=QueryIntent.DEEP_UNDERSTANDING,
                 need_rag=True,
                 preferred_sources=["textbook", "slide"],
                 retrieval_strategy=decision.retrieval_strategy,
                 fallback_to_llm=decision.fallback_to_llm,
                 source_filter=decision.source_filter,
+                source_raw_overfetch=dict(_DEFAULT_SOURCE_RAW_OVERFETCH),
                 confidence=decision.confidence,
                 match_method=f"{decision.match_method}+planner_context",
             )
+        return self._apply_task_profile(decision, planner_task_intent)
 
-        return decision
+    def _apply_task_profile(
+        self,
+        decision: RoutingDecision,
+        planner_task_intent: str,
+    ) -> RoutingDecision:
+        profile = _TASK_SOURCE_PROFILES.get(planner_task_intent or "")
+        if not profile:
+            return decision
+
+        source_weights = {
+            source: float(weight)
+            for source, weight in dict(profile.get("source_weights", {})).items()
+            if float(weight) > 0.0
+        }
+        preferred = list(decision.preferred_sources)
+        if planner_task_intent != "knowledge_query":
+            preferred = sorted(source_weights, key=lambda key: source_weights[key], reverse=True)
+        elif not preferred:
+            preferred = sorted(source_weights, key=lambda key: source_weights[key], reverse=True)
+
+        return RoutingDecision(
+            intent=decision.intent,
+            need_rag=decision.need_rag,
+            preferred_sources=preferred,
+            retrieval_strategy=decision.retrieval_strategy,
+            fallback_to_llm=decision.fallback_to_llm,
+            source_filter=decision.source_filter,
+            source_weights=source_weights,
+            source_raw_overfetch=dict(_DEFAULT_SOURCE_RAW_OVERFETCH),
+            normalization_profile="source_aware_units",
+            evidence_profile=str(profile.get("evidence_profile", "default")),
+            confidence=decision.confidence,
+            match_method=decision.match_method,
+        )
 
     # ── Introspection ──────────────────────────────────────────────────
 

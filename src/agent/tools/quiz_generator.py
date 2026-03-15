@@ -132,12 +132,14 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
     def __init__(
         self,
         hybrid_search: Any = None,
+        source_aware_search: Any = None,
         llm_service: Any = None,
         error_memory: Any = None,
         knowledge_map: Any = None,
         query_router: Any = None,
     ) -> None:
         self._search = hybrid_search
+        self._source_aware_search = source_aware_search
         self._llm = llm_service
         self._error_memory = error_memory
         self._knowledge_map = knowledge_map
@@ -154,6 +156,19 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
 
     def get_args_schema(self) -> type[QuizGeneratorArgs]:
         return QuizGeneratorArgs
+
+    def _ensure_source_aware_search(self) -> Any | None:
+        if self._source_aware_search is not None:
+            return self._source_aware_search
+        if self._search is None:
+            return None
+        from src.core.query_engine.source_aware_search import SourceAwareSearch
+
+        self._source_aware_search = SourceAwareSearch(
+            hybrid_search=self._search,
+            query_router=self._router,
+        )
+        return self._source_aware_search
 
     async def execute(self, context: ToolContext, args: QuizGeneratorArgs) -> ToolResult:
         weak_hint = await self._get_weak_hint(context.user_id)
@@ -224,6 +239,16 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
         if self._search is None:
             return []
         try:
+            source_aware = self._ensure_source_aware_search()
+            if source_aware is not None:
+                normalized = await asyncio.to_thread(
+                    source_aware.search,
+                    query=topic,
+                    task_intent="quiz_generator",
+                    top_k=count + 2,
+                    allowed_sources=["question_bank"],
+                )
+                return list(normalized.results)
             results = await asyncio.to_thread(
                 self._search.search,
                 query=topic,
@@ -239,6 +264,15 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
         if self._search is None:
             return []
         try:
+            source_aware = self._ensure_source_aware_search()
+            if source_aware is not None:
+                normalized = await asyncio.to_thread(
+                    source_aware.search,
+                    query=topic,
+                    task_intent="quiz_generator",
+                    top_k=top_k,
+                )
+                return list(normalized.results)
             results = await asyncio.to_thread(
                 self._search.search, query=topic, top_k=top_k,
             )

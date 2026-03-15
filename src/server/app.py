@@ -262,6 +262,13 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
     else:
         query_router = None
 
+    from src.core.query_engine.source_aware_search import SourceAwareSearch
+
+    source_aware_search = SourceAwareSearch(
+        hybrid_search=hybrid_search,
+        query_router=query_router,
+    )
+
     # --- Semantic Cache ---
     semantic_cache = None
     cache_cfg = settings.get("semantic_cache", {})
@@ -284,6 +291,7 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         hybrid_search=hybrid_search,
         query_enhancer=query_enhancer,
         query_router=query_router,
+        source_aware_search=source_aware_search,
         semantic_cache=semantic_cache,
         trace_collector=shared_trace_collector,
     ))
@@ -296,6 +304,7 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
     ))
     tool_registry.register(ReviewSummaryTool(
         hybrid_search=hybrid_search,
+        source_aware_search=source_aware_search,
         llm_service=llm,
         error_memory=error_mem,
         knowledge_map=kmap_mem,
@@ -304,6 +313,7 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
     ))
     tool_registry.register(QuizGeneratorTool(
         hybrid_search=hybrid_search,
+        source_aware_search=source_aware_search,
         llm_service=llm,
         error_memory=error_mem,
         knowledge_map=kmap_mem,
@@ -314,6 +324,7 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         error_memory=error_mem,
         knowledge_map=kmap_mem,
         hybrid_search=hybrid_search,
+        source_aware_search=source_aware_search,
         trace_enabled=bool(settings.get("observability", {}).get("trace_enabled", False)),
         trace_collector=shared_trace_collector,
     ))

@@ -355,3 +355,69 @@ class RetrievalResult:
     def from_dict(cls, data: Dict[str, Any]) -> "RetrievalResult":
         """Create RetrievalResult from dictionary."""
         return cls(**data)
+
+
+@dataclass
+class AnswerUnit:
+    """Normalized retrieval unit for cross-source ranking and answer building.
+
+    ``RetrievalResult`` is the raw chunk-level contract returned by retrievers.
+    ``AnswerUnit`` sits one level above it and represents the comparable answer
+    unit that downstream learning tools consume after source-aware
+    normalization. This allows question-bank flat chunks, textbook
+    parent-child chunks, and slide chunks to be fused on a common unit layer.
+    """
+
+    unit_id: str
+    source_type: str
+    unit_kind: str
+    retrieval_text: str
+    display_text: str
+    backing_chunk_ids: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    raw_scores: List[float] = field(default_factory=list)
+    support_count: int = 1
+
+    @property
+    def score(self) -> float:
+        if not self.raw_scores:
+            return 0.0
+        return max(float(score) for score in self.raw_scores)
+
+    def to_retrieval_result(self) -> RetrievalResult:
+        payload = dict(self.metadata or {})
+        payload.setdefault("source_type", self.source_type)
+        payload["unit_id"] = self.unit_id
+        payload["unit_kind"] = self.unit_kind
+        payload["backing_chunk_ids"] = list(self.backing_chunk_ids)
+        payload["raw_scores"] = [float(score) for score in self.raw_scores]
+        payload["support_count"] = int(self.support_count)
+        return RetrievalResult(
+            chunk_id=self.unit_id,
+            score=self.score,
+            text=self.retrieval_text,
+            metadata=payload,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "AnswerUnit":
+        return cls(**data)
+
+
+@dataclass
+class SourceAwareSearchResult:
+    """Result payload returned by the source-aware normalization layer."""
+
+    answer_units: List[AnswerUnit] = field(default_factory=list)
+    results: List[RetrievalResult] = field(default_factory=list)
+    routing_metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "answer_units": [unit.to_dict() for unit in self.answer_units],
+            "results": [result.to_dict() for result in self.results],
+            "routing_metadata": dict(self.routing_metadata),
+        }

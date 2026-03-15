@@ -50,6 +50,7 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
         query_enhancer: Any = None,
         conflict_detector: Any = None,
         query_router: Any = None,
+        source_aware_search: Any = None,
         semantic_cache: Any = None,
         trace_collector: TraceCollector | None = None,
     ) -> None:
@@ -59,6 +60,7 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
         self._query_enhancer = query_enhancer
         self._conflict_detector = conflict_detector
         self._query_router = query_router
+        self._source_aware_search = source_aware_search
         self._semantic_cache = semantic_cache
         self._initialized = hybrid_search is not None
         self._current_collection: Optional[str] = None
@@ -97,6 +99,19 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
         if isinstance(observability, dict):
             return bool(observability.get("trace_enabled", False))
         return bool(getattr(observability, "trace_enabled", False))
+
+    def _ensure_source_aware_search(self) -> Any | None:
+        if self._source_aware_search is not None:
+            return self._source_aware_search
+        if self._hybrid_search is None:
+            return None
+        from src.core.query_engine.source_aware_search import SourceAwareSearch
+
+        self._source_aware_search = SourceAwareSearch(
+            hybrid_search=self._hybrid_search,
+            query_router=self._query_router,
+        )
+        return self._source_aware_search
 
     def _ensure_initialized(self, collection: str = "computer_network") -> None:
         if self._initialized and self._current_collection == collection:
@@ -286,6 +301,10 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                 if routing is not None:
                     query_trace.metadata["preferred_sources"] = list(routing.preferred_sources)
                     query_trace.metadata["retrieval_strategy"] = routing.retrieval_strategy
+                    query_trace.metadata["source_weights"] = dict(getattr(routing, "source_weights", {}) or {})
+                    query_trace.metadata["source_raw_overfetch"] = dict(getattr(routing, "source_raw_overfetch", {}) or {})
+                    query_trace.metadata["normalization_profile"] = getattr(routing, "normalization_profile", "")
+                    query_trace.metadata["evidence_profile"] = getattr(routing, "evidence_profile", "")
                     query_trace.metadata["router_match_method"] = routing.match_method
                     query_trace.metadata["router_confidence"] = round(float(routing.confidence), 3)
                     query_trace.metadata["fallback_to_llm"] = bool(routing.fallback_to_llm)
@@ -300,6 +319,10 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                             "preferred_sources": list(routing.preferred_sources),
                             "source_filter": route_filter or routing.source_filter,
                             "retrieval_strategy": routing.retrieval_strategy,
+                            "source_weights": dict(getattr(routing, "source_weights", {}) or {}),
+                            "source_raw_overfetch": dict(getattr(routing, "source_raw_overfetch", {}) or {}),
+                            "normalization_profile": getattr(routing, "normalization_profile", ""),
+                            "evidence_profile": getattr(routing, "evidence_profile", ""),
                             "fallback_to_llm": routing.fallback_to_llm,
                             "need_rag": routing.need_rag,
                             "confidence": round(float(routing.confidence), 3),
@@ -309,8 +332,22 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
 
             # P3+P6: run searches via asyncio.to_thread to avoid blocking
             # the event loop, and run sub-queries in parallel.
-            async def _search_one(q: str) -> list:
+            source_aware = self._ensure_source_aware_search()
+
+            async def _search_one(q: str) -> tuple[list, dict[str, Any]]:
                 trace_arg = query_trace if len(queries) == 1 else None
+                if source_aware is not None:
+                    normalized = await asyncio.to_thread(
+                        source_aware.search,
+                        query=q,
+                        task_intent="knowledge_query",
+                        top_k=args.top_k,
+                        trace=trace_arg,
+                        filters=search_kwargs.get("filters"),
+                        route_decision=routing,
+                        query_vector=hyde_vector,
+                    )
+                    return list(normalized.results), dict(normalized.routing_metadata)
                 r = await asyncio.to_thread(
                     self._hybrid_search.search,
                     query=q,
@@ -318,12 +355,15 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                     trace=trace_arg,
                     **search_kwargs,
                 )
-                return r if isinstance(r, list) else []
+                return (r if isinstance(r, list) else []), {}
 
             search_results = await asyncio.gather(*[_search_one(q) for q in queries])
             all_results: list = []
-            for batch in search_results:
+            normalized_metadata: dict[str, Any] = {}
+            for batch, batch_metadata in search_results:
                 all_results.extend(batch)
+                for key, value in batch_metadata.items():
+                    normalized_metadata.setdefault(key, value)
 
             # Deduplicate by chunk_id, keep highest score
             seen: dict[str, Any] = {}
@@ -331,6 +371,9 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                 if r.chunk_id not in seen or r.score > seen[r.chunk_id].score:
                     seen[r.chunk_id] = r
             results = sorted(seen.values(), key=lambda x: x.score, reverse=True)[:args.top_k]
+
+            if query_trace is not None and normalized_metadata:
+                query_trace.metadata.update(normalized_metadata)
 
             if not results:
                 metadata = {
@@ -358,7 +401,7 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                     metadata=metadata,
                 )
 
-            if args.use_parent:
+            if args.use_parent and source_aware is None:
                 results = self._resolve_parents(results, args.collection)
 
             conflict_section = ""
@@ -404,6 +447,7 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                 "collection": effective_collection,
                 "query_trace_ids": query_trace_ids,
             }
+            metadata.update(normalized_metadata)
             if composite_mode:
                 metadata.update(
                     {
