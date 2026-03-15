@@ -25,6 +25,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import replace
 import json
 import sys
@@ -55,6 +56,118 @@ class _EvalSearchAdapter:
             top_k=top_k,
             filters=filters,
         )
+
+
+class _FallbackSearchAdapter:
+    """Try hybrid search first and fall back to sparse-only eval on runtime errors."""
+
+    def __init__(self, primary_search, fallback_search) -> None:
+        self._primary_search = primary_search
+        self._fallback_search = fallback_search
+
+    def search(self, *, query: str, top_k: int, filters=None):
+        try:
+            results = self._primary_search.search(query=query, top_k=top_k, filters=filters)
+        except Exception as exc:
+            print(f"⚠️  Hybrid search failed at runtime, falling back to sparse eval: {exc}")
+            return self._fallback_search.search(query=query, top_k=top_k, filters=filters)
+        if self._is_empty(results):
+            print("⚠️  Hybrid search returned no results, falling back to sparse eval")
+            return self._fallback_search.search(query=query, top_k=top_k, filters=filters)
+        return results
+
+    @staticmethod
+    def _is_empty(results) -> bool:
+        if isinstance(results, list):
+            return len(results) == 0
+        payload = getattr(results, "results", None)
+        return payload is None or len(payload) == 0
+
+
+def _build_hybrid_eval_search(settings, collection: str, task_intent: str, timeout_seconds: float):
+    def _init():
+        from src.core.query_engine.query_processor import QueryProcessor
+        from src.core.query_engine.hybrid_search import create_hybrid_search
+        from src.core.query_engine.dense_retriever import create_dense_retriever
+        from src.core.query_engine.sparse_retriever import create_sparse_retriever
+        from src.core.query_engine.query_router import QueryRouter
+        from src.core.query_engine.source_aware_search import SourceAwareSearch
+        from src.libs.embedding.embedding_factory import EmbeddingFactory
+        from src.libs.embedding.cached_embedding import CachedEmbedding
+        from src.libs.vector_store.vector_store_factory import VectorStoreFactory
+        from src.storage.runtime import create_sparse_index
+
+        vector_store = VectorStoreFactory.create(
+            settings, collection_name=collection,
+        )
+        raw_embedding_client = EmbeddingFactory.create(settings)
+        embedding_client = CachedEmbedding(
+            raw_embedding_client,
+            max_size=settings.retrieval.embedding_cache_size,
+        )
+        dense_retriever = create_dense_retriever(
+            settings=settings,
+            embedding_client=embedding_client,
+            vector_store=vector_store,
+        )
+        bm25_indexer = create_sparse_index(settings, collection=collection)
+        sparse_retriever = create_sparse_retriever(
+            settings=settings,
+            bm25_indexer=bm25_indexer,
+            vector_store=vector_store,
+        )
+        sparse_retriever.default_collection = collection
+
+        query_processor = QueryProcessor()
+        base_hybrid_search = create_hybrid_search(
+            settings=settings,
+            query_processor=query_processor,
+            dense_retriever=dense_retriever,
+            sparse_retriever=sparse_retriever,
+        )
+        query_router = QueryRouter(fallback_to_llm=True)
+        source_aware_search = SourceAwareSearch(
+            hybrid_search=base_hybrid_search,
+            query_router=query_router,
+        )
+        return _EvalSearchAdapter(source_aware_search, task_intent)
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_init)
+    try:
+        return future.result(timeout=timeout_seconds)
+    except FuturesTimeoutError as exc:
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise RuntimeError(
+            f"Hybrid evaluation initialization timed out after {timeout_seconds:.1f}s"
+        ) from exc
+    except Exception:
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    finally:
+        if future.done():
+            executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _attach_reranker_with_timeout(hybrid_search, settings, timeout_seconds: float) -> None:
+    def _init():
+        from src.libs.reranker.reranker_factory import RerankerFactory
+
+        return RerankerFactory.create(settings)
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_init)
+    try:
+        hybrid_search._source_aware_search.hybrid_search.reranker = future.result(timeout=timeout_seconds)
+    except FuturesTimeoutError:
+        print(f"⚠️  Reranker unavailable, continuing without rerank: initialization timed out after {timeout_seconds:.1f}s")
+        executor.shutdown(wait=False, cancel_futures=True)
+    except Exception as exc:
+        print(f"⚠️  Reranker unavailable, continuing without rerank: {exc}")
+        executor.shutdown(wait=False, cancel_futures=True)
+    finally:
+        if future.done():
+            executor.shutdown(wait=False, cancel_futures=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -108,6 +221,12 @@ def parse_args() -> argparse.Namespace:
         "--enable-rerank",
         action="store_true",
         help="Enable cross-encoder reranking during evaluation.",
+    )
+    parser.add_argument(
+        "--hybrid-init-timeout",
+        type=float,
+        default=10.0,
+        help="Timeout in seconds for hybrid retrieval initialization before sparse fallback.",
     )
     return parser.parse_args()
 
@@ -171,60 +290,24 @@ def main() -> int:
                 hybrid_search = SparseSourceEvalSearch(settings=settings, collection=collection)
                 print(f"✅ SparseSourceEvalSearch initialized for collection: {collection}")
             else:
-                from src.core.query_engine.query_processor import QueryProcessor
-                from src.core.query_engine.hybrid_search import create_hybrid_search
-                from src.core.query_engine.dense_retriever import create_dense_retriever
-                from src.core.query_engine.sparse_retriever import create_sparse_retriever
-                from src.core.query_engine.query_router import QueryRouter
-                from src.core.query_engine.source_aware_search import SourceAwareSearch
-                from src.libs.embedding.embedding_factory import EmbeddingFactory
-                from src.libs.embedding.cached_embedding import CachedEmbedding
-                from src.libs.vector_store.vector_store_factory import VectorStoreFactory
-                from src.storage.runtime import create_sparse_index
+                from src.observability.evaluation.source_eval_search import SparseSourceEvalSearch
 
-                vector_store = VectorStoreFactory.create(
-                    settings, collection_name=collection,
-                )
-                raw_embedding_client = EmbeddingFactory.create(settings)
-                embedding_client = CachedEmbedding(
-                    raw_embedding_client,
-                    max_size=settings.retrieval.embedding_cache_size,
-                )
-                dense_retriever = create_dense_retriever(
-                    settings=settings,
-                    embedding_client=embedding_client,
-                    vector_store=vector_store,
-                )
-                bm25_indexer = create_sparse_index(settings, collection=collection)
-                sparse_retriever = create_sparse_retriever(
-                    settings=settings,
-                    bm25_indexer=bm25_indexer,
-                    vector_store=vector_store,
-                )
-                sparse_retriever.default_collection = collection
-
-                query_processor = QueryProcessor()
-                base_hybrid_search = create_hybrid_search(
-                    settings=settings,
-                    query_processor=query_processor,
-                    dense_retriever=dense_retriever,
-                    sparse_retriever=sparse_retriever,
-                )
-                if args.enable_rerank:
-                    from src.libs.reranker.reranker_factory import RerankerFactory
-
-                    try:
-                        base_hybrid_search.reranker = RerankerFactory.create(settings)
-                    except Exception as exc:
-                        print(f"⚠️  Reranker unavailable, continuing without rerank: {exc}")
-
-                query_router = QueryRouter(fallback_to_llm=True)
-                source_aware_search = SourceAwareSearch(
-                    hybrid_search=base_hybrid_search,
-                    query_router=query_router,
-                )
-                hybrid_search = _EvalSearchAdapter(source_aware_search, args.task_intent)
-                print(f"✅ SourceAwareSearch initialized for collection: {collection} (task_intent={args.task_intent})")
+                sparse_fallback = SparseSourceEvalSearch(settings=settings, collection=collection)
+                try:
+                    primary_search = _build_hybrid_eval_search(
+                        settings=settings,
+                        collection=collection,
+                        task_intent=args.task_intent,
+                        timeout_seconds=args.hybrid_init_timeout,
+                    )
+                    if args.enable_rerank:
+                        _attach_reranker_with_timeout(primary_search, settings, args.hybrid_init_timeout)
+                    hybrid_search = _FallbackSearchAdapter(primary_search, sparse_fallback)
+                    print(f"✅ SourceAwareSearch initialized for collection: {collection} (task_intent={args.task_intent})")
+                except Exception as exc:
+                    print(f"⚠️  Hybrid evaluation unavailable, falling back to sparse mode: {exc}")
+                    hybrid_search = sparse_fallback
+                    print(f"✅ SparseSourceEvalSearch fallback initialized for collection: {collection}")
         except Exception as exc:
             print(f"⚠️  Failed to initialize search (running without retrieval): {exc}")
 

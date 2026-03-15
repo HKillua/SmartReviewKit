@@ -15,6 +15,7 @@ Evaluation file format (JSONL, one object per line):
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import replace
 import json
 import logging
@@ -114,23 +115,34 @@ class _EvalSearchAdapter:
         )
 
 
-def run_evaluation(
-    eval_file: str,
-    top_k: int = 5,
-    collection: str = "computer_network",
-    settings_path: str = "config/settings.storage_stack.yaml",
-    task_intent: str = "knowledge_query",
-    mode: str = "sparse",
-    enable_rerank: bool = False,
-):
-    from src.core.settings import load_settings
+class _FallbackSearchAdapter:
+    """Try hybrid search first and fall back to sparse-only eval on runtime errors."""
 
-    settings = _prepare_settings(load_settings(settings_path))
-    if mode == "sparse":
-        from src.observability.evaluation.source_eval_search import SparseSourceEvalSearch
+    def __init__(self, primary_search, fallback_search) -> None:
+        self._primary_search = primary_search
+        self._fallback_search = fallback_search
 
-        search = SparseSourceEvalSearch(settings=settings, collection=collection)
-    else:
+    def search(self, *, query: str, top_k: int, filters=None):
+        try:
+            results = self._primary_search.search(query=query, top_k=top_k, filters=filters)
+        except Exception as exc:
+            logger.warning("Hybrid search failed at runtime, falling back to sparse eval: %s", exc)
+            return self._fallback_search.search(query=query, top_k=top_k, filters=filters)
+        if self._is_empty(results):
+            logger.warning("Hybrid search returned no results, falling back to sparse eval")
+            return self._fallback_search.search(query=query, top_k=top_k, filters=filters)
+        return results
+
+    @staticmethod
+    def _is_empty(results) -> bool:
+        if isinstance(results, list):
+            return len(results) == 0
+        payload = getattr(results, "results", None)
+        return payload is None or len(payload) == 0
+
+
+def _build_hybrid_eval_search(settings, collection: str, task_intent: str, timeout_seconds: float):
+    def _init():
         from src.core.query_engine.query_processor import QueryProcessor
         from src.core.query_engine.hybrid_search import HybridSearch
         from src.core.query_engine.dense_retriever import create_dense_retriever
@@ -159,17 +171,85 @@ def run_evaluation(
             fusion=fusion,
         )
         hybrid.embedding_client = embedding
-        if enable_rerank:
-            from src.libs.reranker.reranker_factory import RerankerFactory
-
-            try:
-                hybrid.reranker = RerankerFactory.create(settings)
-            except Exception as exc:
-                logger.warning("Reranker unavailable for retrieval eval: %s", exc)
-
         query_router = QueryRouter(fallback_to_llm=True)
         source_aware_search = SourceAwareSearch(hybrid_search=hybrid, query_router=query_router)
-        search = _EvalSearchAdapter(source_aware_search, task_intent)
+        return _EvalSearchAdapter(source_aware_search, task_intent)
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_init)
+    try:
+        return future.result(timeout=timeout_seconds)
+    except FuturesTimeoutError as exc:
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise RuntimeError(
+            f"Hybrid retrieval initialization timed out after {timeout_seconds:.1f}s"
+        ) from exc
+    except Exception:
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    finally:
+        if future.done():
+            executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _attach_reranker_with_timeout(search, settings, timeout_seconds: float) -> None:
+    def _init():
+        from src.libs.reranker.reranker_factory import RerankerFactory
+
+        return RerankerFactory.create(settings)
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_init)
+    try:
+        search._source_aware_search.hybrid_search.reranker = future.result(timeout=timeout_seconds)
+    except FuturesTimeoutError:
+        logger.warning(
+            "Reranker unavailable for retrieval eval: initialization timed out after %.1fs",
+            timeout_seconds,
+        )
+        executor.shutdown(wait=False, cancel_futures=True)
+    except Exception as exc:
+        logger.warning("Reranker unavailable for retrieval eval: %s", exc)
+        executor.shutdown(wait=False, cancel_futures=True)
+    finally:
+        if future.done():
+            executor.shutdown(wait=False, cancel_futures=True)
+
+
+def run_evaluation(
+    eval_file: str,
+    top_k: int = 5,
+    collection: str = "computer_network",
+    settings_path: str = "config/settings.storage_stack.yaml",
+    task_intent: str = "knowledge_query",
+    mode: str = "sparse",
+    enable_rerank: bool = False,
+    hybrid_init_timeout: float = 10.0,
+):
+    from src.core.settings import load_settings
+
+    settings = _prepare_settings(load_settings(settings_path))
+    if mode == "sparse":
+        from src.observability.evaluation.source_eval_search import SparseSourceEvalSearch
+
+        search = SparseSourceEvalSearch(settings=settings, collection=collection)
+    else:
+        from src.observability.evaluation.source_eval_search import SparseSourceEvalSearch
+
+        sparse_fallback = SparseSourceEvalSearch(settings=settings, collection=collection)
+        try:
+            primary_search = _build_hybrid_eval_search(
+                settings=settings,
+                collection=collection,
+                task_intent=task_intent,
+                timeout_seconds=hybrid_init_timeout,
+            )
+            if enable_rerank:
+                _attach_reranker_with_timeout(primary_search, settings, hybrid_init_timeout)
+            search = _FallbackSearchAdapter(primary_search, sparse_fallback)
+        except Exception as exc:
+            logger.warning("Hybrid retrieval unavailable, falling back to sparse eval: %s", exc)
+            search = sparse_fallback
 
     eval_items = load_eval_set(eval_file)
     print(f"\n{'='*60}")
@@ -233,10 +313,11 @@ def main():
     parser.add_argument("--task-intent", default="knowledge_query", help="Task intent for source-aware retrieval")
     parser.add_argument("--mode", choices=["sparse", "hybrid"], default="sparse", help="Retrieval mode for evaluation")
     parser.add_argument("--enable-rerank", action="store_true", help="Enable cross-encoder reranking during retrieval evaluation")
+    parser.add_argument("--hybrid-init-timeout", type=float, default=10.0, help="Timeout in seconds for hybrid retrieval initialization before sparse fallback")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.WARNING)
-    run_evaluation(args.eval_file, args.top_k, args.collection, args.settings, args.task_intent, args.mode, args.enable_rerank)
+    run_evaluation(args.eval_file, args.top_k, args.collection, args.settings, args.task_intent, args.mode, args.enable_rerank, args.hybrid_init_timeout)
 
 
 if __name__ == "__main__":

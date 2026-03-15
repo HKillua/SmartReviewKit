@@ -48,6 +48,8 @@ class SparseSourceEvalSearch:
         for hit in hits:
             doc_hash = str(hit.get("doc_hash") or "")
             source_path = self._source_lookup.get(doc_hash, "")
+            if not source_path:
+                continue
             source_label = Path(source_path).name if source_path else ""
             metadata = {
                 "doc_hash": doc_hash,
