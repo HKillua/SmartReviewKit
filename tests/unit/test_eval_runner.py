@@ -35,6 +35,8 @@ class StubEvaluator(BaseEvaluator):
         trace: Optional[Any] = None,
         **kwargs: Any,
     ) -> Dict[str, float]:
+        if ground_truth is not None:
+            assert isinstance(ground_truth, dict)
         return {"hit_rate": 1.0, "mrr": 0.5}
 
 
@@ -150,6 +152,42 @@ class TestEvalRunner:
 
         assert len(report.query_results) == 1
         assert report.query_results[0].retrieved_chunk_ids == ["c1"]
+
+    def test_run_builds_ground_truth_with_sources(self, tmp_path: Path) -> None:
+        f = tmp_path / "g.json"
+        _write_golden_json(f, [
+            {"query": "RAG", "expected_sources": ["chapter1.pptx"]},
+        ])
+
+        mock_search = MagicMock()
+        mock_search.search.return_value = [
+            MagicMock(chunk_id="c1", text="RAG is...", score=0.9),
+        ]
+
+        seen_ground_truth: dict[str, Any] = {}
+
+        class SourceAwareStubEvaluator(BaseEvaluator):
+            def evaluate(
+                self,
+                query: str,
+                retrieved_chunks: List[Any],
+                generated_answer: Optional[str] = None,
+                ground_truth: Optional[Any] = None,
+                trace: Optional[Any] = None,
+                **kwargs: Any,
+            ) -> Dict[str, float]:
+                seen_ground_truth.update(ground_truth or {})
+                return {"source_hit_rate": 1.0}
+
+        runner = EvalRunner(
+            hybrid_search=mock_search,
+            evaluator=SourceAwareStubEvaluator(),
+        )
+
+        report = runner.run(f)
+
+        assert len(report.query_results) == 1
+        assert seen_ground_truth == {"sources": ["chapter1.pptx"]}
 
     def test_run_with_answer_generator(self, tmp_path: Path) -> None:
         f = tmp_path / "g.json"

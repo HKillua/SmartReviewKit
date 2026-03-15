@@ -214,7 +214,12 @@ class OpenSearchSparseIndex(SparseIndex):
         )
         hits = response.get("hits", {}).get("hits", [])
         return [
-            {"chunk_id": hit["_source"]["chunk_id"], "score": float(hit["_score"])}
+            {
+                "chunk_id": hit["_source"]["chunk_id"],
+                "score": float(hit["_score"]),
+                "doc_hash": str(hit["_source"].get("doc_hash", "")),
+                "doc_id": str(hit["_source"].get("doc_id", "")),
+            }
             for hit in hits
         ]
 

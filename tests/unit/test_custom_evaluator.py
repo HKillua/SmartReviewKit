@@ -58,6 +58,76 @@ class TestCustomEvaluator:
         assert metrics["hit_rate"] == 1.0
         assert metrics["mrr"] == 0.5
 
+    def test_source_metrics_use_source_label(self) -> None:
+        evaluator = CustomEvaluator(metrics=["source_hit_rate", "source_mrr"])
+        retrieved = [
+            {"id": "c1", "metadata": {"source_label": "第1章 计算机网络与因特网.pptx"}},
+            {"id": "c2", "metadata": {"source_label": "第3章 运输层.pptx"}},
+        ]
+
+        metrics = evaluator.evaluate(
+            "query",
+            retrieved,
+            ground_truth={"sources": ["第3章 运输层.pptx"]},
+        )
+
+        assert metrics["source_hit_rate"] == 1.0
+        assert metrics["source_mrr"] == 0.5
+
+    def test_source_metrics_fall_back_to_source_path_basename(self) -> None:
+        evaluator = CustomEvaluator(metrics=["source_hit_rate", "source_mrr"])
+        retrieved = [
+            SimpleNamespace(
+                chunk_id="c1",
+                metadata={"source_path": "/tmp/docs/第2章 应用层.pptx"},
+            ),
+        ]
+
+        metrics = evaluator.evaluate(
+            "query",
+            retrieved,
+            ground_truth={"sources": ["第2章 应用层.pptx"]},
+        )
+
+        assert metrics["source_hit_rate"] == 1.0
+        assert metrics["source_mrr"] == 1.0
+
+    def test_source_metrics_skip_results_without_resolvable_source(self) -> None:
+        evaluator = CustomEvaluator(metrics=["source_hit_rate", "source_mrr"])
+        retrieved = [
+            SimpleNamespace(chunk_id="c1", metadata={}),
+            SimpleNamespace(
+                chunk_id="c2",
+                metadata={"source_label": "第2章 应用层.pptx"},
+            ),
+        ]
+
+        metrics = evaluator.evaluate(
+            "query",
+            retrieved,
+            ground_truth={"sources": ["第2章 应用层.pptx"]},
+        )
+
+        assert metrics["source_hit_rate"] == 1.0
+        assert metrics["source_mrr"] == 1.0
+
+    def test_source_metrics_dedupe_duplicate_sources(self) -> None:
+        evaluator = CustomEvaluator(metrics=["source_hit_rate", "source_mrr"])
+        retrieved = [
+            SimpleNamespace(chunk_id="c1", metadata={"source_label": "第3章 运输层.pptx"}),
+            SimpleNamespace(chunk_id="c2", metadata={"source_label": "第3章 运输层.pptx"}),
+            SimpleNamespace(chunk_id="c3", metadata={"source_label": "第1章 计算机网络与因特网.pptx"}),
+        ]
+
+        metrics = evaluator.evaluate(
+            "query",
+            retrieved,
+            ground_truth={"sources": ["第1章 计算机网络与因特网.pptx"]},
+        )
+
+        assert metrics["source_hit_rate"] == 1.0
+        assert metrics["source_mrr"] == 0.5
+
 
 class TestEvaluatorFactory:
     """Tests for EvaluatorFactory."""

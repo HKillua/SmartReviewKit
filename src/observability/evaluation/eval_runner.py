@@ -267,11 +267,13 @@ class EvalRunner:
         qr.generated_answer = answer
 
         # Step 3: Build ground truth
-        ground_truth = (
-            {"ids": test_case.expected_chunk_ids}
-            if test_case.expected_chunk_ids
-            else None
-        )
+        ground_truth: Optional[Dict[str, Any]] = None
+        if test_case.expected_chunk_ids or test_case.expected_sources:
+            ground_truth = {}
+            if test_case.expected_chunk_ids:
+                ground_truth["ids"] = list(test_case.expected_chunk_ids)
+            if test_case.expected_sources:
+                ground_truth["sources"] = list(test_case.expected_sources)
 
         # Step 4: Evaluate
         try:

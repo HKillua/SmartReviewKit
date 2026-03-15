@@ -25,6 +25,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import json
 import sys
 from pathlib import Path
@@ -40,6 +41,22 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 
+class _EvalSearchAdapter:
+    """Expose a HybridSearch-like surface over SourceAwareSearch."""
+
+    def __init__(self, source_aware_search, task_intent: str) -> None:
+        self._source_aware_search = source_aware_search
+        self._task_intent = task_intent
+
+    def search(self, *, query: str, top_k: int, filters=None):
+        return self._source_aware_search.search(
+            query=query,
+            task_intent=self._task_intent,
+            top_k=top_k,
+            filters=filters,
+        )
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -49,6 +66,11 @@ def parse_args() -> argparse.Namespace:
         "--test-set",
         default="tests/fixtures/golden_test_set.json",
         help="Path to golden test set JSON file (default: tests/fixtures/golden_test_set.json)",
+    )
+    parser.add_argument(
+        "--settings",
+        default="config/settings.storage_stack.yaml",
+        help="Path to settings file (default: config/settings.storage_stack.yaml)",
     )
     parser.add_argument(
         "--collection",
@@ -71,7 +93,48 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip retrieval (evaluate with mock chunks for testing).",
     )
+    parser.add_argument(
+        "--task-intent",
+        default="knowledge_query",
+        help="Task intent used by source-aware retrieval (default: knowledge_query).",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["sparse", "hybrid"],
+        default="sparse",
+        help="Retrieval mode used for evaluation (default: sparse).",
+    )
+    parser.add_argument(
+        "--enable-rerank",
+        action="store_true",
+        help="Enable cross-encoder reranking during evaluation.",
+    )
     return parser.parse_args()
+
+
+def _prepare_eval_settings(settings, test_cases):
+    """Enable evaluation for the CLI without mutating runtime app defaults."""
+    metrics: list[str] = []
+    if any(tc.expected_chunk_ids for tc in test_cases):
+        metrics.extend(["hit_rate", "mrr"])
+    if any(tc.expected_sources for tc in test_cases):
+        metrics.extend(["source_hit_rate", "source_mrr"])
+    if not metrics:
+        metrics = ["source_hit_rate", "source_mrr"]
+
+    evaluation_cfg = replace(
+        settings.evaluation,
+        enabled=True,
+        provider="custom",
+        metrics=metrics,
+    )
+    retrieval_cfg = replace(
+        settings.retrieval,
+        query_rewrite_enabled=False,
+        hyde_enabled=False,
+        multi_query_enabled=False,
+    )
+    return replace(settings, evaluation=evaluation_cfg, retrieval=retrieval_cfg)
 
 
 def main() -> int:
@@ -81,9 +144,10 @@ def main() -> int:
     try:
         from src.core.settings import load_settings
         from src.libs.evaluator.evaluator_factory import EvaluatorFactory
-        from src.observability.evaluation.eval_runner import EvalRunner
+        from src.observability.evaluation.eval_runner import EvalRunner, load_test_set
 
-        settings = load_settings()
+        test_cases = load_test_set(args.test_set)
+        settings = _prepare_eval_settings(load_settings(args.settings), test_cases)
     except Exception as exc:
         print(f"❌ Configuration error: {exc}", file=sys.stderr)
         return 2
@@ -100,41 +164,67 @@ def main() -> int:
     hybrid_search = None
     if not args.no_search:
         try:
-            from src.core.query_engine.query_processor import QueryProcessor
-            from src.core.query_engine.hybrid_search import create_hybrid_search
-            from src.core.query_engine.dense_retriever import create_dense_retriever
-            from src.core.query_engine.sparse_retriever import create_sparse_retriever
-            from src.libs.embedding.embedding_factory import EmbeddingFactory
-            from src.libs.vector_store.vector_store_factory import VectorStoreFactory
-            from src.storage.runtime import create_sparse_index
-
             collection = args.collection or "default"
+            if args.mode == "sparse":
+                from src.observability.evaluation.source_eval_search import SparseSourceEvalSearch
 
-            vector_store = VectorStoreFactory.create(
-                settings, collection_name=collection,
-            )
-            embedding_client = EmbeddingFactory.create(settings)
-            dense_retriever = create_dense_retriever(
-                settings=settings,
-                embedding_client=embedding_client,
-                vector_store=vector_store,
-            )
-            bm25_indexer = create_sparse_index(settings, collection=collection)
-            sparse_retriever = create_sparse_retriever(
-                settings=settings,
-                bm25_indexer=bm25_indexer,
-                vector_store=vector_store,
-            )
-            sparse_retriever.default_collection = collection
+                hybrid_search = SparseSourceEvalSearch(settings=settings, collection=collection)
+                print(f"✅ SparseSourceEvalSearch initialized for collection: {collection}")
+            else:
+                from src.core.query_engine.query_processor import QueryProcessor
+                from src.core.query_engine.hybrid_search import create_hybrid_search
+                from src.core.query_engine.dense_retriever import create_dense_retriever
+                from src.core.query_engine.sparse_retriever import create_sparse_retriever
+                from src.core.query_engine.query_router import QueryRouter
+                from src.core.query_engine.source_aware_search import SourceAwareSearch
+                from src.libs.embedding.embedding_factory import EmbeddingFactory
+                from src.libs.embedding.cached_embedding import CachedEmbedding
+                from src.libs.vector_store.vector_store_factory import VectorStoreFactory
+                from src.storage.runtime import create_sparse_index
 
-            query_processor = QueryProcessor()
-            hybrid_search = create_hybrid_search(
-                settings=settings,
-                query_processor=query_processor,
-                dense_retriever=dense_retriever,
-                sparse_retriever=sparse_retriever,
-            )
-            print(f"✅ HybridSearch initialized for collection: {collection}")
+                vector_store = VectorStoreFactory.create(
+                    settings, collection_name=collection,
+                )
+                raw_embedding_client = EmbeddingFactory.create(settings)
+                embedding_client = CachedEmbedding(
+                    raw_embedding_client,
+                    max_size=settings.retrieval.embedding_cache_size,
+                )
+                dense_retriever = create_dense_retriever(
+                    settings=settings,
+                    embedding_client=embedding_client,
+                    vector_store=vector_store,
+                )
+                bm25_indexer = create_sparse_index(settings, collection=collection)
+                sparse_retriever = create_sparse_retriever(
+                    settings=settings,
+                    bm25_indexer=bm25_indexer,
+                    vector_store=vector_store,
+                )
+                sparse_retriever.default_collection = collection
+
+                query_processor = QueryProcessor()
+                base_hybrid_search = create_hybrid_search(
+                    settings=settings,
+                    query_processor=query_processor,
+                    dense_retriever=dense_retriever,
+                    sparse_retriever=sparse_retriever,
+                )
+                if args.enable_rerank:
+                    from src.libs.reranker.reranker_factory import RerankerFactory
+
+                    try:
+                        base_hybrid_search.reranker = RerankerFactory.create(settings)
+                    except Exception as exc:
+                        print(f"⚠️  Reranker unavailable, continuing without rerank: {exc}")
+
+                query_router = QueryRouter(fallback_to_llm=True)
+                source_aware_search = SourceAwareSearch(
+                    hybrid_search=base_hybrid_search,
+                    query_router=query_router,
+                )
+                hybrid_search = _EvalSearchAdapter(source_aware_search, args.task_intent)
+                print(f"✅ SourceAwareSearch initialized for collection: {collection} (task_intent={args.task_intent})")
         except Exception as exc:
             print(f"⚠️  Failed to initialize search (running without retrieval): {exc}")
 

@@ -1,25 +1,30 @@
-"""Custom evaluator implementation for lightweight metrics.
+"""Custom evaluator implementation for lightweight retrieval metrics.
 
-This evaluator computes simple, deterministic metrics such as hit rate and MRR.
-It is designed for fast regression checks and sanity validation.
+This evaluator computes deterministic retrieval metrics for either chunk IDs
+or source labels. The source-level path is intentionally supported because
+chunk IDs may drift after re-ingestion while source filenames stay stable.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from src.libs.evaluator.base_evaluator import BaseEvaluator
 
 
 class CustomEvaluator(BaseEvaluator):
-    """Custom evaluator for lightweight metrics (hit_rate, mrr).
+    """Custom evaluator for lightweight metrics.
 
     The evaluator expects retrieved chunks to contain an identifier field.
-    Supported id fields: id, chunk_id, document_id, doc_id.
+    Supported ID fields: ``id``, ``chunk_id``, ``document_id``, ``doc_id``.
+    Supported source fields: ``source_label``, ``original_filename``,
+    ``source``, ``source_path``.
     """
 
-    SUPPORTED_METRICS = {"hit_rate", "mrr"}
+    SUPPORTED_METRICS = {"hit_rate", "mrr", "source_hit_rate", "source_mrr"}
     _ID_FIELDS = ("id", "chunk_id", "document_id", "doc_id")
+    _SOURCE_FIELDS = ("source_label", "original_filename", "source", "source_path")
 
     def __init__(
         self,
@@ -72,7 +77,11 @@ class CustomEvaluator(BaseEvaluator):
         self.validate_retrieved_chunks(retrieved_chunks)
 
         retrieved_ids = self._extract_ids(retrieved_chunks, label="retrieved_chunks")
+        retrieved_sources: List[str] = []
+        if "source_hit_rate" in self.metrics or "source_mrr" in self.metrics:
+            retrieved_sources = self._extract_sources(retrieved_chunks, label="retrieved_chunks")
         ground_truth_ids = self._extract_ground_truth_ids(ground_truth)
+        ground_truth_sources = self._extract_ground_truth_sources(ground_truth)
 
         results: Dict[str, float] = {}
 
@@ -80,6 +89,10 @@ class CustomEvaluator(BaseEvaluator):
             results["hit_rate"] = self._compute_hit_rate(retrieved_ids, ground_truth_ids)
         if "mrr" in self.metrics:
             results["mrr"] = self._compute_mrr(retrieved_ids, ground_truth_ids)
+        if "source_hit_rate" in self.metrics:
+            results["source_hit_rate"] = self._compute_hit_rate(retrieved_sources, ground_truth_sources)
+        if "source_mrr" in self.metrics:
+            results["source_mrr"] = self._compute_mrr(retrieved_sources, ground_truth_sources)
 
         return results
 
@@ -101,6 +114,8 @@ class CustomEvaluator(BaseEvaluator):
         if isinstance(ground_truth, dict):
             if "ids" in ground_truth and isinstance(ground_truth["ids"], list):
                 return self._extract_ids(ground_truth["ids"], label="ground_truth.ids")
+            if "ids" not in ground_truth:
+                return []
             return self._extract_ids([ground_truth], label="ground_truth")
         if isinstance(ground_truth, list):
             return self._extract_ids(ground_truth, label="ground_truth")
@@ -109,6 +124,19 @@ class CustomEvaluator(BaseEvaluator):
             f"Unsupported ground_truth type: {type(ground_truth).__name__}. "
             "Expected str, dict, list, or None."
         )
+
+    def _extract_ground_truth_sources(self, ground_truth: Optional[Any]) -> List[str]:
+        """Extract ground-truth source labels from various input shapes."""
+        if ground_truth is None:
+            return []
+        if isinstance(ground_truth, dict):
+            raw_sources = ground_truth.get("sources")
+            if isinstance(raw_sources, list):
+                return [self._normalize_source_label(item) for item in raw_sources if str(item).strip()]
+            if isinstance(raw_sources, str) and raw_sources.strip():
+                return [self._normalize_source_label(raw_sources)]
+            return []
+        return []
 
     def _extract_ids(self, items: Iterable[Any], label: str) -> List[str]:
         """Extract ids from a list of items."""
@@ -141,6 +169,55 @@ class CustomEvaluator(BaseEvaluator):
             )
 
         return ids
+
+    def _extract_sources(self, items: Iterable[Any], label: str) -> List[str]:
+        """Extract normalized source labels from a list of items."""
+        sources: List[str] = []
+        for index, item in enumerate(items):
+            source_value: Optional[str] = None
+            if isinstance(item, dict):
+                source_value = self._source_from_mapping(item)
+            elif hasattr(item, "metadata"):
+                metadata = getattr(item, "metadata", None)
+                if isinstance(metadata, dict):
+                    source_value = self._source_from_mapping(metadata)
+            if source_value is None:
+                continue
+            normalized = self._normalize_source_label(source_value)
+            if normalized:
+                sources.append(normalized)
+        return self._dedupe_preserve_order(sources)
+
+    def _source_from_mapping(self, payload: Dict[str, Any]) -> Optional[str]:
+        for field in self._SOURCE_FIELDS:
+            value = payload.get(field)
+            if value:
+                return str(value)
+        metadata = payload.get("metadata")
+        if isinstance(metadata, dict):
+            for field in self._SOURCE_FIELDS:
+                value = metadata.get(field)
+                if value:
+                    return str(value)
+        return None
+
+    def _normalize_source_label(self, source: Any) -> str:
+        text = str(source or "").strip()
+        if not text:
+            return ""
+        if "/" in text or "\\" in text:
+            text = Path(text).name
+        return text.casefold()
+
+    def _dedupe_preserve_order(self, values: Sequence[str]) -> List[str]:
+        seen: set[str] = set()
+        ordered: List[str] = []
+        for value in values:
+            if value in seen:
+                continue
+            seen.add(value)
+            ordered.append(value)
+        return ordered
 
     def _compute_hit_rate(self, retrieved_ids: Sequence[str], ground_truth_ids: Sequence[str]) -> float:
         """Compute hit rate (binary)."""
