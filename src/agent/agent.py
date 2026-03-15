@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 import time
 import uuid
 from typing import Any, AsyncGenerator, Optional
@@ -21,6 +22,7 @@ from src.agent.grounding import (
     GroundingAssessment,
     GroundingEvaluator,
     GroundingPolicyAction,
+    build_evidence_summary,
     build_conservative_rewrite_messages,
     build_evidence_bundle,
     build_grounding_context,
@@ -28,7 +30,13 @@ from src.agent.grounding import (
 from src.agent.hooks.lifecycle import LifecycleHook
 from src.agent.hooks.middleware import LlmMiddleware
 from src.agent.llm.base import LlmService
-from src.agent.planner import ControlMode, PlannerDecision, TaskIntent, TaskPlanner
+from src.agent.planner import (
+    ControlMode,
+    PlannedSubtask,
+    PlannerDecision,
+    TaskIntent,
+    TaskPlanner,
+)
 from src.agent.prompt_builder import SystemPromptBuilder
 from src.agent.tools.base import ToolRegistry
 from src.agent.types import (
@@ -51,6 +59,46 @@ from src.core.trace.trace_context import TraceContext
 logger = logging.getLogger(__name__)
 
 _TRACE_TEXT_LIMIT = 300
+_CN_NUMBERS = {
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+    "十": 10,
+}
+_QUIZ_COUNT_RE = re.compile(r"(?P<count>\d+|[一二两三四五六七八九十])\s*道")
+_QUESTION_TYPE_PATTERNS = (
+    ("选择题", re.compile(r"选择题", re.IGNORECASE)),
+    ("填空题", re.compile(r"填空题", re.IGNORECASE)),
+    ("简答题", re.compile(r"简答题", re.IGNORECASE)),
+    ("SQL题", re.compile(r"sql题|sql 题", re.IGNORECASE)),
+)
+_TOPIC_CLEANUP_PATTERNS = (
+    re.compile(r"[，。！？；,!?;]+"),
+    re.compile(r"\b(请|帮我|麻烦你|先|再|然后|接着|最后|并且|并|顺便|同时)\b"),
+    re.compile(r"解释|讲解|说明|分析|详细解释|详细介绍|为什么|原理|是什么|区别|对比|比较"),
+    re.compile(r"复习|总结|梳理|回顾|考点|重点|复习摘要|复习重点|考试复习|期末复习"),
+    re.compile(r"出题|做题|练习|习题|刷题|测验|生成.*?题|来.*?道题|出.*?道题|题目"),
+    re.compile(r"判分|评分|批改|评估答案|帮我判|检查答案|我的答案是|请帮我判"),
+    re.compile(r"(?P<count>\d+|[一二两三四五六七八九十])\s*道"),
+    re.compile(r"选择题|填空题|简答题|sql题|SQL题"),
+    re.compile(r"难度\s*[1-5]|基础|中等|困难|简单"),
+)
+_EVALUATOR_FIELD_PATTERNS = {
+    "question": re.compile(r"题目[:：]\s*(.+?)(?=(?:用户答案|我的答案|正确答案|$))", re.S),
+    "user_answer": re.compile(r"(?:用户答案|我的答案)[:：]\s*(.+?)(?=(?:正确答案|$))", re.S),
+    "correct_answer": re.compile(r"正确答案[:：]\s*(.+)$", re.S),
+}
+
+
+def _serialize_subtasks(subtasks: list[PlannedSubtask]) -> list[dict[str, object]]:
+    return [subtask.to_metadata() for subtask in subtasks]
 
 
 def _hash_user_id(user_id: str) -> str:
@@ -98,6 +146,20 @@ def _exclude_tool_schema(tool_schemas: list[dict], tool_name: str) -> list[dict]
 def _build_planner_context(decision: PlannerDecision | None) -> str:
     if decision is None or decision.control_mode == ControlMode.PASS_THROUGH:
         return ""
+    if decision.is_composite and decision.subtasks:
+        lines = [
+            f"任务识别: composite({decision.primary_intent.value if decision.primary_intent else decision.task_intent.value})",
+            f"控制策略: {decision.control_mode.value}",
+            f"匹配方式: {decision.match_method}",
+            f"执行顺序: {decision.ordering_method or 'declared_order'}",
+        ]
+        for index, subtask in enumerate(decision.subtasks, 1):
+            lines.append(
+                f"子任务 {index}: {subtask.task_intent.value} -> {subtask.selected_tool}"
+            )
+        if decision.planner_hint:
+            lines.append(f"执行提示: {decision.planner_hint}")
+        return "\n".join(f"- {line}" for line in lines)
     lines = [
         f"任务识别: {decision.task_intent.value}",
         f"控制策略: {decision.control_mode.value}",
@@ -114,13 +176,21 @@ def _build_planner_context(decision: PlannerDecision | None) -> str:
 def _planner_metadata(decision: PlannerDecision | None) -> dict[str, object]:
     if decision is None:
         return {}
-    return {
+    metadata = {
         "planner_task_intent": decision.task_intent.value,
         "planner_control_mode": decision.control_mode.value,
         "planner_selected_tool": decision.selected_tool,
         "planner_confidence": round(decision.confidence, 3),
         "planner_match_method": decision.match_method,
+        "planner_is_composite": decision.is_composite,
+        "planner_primary_intent": (
+            decision.primary_intent.value if decision.primary_intent is not None else ""
+        ),
+        "planner_ordering_method": decision.ordering_method,
     }
+    if decision.subtasks:
+        metadata["subtask_plan"] = _serialize_subtasks(decision.subtasks)
+    return metadata
 
 
 def _is_course_task(decision: PlannerDecision | None) -> bool:
@@ -131,6 +201,75 @@ def _append_warning(text: str, warning: str) -> str:
     if not warning or warning in text:
         return text
     return f"{text.rstrip()}\n\n{warning}"
+
+
+def _parse_count_token(token: str) -> int | None:
+    token = token.strip()
+    if token.isdigit():
+        return int(token)
+    return _CN_NUMBERS.get(token)
+
+
+def _extract_quiz_count(text: str) -> int | None:
+    match = _QUIZ_COUNT_RE.search(text)
+    if match is None:
+        return None
+    return _parse_count_token(match.group("count"))
+
+
+def _extract_question_type(text: str) -> str | None:
+    for value, pattern in _QUESTION_TYPE_PATTERNS:
+        if pattern.search(text):
+            return value
+    return None
+
+
+def _extract_quiz_difficulty(text: str) -> int | None:
+    if re.search(r"难度\s*1|简单|基础", text):
+        return 1
+    if re.search(r"难度\s*2", text):
+        return 2
+    if re.search(r"难度\s*3|中等", text):
+        return 3
+    if re.search(r"难度\s*4|困难", text):
+        return 4
+    if re.search(r"难度\s*5", text):
+        return 5
+    return None
+
+
+def _clean_topic_text(text: str) -> str:
+    cleaned = text
+    for pattern in _TOPIC_CLEANUP_PATTERNS:
+        cleaned = pattern.sub(" ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ，。！？；,!?;：:")
+    return cleaned
+
+
+def _extract_shared_topic(message: str) -> str:
+    cleaned = _clean_topic_text(message)
+    if cleaned:
+        return cleaned
+    stripped = re.sub(r"\s+", " ", message).strip()
+    return stripped[:120]
+
+
+def _extract_evaluator_fields(message: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for key, pattern in _EVALUATOR_FIELD_PATTERNS.items():
+        match = pattern.search(message)
+        if match is not None:
+            values[key] = " ".join(match.group(1).split())
+    return values
+
+
+def _composite_section_title(intent: TaskIntent) -> str:
+    return {
+        TaskIntent.KNOWLEDGE_QUERY: "知识讲解",
+        TaskIntent.REVIEW_SUMMARY: "复习总结",
+        TaskIntent.QUIZ_GENERATOR: "练习题",
+        TaskIntent.QUIZ_EVALUATOR: "判题结果",
+    }.get(intent, intent.value)
 
 
 def _build_evidence_metadata(
@@ -442,27 +581,43 @@ class Agent:
                 recent_messages=recent_msgs,
             )
 
-            # --- Tool loop ---
             try:
                 response_state: dict[str, object] = {}
-                async for event in self._tool_loop(
-                    conversation,
-                    system_prompt,
-                    tool_schemas,
-                    tool_ctx,
-                    trace=agent_trace,
-                    planner_decision=planner_decision,
-                    planner_runtime=planner_runtime,
-                    response_state=response_state,
-                ):
-                    yield event
+                if planner_decision is not None and planner_decision.is_composite:
+                    async for event in self._run_composite_plan(
+                        conversation,
+                        tool_ctx,
+                        planner_decision,
+                        trace=agent_trace,
+                        response_state=response_state,
+                    ):
+                        yield event
+                else:
+                    async for event in self._tool_loop(
+                        conversation,
+                        system_prompt,
+                        tool_schemas,
+                        tool_ctx,
+                        trace=agent_trace,
+                        planner_decision=planner_decision,
+                        planner_runtime=planner_runtime,
+                        response_state=response_state,
+                    ):
+                        yield event
             except Exception as exc:
-                logger.exception("Agent tool loop error")
+                logger.exception("Agent execution error")
                 if agent_trace is not None:
                     agent_trace.metadata["status"] = "error"
                     agent_trace.record_stage(
                         "error",
-                        {"phase": "tool_loop", "error": _truncate_text(str(exc))},
+                        {
+                            "phase": (
+                                "composite_execution"
+                                if planner_decision is not None and planner_decision.is_composite
+                                else "tool_loop"
+                            ),
+                            "error": _truncate_text(str(exc)),
+                        },
                     )
                 yield StreamEvent(type=StreamEventType.ERROR, content=str(exc))
 
@@ -517,6 +672,377 @@ class Agent:
                 await hook.after_message(conversation)
             except Exception:
                 logger.exception("after_message hook failed in background")
+
+    def _build_composite_tool_args(
+        self,
+        subtask: PlannedSubtask,
+        *,
+        original_request: str,
+        handoff: dict[str, Any],
+    ) -> dict[str, Any]:
+        segment_text = str(subtask.segment_text or original_request).strip()
+        shared_topic = str(handoff.get("shared_topic") or _extract_shared_topic(original_request))
+        segment_topic = _clean_topic_text(segment_text)
+        effective_topic = segment_topic or shared_topic or original_request
+
+        if subtask.task_intent == TaskIntent.KNOWLEDGE_QUERY:
+            return {
+                "query": segment_topic or shared_topic or original_request,
+                "top_k": 5,
+            }
+        if subtask.task_intent == TaskIntent.REVIEW_SUMMARY:
+            return {
+                "topic": effective_topic,
+            }
+        if subtask.task_intent == TaskIntent.QUIZ_GENERATOR:
+            return {
+                "topic": effective_topic,
+                "question_type": _extract_question_type(segment_text)
+                or _extract_question_type(original_request)
+                or "选择题",
+                "count": _extract_quiz_count(segment_text)
+                or _extract_quiz_count(original_request)
+                or 3,
+                "difficulty": _extract_quiz_difficulty(segment_text)
+                or _extract_quiz_difficulty(original_request)
+                or 3,
+            }
+        if subtask.task_intent == TaskIntent.QUIZ_EVALUATOR:
+            parsed = _extract_evaluator_fields(segment_text or original_request)
+            return {
+                "question": parsed.get("question") or effective_topic or original_request,
+                "user_answer": parsed.get("user_answer", ""),
+                "correct_answer": parsed.get("correct_answer", ""),
+                "question_type": _extract_question_type(segment_text)
+                or _extract_question_type(original_request)
+                or "选择题",
+                "topic": effective_topic,
+                "concepts": [],
+            }
+        return {}
+
+    def _build_composite_tool_context(
+        self,
+        base_context: ToolContext,
+        *,
+        subtask: PlannedSubtask,
+        subtask_index: int,
+        handoff: dict[str, Any],
+    ) -> ToolContext:
+        aggregate = dict(handoff.get("aggregate_evidence", {}) or {})
+        handoff_snapshot = {
+            "original_user_request": handoff.get("original_user_request", ""),
+            "shared_topic": handoff.get("shared_topic", ""),
+            "completed_subtasks": list(handoff.get("completed_subtasks", [])),
+            "latest_result_text": handoff.get("latest_result_text", ""),
+            "latest_evidence_summary": handoff.get("latest_evidence_summary", ""),
+            "latest_citations": list(handoff.get("latest_citations", [])),
+            "aggregate_evidence": {
+                "citations": list(aggregate.get("citations", [])),
+                "evidence_summary": aggregate.get("evidence_summary", ""),
+                "evidence_texts": list(aggregate.get("evidence_texts", [])),
+                "source_count": aggregate.get("source_count", 0),
+                "query_trace_ids": list(aggregate.get("query_trace_ids", [])),
+            },
+        }
+        metadata = dict(base_context.metadata)
+        metadata.update(
+            {
+                "planner_task_intent": subtask.task_intent.value,
+                "composite": True,
+                "composite_mode": True,
+                "composite_handoff": handoff_snapshot,
+                "composite_subtask_index": subtask_index,
+                "composite_subtask_intent": subtask.task_intent.value,
+                "composite_parent_request_id": base_context.request_id,
+            }
+        )
+        return base_context.model_copy(update={"metadata": metadata})
+
+    async def _run_composite_plan(
+        self,
+        conversation: Conversation,
+        tool_ctx: ToolContext,
+        planner_decision: PlannerDecision,
+        *,
+        trace: TraceContext | None = None,
+        response_state: dict[str, object] | None = None,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        original_request = next(
+            (
+                msg.content
+                for msg in reversed(conversation.messages)
+                if msg.role == "user" and msg.content
+            ),
+            "",
+        )
+        handoff: dict[str, Any] = {
+            "original_user_request": original_request,
+            "shared_topic": _extract_shared_topic(original_request),
+            "completed_subtasks": [],
+            "latest_result_text": "",
+            "latest_evidence_summary": "",
+            "latest_citations": [],
+            "aggregate_evidence": {
+                "citations": [],
+                "evidence_summary": "",
+                "evidence_texts": [],
+                "source_count": 0,
+                "query_trace_ids": [],
+            },
+        }
+        completed_sections: list[tuple[str, str]] = []
+        completed_subtasks: list[dict[str, object]] = []
+        failed_subtask: dict[str, object] | None = None
+        completed_intents: set[TaskIntent] = set()
+        last_generation_mode = ""
+        last_evaluation_mode = ""
+
+        if trace is not None:
+            trace.record_stage(
+                "composite_plan",
+                {
+                    "subtask_count": len(planner_decision.subtasks),
+                    "ordering_method": planner_decision.ordering_method,
+                    "subtask_plan": _serialize_subtasks(planner_decision.subtasks),
+                },
+            )
+
+        for subtask_index, subtask in enumerate(planner_decision.subtasks):
+            arguments = self._build_composite_tool_args(
+                subtask,
+                original_request=original_request,
+                handoff=handoff,
+            )
+            sub_ctx = self._build_composite_tool_context(
+                tool_ctx,
+                subtask=subtask,
+                subtask_index=subtask_index,
+                handoff=handoff,
+            )
+            tool_call = ToolCallData(
+                id=f"composite_{subtask_index + 1}",
+                name=subtask.selected_tool,
+                arguments=arguments,
+            )
+
+            yield StreamEvent(
+                type=StreamEventType.TOOL_START,
+                tool_name=subtask.selected_tool,
+                metadata={"arguments": arguments},
+            )
+
+            tool_blocked = False
+            for hook in self.hooks:
+                try:
+                    await hook.before_tool(subtask.selected_tool, sub_ctx)
+                except Exception as exc:
+                    logger.warning("before_tool hook blocked %s: %s", subtask.selected_tool, exc)
+                    tool_blocked = True
+                    break
+
+            tool_started = time.monotonic()
+            if tool_blocked:
+                tool_result_obj = ToolResult(
+                    success=False,
+                    error="Tool execution blocked by hook",
+                    metadata={
+                        "tool_name": subtask.selected_tool,
+                        "error_type": ToolErrorType.BLOCKED_BY_HOOK.value,
+                        "retryable": False,
+                    },
+                )
+            else:
+                tool_result_obj = await self.tools.execute(
+                    tool_call,
+                    sub_ctx,
+                    timeout=float(self.config.tool_timeout),
+                )
+
+            for hook in self.hooks:
+                try:
+                    modified = await hook.after_tool(
+                        subtask.selected_tool,
+                        tool_result_obj,
+                        context=sub_ctx,
+                    )
+                    if modified is not None:
+                        tool_result_obj = modified
+                except Exception:
+                    logger.exception("after_tool hook failed")
+
+            yield StreamEvent(
+                type=StreamEventType.TOOL_RESULT,
+                tool_name=subtask.selected_tool,
+                content=(
+                    tool_result_obj.result_for_llm
+                    if tool_result_obj.success
+                    else tool_result_obj.error
+                ),
+                metadata={
+                    "success": tool_result_obj.success,
+                    **tool_result_obj.metadata,
+                },
+            )
+
+            if trace is not None:
+                trace.record_stage(
+                    "composite_subtask_execution",
+                    {
+                        "subtask_index": subtask_index,
+                        "task_intent": subtask.task_intent.value,
+                        "tool_name": subtask.selected_tool,
+                        "arguments": _summarize_arguments(arguments),
+                        "success": tool_result_obj.success,
+                        "error_summary": _truncate_text(tool_result_obj.error),
+                        "result_summary": _truncate_text(tool_result_obj.result_for_llm),
+                        "query_trace_id": tool_result_obj.metadata.get("query_trace_id", ""),
+                    },
+                    elapsed_ms=(time.monotonic() - tool_started) * 1000.0,
+                )
+
+            if not tool_result_obj.success:
+                failed_subtask = {
+                    "subtask_index": subtask_index,
+                    "task_intent": subtask.task_intent.value,
+                    "selected_tool": subtask.selected_tool,
+                    "error": tool_result_obj.error or "子任务执行失败",
+                }
+                break
+
+            completed_intents.add(subtask.task_intent)
+            completed_subtask = {
+                "subtask_index": subtask_index,
+                "task_intent": subtask.task_intent.value,
+                "selected_tool": subtask.selected_tool,
+            }
+            completed_subtasks.append(completed_subtask)
+            completed_sections.append(
+                (
+                    _composite_section_title(subtask.task_intent),
+                    tool_result_obj.result_for_llm or "",
+                )
+            )
+
+            citations = list(tool_result_obj.metadata.get("citations", []) or [])
+            evidence_texts = list(tool_result_obj.metadata.get("evidence_texts", []) or [])
+            query_trace_ids = [
+                str(value)
+                for value in tool_result_obj.metadata.get("query_trace_ids", [])
+                if str(value)
+            ]
+            query_trace_id = str(tool_result_obj.metadata.get("query_trace_id", "") or "")
+            if query_trace_id and query_trace_id not in query_trace_ids:
+                query_trace_ids.append(query_trace_id)
+
+            aggregate = handoff["aggregate_evidence"]
+            aggregate["citations"].extend(citations)
+            aggregate["evidence_texts"].extend(evidence_texts)
+            seen_query_trace_ids = set(aggregate["query_trace_ids"])
+            for trace_id in query_trace_ids:
+                if trace_id not in seen_query_trace_ids:
+                    aggregate["query_trace_ids"].append(trace_id)
+                    seen_query_trace_ids.add(trace_id)
+            aggregate["source_count"] = len(aggregate["citations"])
+            aggregate["evidence_summary"] = (
+                build_evidence_summary(aggregate["citations"])
+                if aggregate["citations"]
+                else str(tool_result_obj.metadata.get("evidence_summary", "") or "")
+            )
+
+            handoff["completed_subtasks"] = list(completed_subtasks)
+            handoff["latest_result_text"] = tool_result_obj.result_for_llm or ""
+            handoff["latest_evidence_summary"] = str(
+                tool_result_obj.metadata.get("evidence_summary", "") or ""
+            )
+            handoff["latest_citations"] = citations
+            last_generation_mode = str(
+                tool_result_obj.metadata.get("generation_mode", "") or last_generation_mode
+            )
+            last_evaluation_mode = str(
+                tool_result_obj.metadata.get("evaluation_mode", "") or last_evaluation_mode
+            )
+
+        lines: list[str] = []
+        for section_title, section_text in completed_sections:
+            lines.append(f"## {section_title}")
+            lines.append(section_text.strip())
+            lines.append("")
+        if failed_subtask is not None:
+            lines.append("## 未完成项")
+            lines.append(
+                f"- 子任务 `{failed_subtask['selected_tool']}` 执行失败：{failed_subtask['error']}"
+            )
+        final_text = "\n".join(line for line in lines if line is not None).strip()
+        if not final_text:
+            final_text = "当前复合学习任务未生成可展示结果。"
+
+        aggregate_metadata = {
+            "grounding_capable": True,
+            "citations": list(handoff["aggregate_evidence"]["citations"]),
+            "evidence_summary": handoff["aggregate_evidence"]["evidence_summary"],
+            "evidence_texts": list(handoff["aggregate_evidence"]["evidence_texts"]),
+            "source_count": int(handoff["aggregate_evidence"]["source_count"] or 0),
+            "query_trace_ids": list(handoff["aggregate_evidence"]["query_trace_ids"]),
+            "generation_mode": "composite",
+            "evaluation_mode": last_evaluation_mode,
+        }
+        aggregate_bundle = build_evidence_bundle("composite", aggregate_metadata)
+        grounding_assessment: GroundingAssessment | None = None
+        if (
+            aggregate_bundle is not None
+            and aggregate_bundle.has_evidence
+            and TaskIntent.QUIZ_GENERATOR not in completed_intents
+            and TaskIntent.QUIZ_EVALUATOR not in completed_intents
+            and failed_subtask is None
+        ):
+            final_text, grounding_assessment = await self._finalize_answer(
+                final_text,
+                course_task=True,
+                evidence_bundle=aggregate_bundle,
+                fallback_text=final_text,
+            )
+            if trace is not None and grounding_assessment is not None:
+                trace.record_stage(
+                    "answer_grounding",
+                    {
+                        **grounding_assessment.to_metadata(),
+                        "generation_mode": "composite",
+                    },
+                )
+
+        if response_state is not None:
+            response_state.update(
+                {
+                    "composite": True,
+                    "planner_primary_intent": (
+                        planner_decision.primary_intent.value
+                        if planner_decision.primary_intent is not None
+                        else planner_decision.task_intent.value
+                    ),
+                    "subtask_plan": _serialize_subtasks(planner_decision.subtasks),
+                    "completed_subtasks": list(completed_subtasks),
+                    "failed_subtask": failed_subtask or {},
+                    "generation_mode": "composite",
+                }
+            )
+            response_state.update(_build_evidence_metadata(aggregate_bundle, grounding_assessment))
+            if last_evaluation_mode:
+                response_state["evaluation_mode"] = last_evaluation_mode
+
+        if trace is not None:
+            trace.record_stage(
+                "composite_finalize",
+                {
+                    "completed_subtask_count": len(completed_subtasks),
+                    "failed_subtask": failed_subtask or {},
+                    "content_length": len(final_text),
+                    "content_preview": _truncate_text(final_text),
+                },
+            )
+
+        yield StreamEvent(type=StreamEventType.TEXT_DELTA, content=final_text)
+        conversation.messages.append(Message(role="assistant", content=final_text))
 
     async def _tool_loop(
         self,

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Dict, List, Optional
 
@@ -28,6 +28,26 @@ class ControlMode(str, Enum):
 
 
 @dataclass
+class PlannedSubtask:
+    task_intent: TaskIntent
+    selected_tool: str
+    confidence: float
+    source_span: tuple[int, int]
+    match_method: str = "rule"
+    segment_text: str = ""
+
+    def to_metadata(self) -> Dict[str, object]:
+        return {
+            "task_intent": self.task_intent.value,
+            "selected_tool": self.selected_tool,
+            "confidence": round(self.confidence, 3),
+            "source_span": [self.source_span[0], self.source_span[1]],
+            "match_method": self.match_method,
+            "segment_text": self.segment_text,
+        }
+
+
+@dataclass
 class PlannerDecision:
     task_intent: TaskIntent
     confidence: float = 0.0
@@ -35,6 +55,10 @@ class PlannerDecision:
     control_mode: ControlMode = ControlMode.PASS_THROUGH
     selected_tool: str = ""
     planner_hint: str = ""
+    is_composite: bool = False
+    subtasks: list[PlannedSubtask] = field(default_factory=list)
+    primary_intent: TaskIntent | None = None
+    ordering_method: str = ""
 
     def to_metadata(self) -> Dict[str, object]:
         return {
@@ -44,11 +68,17 @@ class PlannerDecision:
             "control_mode": self.control_mode.value,
             "selected_tool": self.selected_tool,
             "planner_hint": self.planner_hint,
+            "is_composite": self.is_composite,
+            "primary_intent": (
+                self.primary_intent.value if self.primary_intent is not None else ""
+            ),
+            "ordering_method": self.ordering_method,
+            "subtasks": [subtask.to_metadata() for subtask in self.subtasks],
         }
 
 
 _QUIZ_GENERATOR_RULES = re.compile(
-    r"出题|做题|练习|习题|刷题|测验|来.*道题|生成.*题|quiz",
+    r"出题|做题|练习|习题|刷题|测验|来\s*(?:\d+|[一二两三四五六七八九十])?\s*道(?:选择|填空|简答|SQL)?题|出\s*(?:\d+|[一二两三四五六七八九十])?\s*道(?:选择|填空|简答|SQL)?题|生成.*题|quiz",
     re.IGNORECASE,
 )
 _QUIZ_EVALUATOR_RULES = re.compile(
@@ -56,7 +86,11 @@ _QUIZ_EVALUATOR_RULES = re.compile(
     re.IGNORECASE,
 )
 _REVIEW_RULES = re.compile(
-    r"复习|总结.*要点|考点|回顾|梳理|复习摘要|复习重点|考试复习|期末复习",
+    r"复习|总结(?:一下)?(?:.*?(?:要点|重点))?|考点|回顾|梳理|复习摘要|复习重点|考试复习|期末复习",
+    re.IGNORECASE,
+)
+_KNOWLEDGE_RULES = re.compile(
+    r"解释|讲解|说明|为什么|原理|怎么理解|如何理解|详细介绍|详细解释|区别|对比|比较|分析|是什么",
     re.IGNORECASE,
 )
 _DOCUMENT_RULES = re.compile(
@@ -145,6 +179,13 @@ _TASK_PROTOTYPES: Dict[TaskIntent, List[str]] = {
     ],
 }
 
+_COMPOSITE_TASK_PATTERNS: list[tuple[TaskIntent, re.Pattern[str]]] = [
+    (TaskIntent.KNOWLEDGE_QUERY, _KNOWLEDGE_RULES),
+    (TaskIntent.REVIEW_SUMMARY, _REVIEW_RULES),
+    (TaskIntent.QUIZ_GENERATOR, _QUIZ_GENERATOR_RULES),
+    (TaskIntent.QUIZ_EVALUATOR, _QUIZ_EVALUATOR_RULES),
+]
+
 
 def _cosine_similarity(a: List[float], b: List[float]) -> float:
     dot = sum(x * y for x, y in zip(a, b))
@@ -210,6 +251,10 @@ class TaskPlanner:
                 planner_hint=decision.planner_hint,
             )
 
+        composite_decision = self._composite_rule_match(message)
+        if composite_decision is not None:
+            return composite_decision
+
         rule_decision = self._rule_match(message)
         if rule_decision is not None:
             return rule_decision
@@ -220,6 +265,65 @@ class TaskPlanner:
                 return embedding_decision
 
         return self._default_decision(message)
+
+    def _composite_rule_match(self, message: str) -> PlannerDecision | None:
+        text = message.strip()
+        if not text:
+            return None
+        if _CHAT_RULES.match(text):
+            return None
+        if _DOCUMENT_RULES.search(text) or self._looks_like_file_ingest(text):
+            return None
+
+        ordered_hits = self._collect_composite_hits(text)
+        if len(ordered_hits) < 2:
+            return None
+
+        subtasks: list[PlannedSubtask] = []
+        for index, (intent, start, end, matched_text) in enumerate(ordered_hits):
+            next_start = ordered_hits[index + 1][1] if index + 1 < len(ordered_hits) else len(text)
+            segment_text = text[start:next_start].strip()
+            if not segment_text:
+                segment_text = matched_text
+            subtasks.append(
+                PlannedSubtask(
+                    task_intent=intent,
+                    selected_tool=intent.value,
+                    confidence=1.0,
+                    source_span=(start, end),
+                    match_method="rule",
+                    segment_text=segment_text,
+                )
+            )
+
+        primary_intent = subtasks[0].task_intent
+        return PlannerDecision(
+            task_intent=primary_intent,
+            confidence=1.0,
+            match_method="rule_composite",
+            control_mode=ControlMode.FORCE_TOOL,
+            selected_tool=subtasks[0].selected_tool,
+            planner_hint=self._build_composite_hint(subtasks),
+            is_composite=True,
+            subtasks=subtasks,
+            primary_intent=primary_intent,
+            ordering_method="rule_span_order",
+        )
+
+    def _collect_composite_hits(
+        self,
+        message: str,
+    ) -> list[tuple[TaskIntent, int, int, str]]:
+        hits: list[tuple[TaskIntent, int, int, str]] = []
+        seen_intents: set[TaskIntent] = set()
+        for intent, pattern in _COMPOSITE_TASK_PATTERNS:
+            match = pattern.search(message)
+            if match is None or intent in seen_intents:
+                continue
+            seen_intents.add(intent)
+            hits.append((intent, match.start(), match.end(), match.group(0)))
+        hits.sort(key=lambda item: item[1])
+        return hits
 
     def _rule_match(self, message: str) -> PlannerDecision | None:
         text = message.strip()
@@ -251,6 +355,12 @@ class TaskPlanner:
             return self._build_decision(
                 TaskIntent.REVIEW_SUMMARY,
                 confidence=1.0,
+                match_method="rule",
+            )
+        if _KNOWLEDGE_RULES.search(text):
+            return self._build_decision(
+                TaskIntent.KNOWLEDGE_QUERY,
+                confidence=0.92,
                 match_method="rule",
             )
         return None
@@ -342,6 +452,14 @@ class TaskPlanner:
             control_mode=control_mode,
             selected_tool=intent.value,
             planner_hint=hint_templates.get(intent, ""),
+        )
+
+    @staticmethod
+    def _build_composite_hint(subtasks: list[PlannedSubtask]) -> str:
+        ordered_tools = " -> ".join(subtask.selected_tool for subtask in subtasks)
+        return (
+            "这是复合学习任务，请严格按用户表达顺序依次执行子任务："
+            f"{ordered_tools}。"
         )
 
     @property

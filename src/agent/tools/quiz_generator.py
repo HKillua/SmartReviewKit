@@ -17,6 +17,35 @@ from src.core.response.citation_generator import CitationGenerator, sanitize_ret
 
 logger = logging.getLogger(__name__)
 
+
+def _composite_handoff(context: ToolContext) -> dict[str, Any]:
+    value = context.metadata.get("composite_handoff", {})
+    return value if isinstance(value, dict) else {}
+
+
+def _handoff_context_text(context: ToolContext) -> str:
+    handoff = _composite_handoff(context)
+    aggregate = handoff.get("aggregate_evidence", {})
+    if isinstance(aggregate, dict):
+        evidence_summary = str(aggregate.get("evidence_summary", "") or "").strip()
+        if evidence_summary:
+            return evidence_summary
+    latest_result = str(handoff.get("latest_result_text", "") or "").strip()
+    return latest_result
+
+
+def _handoff_citations(context: ToolContext) -> list[dict[str, Any]]:
+    handoff = _composite_handoff(context)
+    aggregate = handoff.get("aggregate_evidence", {})
+    if isinstance(aggregate, dict):
+        citations = aggregate.get("citations", [])
+        if isinstance(citations, list) and citations:
+            return [dict(citation) for citation in citations if isinstance(citation, dict)]
+    latest = handoff.get("latest_citations", [])
+    if isinstance(latest, list):
+        return [dict(citation) for citation in latest if isinstance(citation, dict)]
+    return []
+
 QUIZ_PROMPT_TEMPLATE = """请根据以下知识内容，生成 {count} 道{question_type}，难度级别 {difficulty}/5。
 
 知识内容:
@@ -128,6 +157,8 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
 
     async def execute(self, context: ToolContext, args: QuizGeneratorArgs) -> ToolResult:
         weak_hint = await self._get_weak_hint(context.user_id)
+        handoff_context = _handoff_context_text(context)
+        handoff_citations = _handoff_citations(context)
 
         # --- Tier 1: try question bank ---
         qb_results = await self._search_question_bank(args.topic, args.count)
@@ -155,7 +186,21 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
         # --- Tier 2: RAG context + LLM generation ---
         results = await self._search_all(args.topic, top_k=6)
         if results:
-            return await self._generate_from_context(results, args, weak_hint)
+            return await self._generate_from_context(
+                results,
+                args,
+                weak_hint,
+                supplemental_context=handoff_context,
+                supplemental_citations=handoff_citations,
+            )
+
+        if handoff_context:
+            return await self._generate_from_handoff_context(
+                handoff_context,
+                args,
+                weak_hint,
+                citations=handoff_citations,
+            )
 
         return ToolResult(
             success=True,
@@ -218,11 +263,21 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
             questions.append(q)
         return "以下题目来自课程题库：\n\n" + _format_questions(questions, question_type)
 
-    async def _generate_from_context(self, results: list, args: "QuizGeneratorArgs", weak_hint: str) -> ToolResult:
+    async def _generate_from_context(
+        self,
+        results: list,
+        args: "QuizGeneratorArgs",
+        weak_hint: str,
+        *,
+        supplemental_context: str = "",
+        supplemental_citations: Optional[list[dict[str, Any]]] = None,
+    ) -> ToolResult:
         knowledge_text = "\n\n".join(
             f"[{i}] {sanitize_retrieval_text(r.text)[:500]}"
             for i, r in enumerate(results, 1)
         )
+        if supplemental_context:
+            knowledge_text += f"\n\n[Supplemental]\n{supplemental_context[:1200]}"
         prompt = QUIZ_PROMPT_TEMPLATE.format(
             count=args.count,
             question_type=sanitize_user_input(args.question_type, max_length=50),
@@ -234,11 +289,35 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
             citation.to_dict()
             for citation in self._citation_generator.generate(results)
         ]
+        if supplemental_citations:
+            citations.extend(supplemental_citations)
         return await self._call_llm_for_quiz(
             prompt,
             args.question_type,
             source="rag_backed",
             citations=citations,
+        )
+
+    async def _generate_from_handoff_context(
+        self,
+        context_text: str,
+        args: "QuizGeneratorArgs",
+        weak_hint: str,
+        *,
+        citations: Optional[list[dict[str, Any]]] = None,
+    ) -> ToolResult:
+        prompt = QUIZ_PROMPT_TEMPLATE.format(
+            count=args.count,
+            question_type=sanitize_user_input(args.question_type, max_length=50),
+            difficulty=args.difficulty,
+            context=context_text[:2400],
+            weak_points_hint=weak_hint,
+        )
+        return await self._call_llm_for_quiz(
+            prompt,
+            args.question_type,
+            source="composite_handoff",
+            citations=citations or [],
         )
 
     async def _generate_from_llm_knowledge(self, args: "QuizGeneratorArgs", weak_hint: str) -> ToolResult:

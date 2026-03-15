@@ -23,6 +23,43 @@ def _collection_name(search: Any) -> str:
     value = getattr(search, "default_collection", "")
     return value if isinstance(value, str) else ""
 
+
+def _composite_handoff(context: ToolContext) -> dict[str, Any]:
+    value = context.metadata.get("composite_handoff", {})
+    return value if isinstance(value, dict) else {}
+
+
+def _handoff_evidence_summary(context: ToolContext) -> str:
+    handoff = _composite_handoff(context)
+    aggregate = handoff.get("aggregate_evidence", {})
+    if isinstance(aggregate, dict):
+        evidence_summary = str(aggregate.get("evidence_summary", "") or "").strip()
+        if evidence_summary:
+            return evidence_summary
+    return str(handoff.get("latest_evidence_summary", "") or "").strip()
+
+
+def _handoff_citations(context: ToolContext) -> list[dict[str, Any]]:
+    handoff = _composite_handoff(context)
+    aggregate = handoff.get("aggregate_evidence", {})
+    if isinstance(aggregate, dict):
+        citations = aggregate.get("citations", [])
+        if isinstance(citations, list) and citations:
+            return [dict(citation) for citation in citations if isinstance(citation, dict)]
+    latest = handoff.get("latest_citations", [])
+    if isinstance(latest, list):
+        return [dict(citation) for citation in latest if isinstance(citation, dict)]
+    return []
+
+
+def _int_metadata(value: Any, default: int = -1) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
 EVAL_PROMPT_TEMPLATE = """请评判以下题目的用户答案。
 
 题目类型: {question_type}
@@ -100,6 +137,17 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
         return QuizEvaluatorArgs
 
     async def execute(self, context: ToolContext, args: QuizEvaluatorArgs) -> ToolResult:
+        composite_mode = bool(context.metadata.get("composite_mode", False))
+        composite_parent_request_id = str(
+            context.metadata.get("composite_parent_request_id", "") or ""
+        ).strip()
+        composite_subtask_index = _int_metadata(
+            context.metadata.get("composite_subtask_index", -1),
+            default=-1,
+        )
+        composite_subtask_intent = str(
+            context.metadata.get("composite_subtask_intent", "") or ""
+        ).strip()
         if self._llm is None:
             is_correct = args.user_answer.strip().lower() == args.correct_answer.strip().lower()
             verdict = "correct" if is_correct else "incorrect"
@@ -121,6 +169,9 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
                     "query_trace_ids": [],
                     "final_response_preferred": True,
                     "grounding_passthrough": True,
+                    "composite_parent_request_id": composite_parent_request_id if composite_mode else "",
+                    "composite_subtask_index": composite_subtask_index if composite_mode else -1,
+                    "composite_subtask_intent": composite_subtask_intent if composite_mode else "",
                 },
             )
 
@@ -182,7 +233,23 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
                 if enhanced:
                     explanation = enhanced
                     evaluation_mode = "evidence_enhanced"
-            elif explanation:
+            else:
+                handoff_summary = _handoff_evidence_summary(context)
+                if handoff_summary:
+                    citations = _handoff_citations(context)
+                    evidence_summary = handoff_summary
+                    enhanced = await self._enhance_explanation_with_evidence(
+                        args=args,
+                        verdict=verdict,
+                        score=result.get("score"),
+                        base_explanation=explanation,
+                        key_concepts=concepts,
+                        evidence_summary=evidence_summary,
+                    )
+                    if enhanced:
+                        explanation = enhanced
+                        evaluation_mode = "handoff_evidence_enhanced"
+            if not evidence_results and not evidence_summary and explanation:
                 explanation += "\n\n> 说明：以上解析未绑定课程资料证据，请结合课件复核。"
             result["explanation"] = explanation
 
@@ -210,6 +277,9 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
                     "query_trace_ids": [query_trace.trace_id] if query_trace is not None else [],
                     "final_response_preferred": True,
                     "grounding_passthrough": True,
+                    "composite_parent_request_id": composite_parent_request_id if composite_mode else "",
+                    "composite_subtask_index": composite_subtask_index if composite_mode else -1,
+                    "composite_subtask_intent": composite_subtask_intent if composite_mode else "",
                 },
             )
         except Exception as exc:
@@ -244,6 +314,23 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
                     "evaluation_mode_candidate": "evidence_enhanced",
                 }
             )
+            if context.metadata.get("composite_mode", False):
+                query_trace.metadata.update(
+                    {
+                        "composite_parent_request_id": str(
+                            context.metadata.get("composite_parent_request_id", "") or ""
+                        ),
+                        "composite_subtask_index": int(
+                            _int_metadata(
+                                context.metadata.get("composite_subtask_index", -1),
+                                default=-1,
+                            )
+                        ),
+                        "composite_subtask_intent": str(
+                            context.metadata.get("composite_subtask_intent", "") or ""
+                        ),
+                    }
+                )
         try:
             results = await asyncio.to_thread(
                 self._search.search,

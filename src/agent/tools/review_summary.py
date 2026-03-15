@@ -23,6 +23,43 @@ def _collection_name(search: Any) -> str:
     value = getattr(search, "default_collection", "")
     return value if isinstance(value, str) else ""
 
+
+def _composite_handoff(context: ToolContext) -> dict[str, Any]:
+    value = context.metadata.get("composite_handoff", {})
+    return value if isinstance(value, dict) else {}
+
+
+def _handoff_context_text(context: ToolContext) -> str:
+    handoff = _composite_handoff(context)
+    aggregate = handoff.get("aggregate_evidence", {})
+    if isinstance(aggregate, dict):
+        evidence_summary = str(aggregate.get("evidence_summary", "") or "").strip()
+        if evidence_summary:
+            return evidence_summary
+    return str(handoff.get("latest_result_text", "") or "").strip()
+
+
+def _handoff_citations(context: ToolContext) -> list[dict[str, Any]]:
+    handoff = _composite_handoff(context)
+    aggregate = handoff.get("aggregate_evidence", {})
+    if isinstance(aggregate, dict):
+        citations = aggregate.get("citations", [])
+        if isinstance(citations, list) and citations:
+            return [dict(citation) for citation in citations if isinstance(citation, dict)]
+    latest = handoff.get("latest_citations", [])
+    if isinstance(latest, list):
+        return [dict(citation) for citation in latest if isinstance(citation, dict)]
+    return []
+
+
+def _int_metadata(value: Any, default: int = -1) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
 REVIEW_PROMPT_TEMPLATE = """请根据以下知识库检索内容，生成一份结构化的考点复习摘要。
 
 主题: {topic}
@@ -83,6 +120,17 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
 
     async def execute(self, context: ToolContext, args: ReviewSummaryArgs) -> ToolResult:
         query_trace: TraceContext | None = None
+        composite_mode = bool(context.metadata.get("composite_mode", False))
+        composite_parent_request_id = str(
+            context.metadata.get("composite_parent_request_id", "") or ""
+        ).strip()
+        composite_subtask_index = _int_metadata(
+            context.metadata.get("composite_subtask_index", -1),
+            default=-1,
+        )
+        composite_subtask_intent = str(
+            context.metadata.get("composite_subtask_intent", "") or ""
+        ).strip()
         # Step 1: retrieve knowledge
         if self._search is None:
             return ToolResult(success=False, error="知识检索服务未初始化")
@@ -100,6 +148,14 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
                     "chapter": (args.chapter or "")[:120],
                 }
             )
+            if composite_mode:
+                query_trace.metadata.update(
+                    {
+                        "composite_parent_request_id": composite_parent_request_id,
+                        "composite_subtask_index": composite_subtask_index,
+                        "composite_subtask_intent": composite_subtask_intent,
+                    }
+                )
 
         try:
             results = await asyncio.to_thread(
@@ -118,38 +174,54 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
                 self._trace_collector.collect(query_trace)
             return ToolResult(success=False, error=f"知识检索失败: {exc}")
 
-        if not results:
-            if query_trace is not None:
-                query_trace.metadata["result_count"] = 0
-                self._trace_collector.collect(query_trace)
-            return ToolResult(
-                success=True,
-                result_for_llm="未找到与该主题相关的知识库内容，请确认主题名称。",
-                metadata={
-                    "grounding_capable": True,
-                    "citations": [],
-                    "evidence_summary": "",
-                    "source_count": 0,
-                    "query_trace_id": query_trace.trace_id if query_trace is not None else "",
-                    "query_trace_ids": [query_trace.trace_id] if query_trace is not None else [],
-                    "final_response_preferred": True,
-                    "grounding_passthrough": True,
-                },
+        citations: list[dict[str, Any]] = []
+        evidence_summary = ""
+        knowledge_text = ""
+        if results:
+            citations = [
+                citation.to_dict()
+                for citation in self._citation_generator.generate(results)
+            ]
+            evidence_summary = build_evidence_summary(citations)
+            knowledge_text = "\n\n".join(
+                f"[{i}] {sanitize_retrieval_text(r.text)[:600]}" for i, r in enumerate(results, 1)
             )
+        else:
+            knowledge_text = _handoff_context_text(context)
+            citations = _handoff_citations(context)
+            evidence_summary = build_evidence_summary(citations) if citations else ""
+            if query_trace is not None:
+                query_trace.metadata["handoff_used"] = bool(knowledge_text)
 
         if query_trace is not None:
             query_trace.metadata["result_count"] = len(results)
+            query_trace.metadata["effective_source_count"] = len(citations)
             self._trace_collector.collect(query_trace)
 
-        citations = [
-            citation.to_dict()
-            for citation in self._citation_generator.generate(results)
-        ]
-        evidence_summary = build_evidence_summary(citations)
-
-        knowledge_text = "\n\n".join(
-            f"[{i}] {sanitize_retrieval_text(r.text)[:600]}" for i, r in enumerate(results, 1)
-        )
+        if not knowledge_text:
+            metadata = {
+                "grounding_capable": True,
+                "citations": [],
+                "evidence_summary": "",
+                "source_count": 0,
+                "query_trace_id": query_trace.trace_id if query_trace is not None else "",
+                "query_trace_ids": [query_trace.trace_id] if query_trace is not None else [],
+                "final_response_preferred": True,
+                "grounding_passthrough": True,
+            }
+            if composite_mode:
+                metadata.update(
+                    {
+                        "composite_parent_request_id": composite_parent_request_id,
+                        "composite_subtask_index": composite_subtask_index,
+                        "composite_subtask_intent": composite_subtask_intent,
+                    }
+                )
+            return ToolResult(
+                success=True,
+                result_for_llm="未找到与该主题相关的知识库内容，请确认主题名称。",
+                metadata=metadata,
+            )
 
         # Step 2: get weak points from memory (if available)
         weak_section = ""
@@ -184,6 +256,9 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
                     "query_trace_ids": [query_trace.trace_id] if query_trace is not None else [],
                     "final_response_preferred": True,
                     "grounding_passthrough": True,
+                    "composite_parent_request_id": composite_parent_request_id if composite_mode else "",
+                    "composite_subtask_index": composite_subtask_index if composite_mode else -1,
+                    "composite_subtask_intent": composite_subtask_intent if composite_mode else "",
                 },
             )
 
@@ -210,6 +285,9 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
                         "query_trace_ids": [query_trace.trace_id] if query_trace is not None else [],
                         "final_response_preferred": True,
                         "grounding_passthrough": True,
+                        "composite_parent_request_id": composite_parent_request_id if composite_mode else "",
+                        "composite_subtask_index": composite_subtask_index if composite_mode else -1,
+                        "composite_subtask_intent": composite_subtask_intent if composite_mode else "",
                     },
                 )
             return ToolResult(
@@ -224,6 +302,9 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
                     "query_trace_ids": [query_trace.trace_id] if query_trace is not None else [],
                     "final_response_preferred": True,
                     "grounding_passthrough": True,
+                    "composite_parent_request_id": composite_parent_request_id if composite_mode else "",
+                    "composite_subtask_index": composite_subtask_index if composite_mode else -1,
+                    "composite_subtask_intent": composite_subtask_intent if composite_mode else "",
                 },
             )
         except Exception as exc:
@@ -240,5 +321,8 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
                     "query_trace_ids": [query_trace.trace_id] if query_trace is not None else [],
                     "final_response_preferred": True,
                     "grounding_passthrough": True,
+                    "composite_parent_request_id": composite_parent_request_id if composite_mode else "",
+                    "composite_subtask_index": composite_subtask_index if composite_mode else -1,
+                    "composite_subtask_intent": composite_subtask_intent if composite_mode else "",
                 },
             )

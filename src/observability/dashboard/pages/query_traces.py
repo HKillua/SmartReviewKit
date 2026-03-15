@@ -134,6 +134,15 @@ def render() -> None:
                         f"**Router Match:** `{meta.get('router_match_method', '—')}` "
                         f"({meta.get('router_confidence', '—')})"
                     )
+                if meta.get("composite_parent_request_id"):
+                    st.markdown(
+                        f"**Composite Request:** `{meta.get('composite_parent_request_id', '—')}`"
+                    )
+                if meta.get("composite_subtask_intent"):
+                    st.markdown(
+                        f"**Composite Subtask:** `#{meta.get('composite_subtask_index', '—')}` "
+                        f"`{meta.get('composite_subtask_intent', '—')}`"
+                    )
 
             st.divider()
 

@@ -355,6 +355,152 @@ class _ReviewOnlyLlm:
         )
 
 
+class _NoLlmExpected:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def send_request(self, request):
+        self.calls += 1
+        raise AssertionError("Composite execution should not call the LLM tool loop")
+
+
+class _CompositeReviewTool:
+    @property
+    def name(self) -> str:
+        return "review_summary"
+
+    @property
+    def description(self) -> str:
+        return "composite review tool"
+
+    def get_args_schema(self):
+        class _Args(BaseModel):
+            topic: str = Field(default="")
+
+        return _Args
+
+    async def execute(self, context, args):
+        from src.agent.types import ToolResult
+
+        assert context.metadata["composite_mode"] is True
+        return ToolResult(
+            success=True,
+            result_for_llm="TCP 的复习重点包括三次握手和可靠传输机制。",
+            metadata={
+                "grounding_capable": True,
+                "final_response_preferred": True,
+                "citations": [
+                    {"index": 1, "source": "tcp.pdf", "text_snippet": "TCP 包括三次握手。"}
+                ],
+                "evidence_summary": "[1] `tcp.pdf`: TCP 包括三次握手。",
+                "source_count": 1,
+            },
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.get_args_schema().model_json_schema(),
+            },
+        }
+
+
+class _CompositeQuizTool:
+    @property
+    def name(self) -> str:
+        return "quiz_generator"
+
+    @property
+    def description(self) -> str:
+        return "composite quiz tool"
+
+    def get_args_schema(self):
+        class _Args(BaseModel):
+            topic: str = Field(default="")
+            question_type: str = Field(default="选择题")
+            count: int = Field(default=3)
+            difficulty: int = Field(default=3)
+
+        return _Args
+
+    async def execute(self, context, args):
+        from src.agent.types import ToolResult
+
+        handoff = context.metadata["composite_handoff"]
+        assert handoff["latest_result_text"].startswith("TCP 的复习重点")
+        return ToolResult(
+            success=True,
+            result_for_llm="### 第 1 题\n\nTCP 为什么需要三次握手？",
+            metadata={
+                "grounding_capable": True,
+                "final_response_preferred": True,
+                "generation_mode": "composite_handoff",
+                "citations": [
+                    {"index": 1, "source": "tcp.pdf", "text_snippet": "TCP 使用三次握手建立连接。"}
+                ],
+                "evidence_summary": "[1] `tcp.pdf`: TCP 使用三次握手建立连接。",
+                "source_count": 1,
+            },
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.get_args_schema().model_json_schema(),
+            },
+        }
+
+
+class _CompositeQuizFailTool(_CompositeQuizTool):
+    async def execute(self, context, args):
+        from src.agent.types import ToolResult
+
+        return ToolResult(success=False, error="quiz generation failed")
+
+
+class _CompositePlanner:
+    def __init__(self, *, fail_second: bool = False) -> None:
+        self.fail_second = fail_second
+
+    def plan(self, message, matched_skill=None):
+        from src.agent.planner import ControlMode, PlannedSubtask, PlannerDecision, TaskIntent
+
+        subtasks = [
+            PlannedSubtask(
+                task_intent=TaskIntent.REVIEW_SUMMARY,
+                selected_tool="review_summary",
+                confidence=1.0,
+                source_span=(0, 2),
+                segment_text="总结 TCP 的重点",
+            ),
+            PlannedSubtask(
+                task_intent=TaskIntent.QUIZ_GENERATOR,
+                selected_tool="quiz_generator",
+                confidence=1.0,
+                source_span=(3, 8),
+                segment_text="出 3 道题",
+            ),
+        ]
+        return PlannerDecision(
+            task_intent=TaskIntent.REVIEW_SUMMARY,
+            confidence=1.0,
+            match_method="rule_composite",
+            control_mode=ControlMode.FORCE_TOOL,
+            selected_tool="review_summary",
+            planner_hint="Composite execution",
+            is_composite=True,
+            subtasks=subtasks,
+            primary_intent=TaskIntent.REVIEW_SUMMARY,
+            ordering_method="rule_span_order",
+        )
+
+
 @pytest.mark.asyncio
 async def test_agent_done_event_contains_trace_id_and_agent_trace(tmp_path: Path) -> None:
     from src.agent.agent import Agent
@@ -624,6 +770,53 @@ async def test_knowledge_query_trace_records_retrieval_policy(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_knowledge_query_trace_records_composite_metadata(tmp_path: Path) -> None:
+    from src.agent.tools.knowledge_query import KnowledgeQueryArgs, KnowledgeQueryTool
+    from src.agent.types import ToolContext
+
+    trace_path = tmp_path / "composite_query_trace.jsonl"
+    hybrid_search = MagicMock()
+    hybrid_search.search.return_value = [
+        RetrievalResult(
+            chunk_id="chunk_1",
+            score=0.95,
+            text="DNS 是分层命名系统。",
+            metadata={"source_path": "dns.pdf", "title": "DNS"},
+        )
+    ]
+
+    tool = KnowledgeQueryTool(
+        settings={"observability": {"trace_enabled": True}},
+        hybrid_search=hybrid_search,
+    )
+    tool._current_collection = "computer_network"
+    tool._trace_collector = TraceCollector(traces_path=trace_path)
+
+    result = await tool.execute(
+        ToolContext(
+            user_id="u1",
+            conversation_id="conv_composite_query",
+            request_id="req_composite",
+            metadata={
+                "agent_trace_id": "agent-trace-xyz",
+                "planner_task_intent": "knowledge_query",
+                "composite_mode": True,
+                "composite_parent_request_id": "req_composite",
+                "composite_subtask_index": 0,
+                "composite_subtask_intent": "knowledge_query",
+            },
+        ),
+        KnowledgeQueryArgs(query="解释 DNS"),
+    )
+
+    trace = TraceService(trace_path).get_trace(result.metadata["query_trace_id"])
+    assert trace is not None
+    assert trace["metadata"]["composite_parent_request_id"] == "req_composite"
+    assert trace["metadata"]["composite_subtask_index"] == 0
+    assert trace["metadata"]["composite_subtask_intent"] == "knowledge_query"
+
+
+@pytest.mark.asyncio
 async def test_knowledge_query_uses_default_collection_from_tool_context(tmp_path: Path) -> None:
     from src.agent.tools.knowledge_query import KnowledgeQueryArgs, KnowledgeQueryTool
     from src.agent.types import ToolContext
@@ -812,3 +1005,93 @@ async def test_planner_violation_retries_then_downgrades_to_advisory(tmp_path: P
         if stage["stage"] == "planner_violation"
     ]
     assert len(planner_violations) >= 2
+
+
+@pytest.mark.asyncio
+async def test_composite_plan_executes_subtasks_in_order(tmp_path: Path) -> None:
+    from src.agent.agent import Agent
+    from src.agent.config import AgentConfig
+    from src.agent.conversation import ConversationStore
+    from src.agent.tools.base import ToolRegistry
+
+    trace_path = tmp_path / "composite_trace.jsonl"
+    collector = TraceCollector(traces_path=trace_path)
+    conversation = Conversation(id="conv_composite", user_id="u1", messages=[])
+    store = AsyncMock(spec=ConversationStore)
+    store.get.return_value = conversation
+    store.create.return_value = conversation
+    store.update.return_value = None
+
+    registry = ToolRegistry()
+    registry.register(_CompositeReviewTool())
+    registry.register(_CompositeQuizTool())
+
+    llm = _NoLlmExpected()
+    agent = Agent(
+        llm_service=llm,
+        tool_registry=registry,
+        conversation_store=store,
+        config=AgentConfig(stream_responses=False, max_tool_iterations=3),
+        task_planner=_CompositePlanner(),
+        trace_enabled=True,
+        trace_collector=collector,
+    )
+
+    events = [
+        event async for event in agent.chat("帮我先总结 TCP 的重点，再出 3 道题", "u1", "conv_composite")
+    ]
+
+    tool_starts = [event.tool_name for event in events if event.type.value == "tool_start"]
+    assert tool_starts == ["review_summary", "quiz_generator"]
+    final_text = "".join(event.content or "" for event in events if event.type.value == "text_delta")
+    assert "## 复习总结" in final_text
+    assert "## 练习题" in final_text
+    done_event = next(event for event in events if event.type.value == "done")
+    assert done_event.metadata["composite"] is True
+    assert len(done_event.metadata["completed_subtasks"]) == 2
+    assert done_event.metadata["failed_subtask"] == {}
+    assert llm.calls == 0
+
+    trace = TraceService(trace_path).get_trace(done_event.metadata["trace_id"])
+    assert trace is not None
+    stage_names = [stage["stage"] for stage in trace["stages"]]
+    assert "composite_plan" in stage_names
+    assert "composite_subtask_execution" in stage_names
+    assert "composite_finalize" in stage_names
+
+
+@pytest.mark.asyncio
+async def test_composite_plan_returns_partial_success_on_failure(tmp_path: Path) -> None:
+    from src.agent.agent import Agent
+    from src.agent.config import AgentConfig
+    from src.agent.conversation import ConversationStore
+    from src.agent.tools.base import ToolRegistry
+
+    conversation = Conversation(id="conv_composite_fail", user_id="u1", messages=[])
+    store = AsyncMock(spec=ConversationStore)
+    store.get.return_value = conversation
+    store.create.return_value = conversation
+    store.update.return_value = None
+
+    registry = ToolRegistry()
+    registry.register(_CompositeReviewTool())
+    registry.register(_CompositeQuizFailTool())
+
+    agent = Agent(
+        llm_service=_NoLlmExpected(),
+        tool_registry=registry,
+        conversation_store=store,
+        config=AgentConfig(stream_responses=False, max_tool_iterations=3),
+        task_planner=_CompositePlanner(),
+    )
+
+    events = [
+        event async for event in agent.chat("帮我先总结 TCP 的重点，再出 3 道题", "u1", "conv_composite_fail")
+    ]
+
+    final_text = "".join(event.content or "" for event in events if event.type.value == "text_delta")
+    assert "## 复习总结" in final_text
+    assert "## 未完成项" in final_text
+    done_event = next(event for event in events if event.type.value == "done")
+    assert len(done_event.metadata["completed_subtasks"]) == 1
+    assert done_event.metadata["failed_subtask"]["selected_tool"] == "quiz_generator"

@@ -57,3 +57,39 @@ def test_general_chat_passes_through() -> None:
 
     assert decision.task_intent == TaskIntent.GENERAL_CHAT
     assert decision.control_mode == ControlMode.PASS_THROUGH
+
+
+def test_rule_hit_builds_composite_plan_in_user_order() -> None:
+    planner = TaskPlanner()
+    decision = planner.plan("帮我先总结 TCP 的重点，再出 3 道题")
+
+    assert decision.is_composite is True
+    assert decision.primary_intent == TaskIntent.REVIEW_SUMMARY
+    assert [subtask.task_intent for subtask in decision.subtasks] == [
+        TaskIntent.REVIEW_SUMMARY,
+        TaskIntent.QUIZ_GENERATOR,
+    ]
+    assert decision.subtasks[0].selected_tool == "review_summary"
+    assert decision.subtasks[1].selected_tool == "quiz_generator"
+
+
+def test_rule_hit_builds_three_step_composite_plan() -> None:
+    planner = TaskPlanner()
+    decision = planner.plan("先解释 DNS，再帮我总结，最后出一道选择题")
+
+    assert decision.is_composite is True
+    assert [subtask.task_intent for subtask in decision.subtasks] == [
+        TaskIntent.KNOWLEDGE_QUERY,
+        TaskIntent.REVIEW_SUMMARY,
+        TaskIntent.QUIZ_GENERATOR,
+    ]
+    assert decision.subtasks[0].source_span[0] < decision.subtasks[1].source_span[0]
+    assert decision.subtasks[1].source_span[0] < decision.subtasks[2].source_span[0]
+
+
+def test_embedding_only_fallback_does_not_create_composite_plan() -> None:
+    planner = TaskPlanner(embedding_fn=_fake_embed)
+    decision = planner.plan("Drill me on UDP basics")
+
+    assert decision.is_composite is False
+    assert decision.task_intent == TaskIntent.QUIZ_GENERATOR

@@ -2,6 +2,7 @@
 
 from src.agent.planner.task_planner import (
     ControlMode,
+    PlannedSubtask,
     PlannerDecision,
     TaskIntent,
     TaskPlanner,
@@ -9,6 +10,7 @@ from src.agent.planner.task_planner import (
 
 __all__ = [
     "ControlMode",
+    "PlannedSubtask",
     "PlannerDecision",
     "TaskIntent",
     "TaskPlanner",

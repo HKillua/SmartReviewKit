@@ -22,6 +22,15 @@ from src.core.trace.trace_context import TraceContext
 logger = logging.getLogger(__name__)
 
 
+def _int_metadata(value: Any, default: int = -1) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 class KnowledgeQueryArgs(BaseModel):
     query: str = Field(..., description="检索查询文本")
     top_k: int = Field(default=5, ge=1, le=20, description="返回结果数量")
@@ -148,6 +157,17 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
             )
             planner_task_intent = str(context.metadata.get("planner_task_intent", "") or "").strip()
             matched_skill = str(context.metadata.get("matched_skill", "") or "").strip()
+            composite_mode = bool(context.metadata.get("composite_mode", False))
+            composite_parent_request_id = str(
+                context.metadata.get("composite_parent_request_id", "") or ""
+            ).strip()
+            composite_subtask_index = _int_metadata(
+                context.metadata.get("composite_subtask_index", -1),
+                default=-1,
+            )
+            composite_subtask_intent = str(
+                context.metadata.get("composite_subtask_intent", "") or ""
+            ).strip()
             # --- Adaptive routing ---
             routing = None
             if self._query_router is not None:
@@ -194,6 +214,14 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                         "planner_task_intent": planner_task_intent,
                     }
                 )
+                if composite_mode:
+                    query_trace.metadata.update(
+                        {
+                            "composite_parent_request_id": composite_parent_request_id,
+                            "composite_subtask_index": composite_subtask_index,
+                            "composite_subtask_intent": composite_subtask_intent,
+                        }
+                    )
 
             effective_query = args.query
             hyde_vector = None
@@ -314,6 +342,14 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                     "query_trace_ids": [query_trace.trace_id] if query_trace is not None else [],
                     "final_response_preferred": True,
                 }
+                if composite_mode:
+                    metadata.update(
+                        {
+                            "composite_parent_request_id": composite_parent_request_id,
+                            "composite_subtask_index": composite_subtask_index,
+                            "composite_subtask_intent": composite_subtask_intent,
+                        }
+                    )
                 if query_trace is not None:
                     metadata["query_trace_id"] = query_trace.trace_id
                 return ToolResult(
@@ -368,6 +404,14 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                 "collection": effective_collection,
                 "query_trace_ids": query_trace_ids,
             }
+            if composite_mode:
+                metadata.update(
+                    {
+                        "composite_parent_request_id": composite_parent_request_id,
+                        "composite_subtask_index": composite_subtask_index,
+                        "composite_subtask_intent": composite_subtask_intent,
+                    }
+                )
             if query_trace is not None:
                 metadata["query_trace_id"] = query_trace.trace_id
 
