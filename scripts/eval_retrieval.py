@@ -97,6 +97,7 @@ def _prepare_settings(settings):
         query_rewrite_enabled=False,
         hyde_enabled=False,
         multi_query_enabled=False,
+        min_score=0.0,
     )
     return replace(settings, retrieval=retrieval_cfg)
 
@@ -113,6 +114,13 @@ class _EvalSearchAdapter:
             top_k=top_k,
             filters=filters,
         )
+
+
+def _resolve_underlying_hybrid_search(search):
+    source_aware = getattr(search, "_source_aware_search", None)
+    if source_aware is None:
+        return None
+    return getattr(source_aware, "_hybrid_search", None) or getattr(source_aware, "hybrid_search", None)
 
 
 class _FallbackSearchAdapter:
@@ -201,7 +209,10 @@ def _attach_reranker_with_timeout(search, settings, timeout_seconds: float) -> N
     executor = ThreadPoolExecutor(max_workers=1)
     future = executor.submit(_init)
     try:
-        search._source_aware_search.hybrid_search.reranker = future.result(timeout=timeout_seconds)
+        target = _resolve_underlying_hybrid_search(search)
+        if target is None:
+            raise AttributeError("unable to resolve underlying HybridSearch from eval adapter")
+        target.reranker = future.result(timeout=timeout_seconds)
     except FuturesTimeoutError:
         logger.warning(
             "Reranker unavailable for retrieval eval: initialization timed out after %.1fs",

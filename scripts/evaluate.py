@@ -58,6 +58,13 @@ class _EvalSearchAdapter:
         )
 
 
+def _resolve_underlying_hybrid_search(search):
+    source_aware = getattr(search, "_source_aware_search", None)
+    if source_aware is None:
+        return None
+    return getattr(source_aware, "_hybrid_search", None) or getattr(source_aware, "hybrid_search", None)
+
+
 class _FallbackSearchAdapter:
     """Try hybrid search first and fall back to sparse-only eval on runtime errors."""
 
@@ -158,7 +165,10 @@ def _attach_reranker_with_timeout(hybrid_search, settings, timeout_seconds: floa
     executor = ThreadPoolExecutor(max_workers=1)
     future = executor.submit(_init)
     try:
-        hybrid_search._source_aware_search.hybrid_search.reranker = future.result(timeout=timeout_seconds)
+        target = _resolve_underlying_hybrid_search(hybrid_search)
+        if target is None:
+            raise AttributeError("unable to resolve underlying HybridSearch from eval adapter")
+        target.reranker = future.result(timeout=timeout_seconds)
     except FuturesTimeoutError:
         print(f"⚠️  Reranker unavailable, continuing without rerank: initialization timed out after {timeout_seconds:.1f}s")
         executor.shutdown(wait=False, cancel_futures=True)
@@ -252,6 +262,7 @@ def _prepare_eval_settings(settings, test_cases):
         query_rewrite_enabled=False,
         hyde_enabled=False,
         multi_query_enabled=False,
+        min_score=0.0,
     )
     return replace(settings, evaluation=evaluation_cfg, retrieval=retrieval_cfg)
 

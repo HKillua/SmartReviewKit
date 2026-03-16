@@ -130,6 +130,44 @@ def test_global_fallback_runs_when_source_specific_searches_all_empty() -> None:
     assert result.routing_metadata["fallback_global_used"] is True
 
 
+def test_global_fallback_backfills_when_source_budgets_underfill_top_k() -> None:
+    def _search(*, query, top_k, filters=None, query_vector=None):
+        if filters == {"source_type": "slide"}:
+            return [
+                _result(
+                    "slide_1",
+                    "课程纲要",
+                    score=0.9,
+                    source_type="slide",
+                    source_path="slides.pptx",
+                )
+            ]
+        if filters:
+            return []
+        return [
+            _result(
+                "slide_1",
+                "课程纲要",
+                score=0.9,
+                source_type="slide",
+                source_path="slides.pptx",
+            ),
+            _result(
+                "slide_2",
+                "TCP/IP 分层模型",
+                score=0.8,
+                source_type="slide",
+                source_path="slides.pptx",
+            ),
+        ]
+
+    svc = SourceAwareSearch(_hybrid_with_search(_search))
+    result = svc.search(query="TCP/IP", task_intent="knowledge_query", top_k=2)
+
+    assert result.routing_metadata["fallback_global_used"] is True
+    assert [unit.unit_id for unit in result.answer_units] == ["slide_1", "slide_2"]
+
+
 def test_duplicate_units_are_coalesced_across_source_queries() -> None:
     def _search(*, query, top_k, filters=None, query_vector=None):
         return [
@@ -175,7 +213,7 @@ def test_slide_results_remain_slide_units() -> None:
 
 def test_explanatory_profile_orders_textbook_before_question_bank() -> None:
     def _search(*, query, top_k, filters=None, query_vector=None):
-        source = filters.get("source_type")
+        source = (filters or {}).get("source_type")
         if source == "textbook":
             return [
                 _result(

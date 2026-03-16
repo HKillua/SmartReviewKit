@@ -5,7 +5,9 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from scripts.evaluate import _FallbackSearchAdapter as EvaluateFallbackSearchAdapter
+from scripts.evaluate import _resolve_underlying_hybrid_search as evaluate_resolve_hybrid_search
 from scripts.eval_retrieval import _FallbackSearchAdapter as RetrievalFallbackSearchAdapter
+from scripts.eval_retrieval import _resolve_underlying_hybrid_search as retrieval_resolve_hybrid_search
 from src.observability.evaluation.source_eval_search import SparseSourceEvalSearch
 
 
@@ -73,3 +75,21 @@ def test_sparse_source_eval_search_skips_hits_without_source_mapping():
 
     assert [item.chunk_id for item in results] == ["chunk-a"]
     assert results[0].metadata["source_label"] == "chapter1.pdf"
+
+
+def test_evaluate_resolve_hybrid_search_supports_private_attribute():
+    hybrid = object()
+    adapter = SimpleNamespace(
+        _source_aware_search=SimpleNamespace(_hybrid_search=hybrid),
+    )
+
+    assert evaluate_resolve_hybrid_search(adapter) is hybrid
+
+
+def test_retrieval_resolve_hybrid_search_supports_private_attribute():
+    hybrid = object()
+    adapter = SimpleNamespace(
+        _source_aware_search=SimpleNamespace(_hybrid_search=hybrid),
+    )
+
+    assert retrieval_resolve_hybrid_search(adapter) is hybrid

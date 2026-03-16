@@ -113,7 +113,7 @@ class SourceAwareSearch:
             all_units.extend(normalized_units)
 
         fallback_global_used = False
-        if not all_units and allowed_sources is None:
+        if len(all_units) < top_k and allowed_sources is None:
             fallback_results = self._run_hybrid_search(
                 query=query,
                 top_k=max(top_k, max(source_budgets.values(), default=top_k)),
@@ -125,10 +125,15 @@ class SourceAwareSearch:
                 fallback_global_used = True
                 raw_candidate_counts["fallback_all"] = len(fallback_results)
                 fallback_units, fallback_stats = self._normalize_mixed_results(fallback_results)
+                existing_unit_ids = {unit.unit_id for unit in all_units}
+                fallback_units = [
+                    unit for unit in fallback_units
+                    if unit.unit_id not in existing_unit_ids
+                ]
                 normalized_unit_counts["fallback_all"] = len(fallback_units)
                 for key in textbook_stats:
                     textbook_stats[key] += int(fallback_stats.get(key, 0))
-                all_units.extend(fallback_units[:top_k])
+                all_units.extend(fallback_units[: max(top_k - len(all_units), 0)])
 
         all_units = self._coalesce_duplicate_units(all_units)
         raw_unit_results = [unit.to_retrieval_result() for unit in all_units]
