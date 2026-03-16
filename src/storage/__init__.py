@@ -21,6 +21,8 @@ from src.storage.postgres_backends import (
     PostgresStudentProfileMemory,
 )
 from src.storage.runtime import (
+    build_llm_circuit_breaker_scope,
+    create_circuit_breaker,
     create_conversation_store,
     create_feedback_store,
     create_image_storage,
@@ -57,6 +59,8 @@ __all__ = [
     "PostgresStudentProfileMemory",
     "PostgresUnavailableError",
     "SparseIndex",
+    "build_llm_circuit_breaker_scope",
+    "create_circuit_breaker",
     "create_conversation_store",
     "create_feedback_store",
     "create_image_storage",

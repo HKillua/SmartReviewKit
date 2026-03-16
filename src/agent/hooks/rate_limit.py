@@ -7,7 +7,7 @@ import logging
 import threading
 import time
 from enum import Enum
-from typing import Optional
+from typing import Optional, Protocol
 
 from src.agent.hooks.lifecycle import LifecycleHook
 from src.agent.hooks.middleware import LlmMiddleware
@@ -73,6 +73,21 @@ class CircuitState(str, Enum):
     CLOSED = "closed"
     OPEN = "open"
     HALF_OPEN = "half_open"
+
+
+class CircuitBreakerBackend(Protocol):
+    @property
+    def state(self) -> CircuitState:
+        ...
+
+    def record_success(self) -> None:
+        ...
+
+    def record_failure(self) -> None:
+        ...
+
+    def allow_request(self) -> bool:
+        ...
 
 
 class CircuitBreaker:

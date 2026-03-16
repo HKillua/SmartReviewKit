@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from src.agent.conversation import FileConversationStore
-from src.agent.hooks.rate_limit import RateLimitHook
+from src.agent.hooks.rate_limit import CircuitBreaker, CircuitBreakerBackend, RateLimitHook
+from src.agent.hooks.redis_circuit_breaker import RedisCircuitBreaker
 from src.agent.hooks.redis_rate_limit import RedisRateLimitHook
 from src.agent.memory.error_memory import ErrorMemory
 from src.agent.memory.feedback_store import FeedbackStore
@@ -43,6 +46,24 @@ class IngestionBackends:
     object_store: ObjectStore
     document_registry: PostgresDocumentRegistry | None = None
     task_store: IngestionTaskStore | None = None
+
+
+def _normalize_scope_segment(value: str) -> str:
+    lowered = value.strip().lower() or "default"
+    return re.sub(r"[^a-z0-9_.-]+", "-", lowered)
+
+
+def build_llm_circuit_breaker_scope(settings: Settings) -> str:
+    llm = settings.llm
+    endpoint_identity = "default"
+    if llm.base_url:
+        endpoint_identity = f"base_url:{llm.base_url}"
+    elif llm.azure_endpoint or llm.deployment_name:
+        endpoint_identity = f"azure:{llm.azure_endpoint or ''}:{llm.deployment_name or ''}"
+    endpoint_hash = hashlib.sha256(endpoint_identity.encode("utf-8")).hexdigest()[:12]
+    provider = _normalize_scope_segment(llm.provider)
+    model = _normalize_scope_segment(llm.model)
+    return f"circuit_breaker:{provider}:{model}:{endpoint_hash}"
 
 
 def create_object_store_from_settings(settings: Settings) -> ObjectStore:
@@ -113,6 +134,22 @@ def create_rate_limit_hook(raw_settings: dict[str, Any], requests_per_minute: in
     if redis_cfg.get("enabled") and redis_cfg.get("url"):
         return RedisRateLimitHook(redis_cfg["url"], requests_per_minute=requests_per_minute)
     return RateLimitHook(requests_per_minute=requests_per_minute)
+
+
+def create_circuit_breaker(settings: Settings) -> CircuitBreakerBackend:
+    breaker_cfg = settings.llm_resilience.circuit_breaker
+    if settings.redis.enabled and settings.redis.url:
+        return RedisCircuitBreaker(
+            settings.redis.url,
+            scope_key=build_llm_circuit_breaker_scope(settings),
+            failure_threshold=breaker_cfg.failure_threshold,
+            cooldown_seconds=breaker_cfg.cooldown_seconds,
+            probe_ttl_seconds=breaker_cfg.cooldown_seconds,
+        )
+    return CircuitBreaker(
+        failure_threshold=breaker_cfg.failure_threshold,
+        cooldown_seconds=breaker_cfg.cooldown_seconds,
+    )
 
 
 def create_sparse_index(settings: Settings, collection: str = "default") -> SparseIndex:

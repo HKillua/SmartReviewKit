@@ -5,10 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import Optional
 
 from src.agent.hooks.middleware import LlmMiddleware
-from src.agent.hooks.rate_limit import CircuitBreaker
+from src.agent.hooks.rate_limit import CircuitBreaker, CircuitBreakerBackend
 from src.agent.types import LlmRequest, LlmResponse
 
 logger = logging.getLogger(__name__)
@@ -32,7 +31,7 @@ class RetryWithBackoffMiddleware(LlmMiddleware):
         max_retries: int = 3,
         base_delay: float = 1.0,
         max_delay: float = 16.0,
-        circuit_breaker: CircuitBreaker | None = None,
+        circuit_breaker: CircuitBreakerBackend | None = None,
     ) -> None:
         self._llm = llm_service
         self._max_retries = max_retries

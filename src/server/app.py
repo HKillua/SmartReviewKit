@@ -42,6 +42,7 @@ from src.core.trace.trace_collector import TraceCollector
 from src.server.chat_handler import ChatHandler
 from src.server.routes import configure_routes, router
 from src.storage.runtime import (
+    create_circuit_breaker,
     create_conversation_store,
     create_feedback_store,
     create_ingestion_backends,
@@ -170,6 +171,26 @@ def _auto_ingest(ingest_dir: str, collection: str, settings_path: str = "config/
         pipeline.close()
 
 
+def _build_circuit_breaker(core_settings: Any) -> Any:
+    return create_circuit_breaker(core_settings)
+
+
+def _build_retry_middleware(
+    core_settings: Any,
+    llm_service: object,
+    *,
+    circuit_breaker: Any | None = None,
+) -> RetryWithBackoffMiddleware:
+    resilience_cfg = core_settings.llm_resilience
+    return RetryWithBackoffMiddleware(
+        llm_service=llm_service,
+        max_retries=resilience_cfg.retry.max_retries,
+        base_delay=resilience_cfg.retry.base_delay_seconds,
+        max_delay=resilience_cfg.retry.max_delay_seconds,
+        circuit_breaker=circuit_breaker or create_circuit_breaker(core_settings),
+    )
+
+
 def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
     """Wire all components and return a configured FastAPI app."""
     settings_path = _resolve_settings_path(settings_path)
@@ -182,9 +203,15 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
     collection = agent_cfg.default_collection
     ingestion_backends = create_ingestion_backends(core_settings, collection=collection)
     shared_trace_collector = TraceCollector.from_settings(core_settings)
+    circuit_breaker = _build_circuit_breaker(core_settings)
 
     # --- LLM ---
     llm = create_llm_service(settings)
+    retry_middleware = _build_retry_middleware(
+        core_settings,
+        llm,
+        circuit_breaker=circuit_breaker,
+    )
 
     # --- Memory stores ---
     memory_stores = create_memory_stores(memory_cfg, settings)
@@ -357,7 +384,6 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         hooks.insert(0, guardrails_hook)
 
     # --- LLM Middlewares (retry + circuit breaker + reflection) ---
-    retry_middleware = RetryWithBackoffMiddleware(llm_service=llm)
     llm_middlewares: list = [retry_middleware]
 
     reflection_cfg = settings.get("reflection", {})

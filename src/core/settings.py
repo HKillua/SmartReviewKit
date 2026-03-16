@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -199,6 +199,25 @@ class RedisSettings:
 
 
 @dataclass(frozen=True)
+class RetryPolicySettings:
+    max_retries: int = 3
+    base_delay_seconds: float = 1.0
+    max_delay_seconds: float = 16.0
+
+
+@dataclass(frozen=True)
+class CircuitBreakerSettings:
+    failure_threshold: int = 5
+    cooldown_seconds: float = 30.0
+
+
+@dataclass(frozen=True)
+class LLMResilienceSettings:
+    retry: RetryPolicySettings = field(default_factory=RetryPolicySettings)
+    circuit_breaker: CircuitBreakerSettings = field(default_factory=CircuitBreakerSettings)
+
+
+@dataclass(frozen=True)
 class ObjectStoreSettings:
     provider: str = "local"
     local_root: str = "./data/object_store"
@@ -275,6 +294,7 @@ class Settings:
     object_store: ObjectStoreSettings
     sparse_store: SparseStoreSettings
     opensearch: OpenSearchSettings
+    llm_resilience: LLMResilienceSettings = field(default_factory=LLMResilienceSettings)
     ingestion: Optional[IngestionSettings] = None
     ingestion_worker: Optional[IngestionWorkerSettings] = None
     vision_llm: Optional[VisionLLMSettings] = None
@@ -294,6 +314,15 @@ class Settings:
         milvus_cfg = vector_store.get("milvus", {}) if isinstance(vector_store.get("milvus", {}), dict) else {}
         postgres_cfg = data.get("postgres", {}) if isinstance(data.get("postgres", {}), dict) else {}
         redis_cfg = data.get("redis", {}) if isinstance(data.get("redis", {}), dict) else {}
+        llm_resilience_cfg = {}
+        if "llm_resilience" in data:
+            llm_resilience_cfg = _require_mapping(data, "llm_resilience", "settings")
+        retry_cfg = llm_resilience_cfg.get("retry", {})
+        if retry_cfg and not isinstance(retry_cfg, dict):
+            raise SettingsError("Expected mapping for field: llm_resilience.retry")
+        circuit_breaker_cfg = llm_resilience_cfg.get("circuit_breaker", {})
+        if circuit_breaker_cfg and not isinstance(circuit_breaker_cfg, dict):
+            raise SettingsError("Expected mapping for field: llm_resilience.circuit_breaker")
         object_store_cfg = data.get("object_store", {}) if isinstance(data.get("object_store", {}), dict) else {}
         sparse_store_cfg = data.get("sparse_store", {}) if isinstance(data.get("sparse_store", {}), dict) else {}
         opensearch_cfg = data.get("opensearch", {}) if isinstance(data.get("opensearch", {}), dict) else {}
@@ -424,6 +453,17 @@ class Settings:
                 enabled=bool(redis_cfg.get("enabled", False)),
                 url=str(redis_cfg.get("url", "")),
                 ttl_seconds=int(redis_cfg.get("ttl_seconds", 3600)),
+            ),
+            llm_resilience=LLMResilienceSettings(
+                retry=RetryPolicySettings(
+                    max_retries=int(retry_cfg.get("max_retries", 3)),
+                    base_delay_seconds=float(retry_cfg.get("base_delay_seconds", 1.0)),
+                    max_delay_seconds=float(retry_cfg.get("max_delay_seconds", 16.0)),
+                ),
+                circuit_breaker=CircuitBreakerSettings(
+                    failure_threshold=int(circuit_breaker_cfg.get("failure_threshold", 5)),
+                    cooldown_seconds=float(circuit_breaker_cfg.get("cooldown_seconds", 30.0)),
+                ),
             ),
             object_store=ObjectStoreSettings(
                 provider=str(object_store_cfg.get("provider", "local")),

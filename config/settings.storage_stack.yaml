@@ -72,6 +72,15 @@ redis:
   url: "redis://localhost:6380/0"
   ttl_seconds: 3600
 
+llm_resilience:
+  retry:
+    max_retries: 3
+    base_delay_seconds: 1.0
+    max_delay_seconds: 16.0
+  circuit_breaker:
+    failure_threshold: 5
+    cooldown_seconds: 30.0
+
 object_store:
   provider: "minio"          # local / minio
   local_root: "./data/object_store"

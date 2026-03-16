@@ -5,14 +5,20 @@ from __future__ import annotations
 import textwrap
 from pathlib import Path
 
+import pytest
+
 from src.agent.config import load_agent_config, load_memory_config
 from src.agent.conversation import FileConversationStore
+from src.agent.hooks.rate_limit import CircuitBreaker
+from src.agent.hooks.redis_circuit_breaker import RedisCircuitBreaker
 from src.core.cache.semantic_cache import SemanticCache
 from src.core.settings import load_settings
 from src.ingestion.storage.image_storage import ImageStorage
 from src.libs.loader.file_integrity import SQLiteIntegrityChecker
 from src.storage.object_store import LocalObjectStore
 from src.storage.runtime import (
+    build_llm_circuit_breaker_scope,
+    create_circuit_breaker,
     create_conversation_store,
     create_feedback_store,
     create_image_storage,
@@ -115,3 +121,51 @@ def test_runtime_factories_default_to_local_backends(tmp_path: Path) -> None:
     assert isinstance(image_storage, ImageStorage)
     assert isinstance(ingestion_backends.integrity_checker, SQLiteIntegrityChecker)
     assert isinstance(semantic_cache, SemanticCache)
+
+
+def test_create_circuit_breaker_defaults_to_in_memory(tmp_path: Path) -> None:
+    _, core_settings = _build_settings(tmp_path)
+
+    breaker = create_circuit_breaker(core_settings)
+
+    assert isinstance(breaker, CircuitBreaker)
+
+
+def test_create_circuit_breaker_uses_redis_when_enabled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fakeredis = pytest.importorskip("fakeredis")
+    fake_client = fakeredis.FakeRedis(decode_responses=True)
+
+    _, core_settings = _build_settings(tmp_path)
+    object.__setattr__(core_settings.redis, "enabled", True)
+    object.__setattr__(core_settings.redis, "url", "redis://example/0")
+
+    monkeypatch.setattr(
+        "src.agent.hooks.redis_circuit_breaker.redis.Redis.from_url",
+        lambda *args, **kwargs: fake_client,
+    )
+
+    breaker = create_circuit_breaker(core_settings)
+
+    assert isinstance(breaker, RedisCircuitBreaker)
+    assert breaker.scope_key == build_llm_circuit_breaker_scope(core_settings)
+
+
+def test_create_circuit_breaker_fails_fast_when_redis_unreachable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, core_settings = _build_settings(tmp_path)
+    object.__setattr__(core_settings.redis, "enabled", True)
+    object.__setattr__(core_settings.redis, "url", "redis://example/0")
+
+    class FailingRedis:
+        def ping(self) -> bool:
+            raise RuntimeError("redis down")
+
+    monkeypatch.setattr(
+        "src.agent.hooks.redis_circuit_breaker.redis.Redis.from_url",
+        lambda *args, **kwargs: FailingRedis(),
+    )
+
+    with pytest.raises(RuntimeError, match="requires reachable Redis"):
+        create_circuit_breaker(core_settings)
