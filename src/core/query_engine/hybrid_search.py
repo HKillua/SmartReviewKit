@@ -221,6 +221,7 @@ class HybridSearch:
         trace: Optional[Any] = None,
         return_details: bool = False,
         query_vector: Optional[List[float]] = None,
+        fast_mode: bool = False,
     ) -> List[RetrievalResult] | HybridSearchResult:
         """Perform hybrid search combining Dense and Sparse retrieval.
         
@@ -249,6 +250,8 @@ class HybridSearch:
             raise ValueError("Query cannot be empty or whitespace-only")
         
         effective_top_k = top_k if top_k is not None else self.config.fusion_top_k
+        rerank_enabled = self.config.rerank_enabled and not fast_mode
+        mmr_enabled = self.config.mmr_enabled and not fast_mode
         
         logger.debug(f"HybridSearch: query='{query[:50]}...', top_k={effective_top_k}")
         
@@ -320,11 +323,11 @@ class HybridSearch:
                 )
         
         # Step 6: Reranker (if enabled and available)
-        if self.config.rerank_enabled and self.reranker is not None:
+        if rerank_enabled and self.reranker is not None:
             fused_results = self._apply_reranker(query, fused_results, trace)
-        
+
         # Step 7: MMR diversity (if enabled)
-        if self.config.mmr_enabled and self.embedding_client is not None and fused_results:
+        if mmr_enabled and self.embedding_client is not None and fused_results:
             fused_results = self._apply_mmr(query, fused_results, effective_top_k, trace)
         
         # Step 8: Min score filtering
@@ -348,9 +351,10 @@ class HybridSearch:
                 "score_max": round(max(scores), 4),
                 "score_min": round(min(scores), 4),
                 "score_mean": round(sum(scores) / len(scores), 4),
-                "reranker_used": self.config.rerank_enabled and self.reranker is not None,
-                "mmr_used": self.config.mmr_enabled,
+                "reranker_used": rerank_enabled and self.reranker is not None,
+                "mmr_used": mmr_enabled,
                 "dedup_used": self.config.post_dedup_enabled,
+                "fast_mode": fast_mode,
                 "pipeline": "dense+sparse+rrf",
             }, elapsed_ms=(time.monotonic() - _t0_summary) * 1000.0)
         

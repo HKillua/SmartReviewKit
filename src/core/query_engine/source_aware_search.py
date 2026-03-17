@@ -58,6 +58,7 @@ class SourceAwareSearch:
         route_decision: Any = None,
         query_vector: Optional[List[float]] = None,
         allowed_sources: Optional[Iterable[str]] = None,
+        fast_mode: bool = False,
     ) -> SourceAwareSearchResult:
         routing = route_decision or self._build_route(query=query, task_intent=task_intent)
         source_weights, preferred_sources = self._select_sources(routing, allowed_sources)
@@ -101,6 +102,7 @@ class SourceAwareSearch:
                 filters=source_filters,
                 query_vector=query_vector,
                 trace=trace,
+                fast_mode=fast_mode,
             )
             raw_candidate_counts[source_type] = len(raw_results)
             normalized_units, stats = self._normalize_source_results(source_type, raw_results)
@@ -120,6 +122,7 @@ class SourceAwareSearch:
                 filters=filters,
                 query_vector=query_vector,
                 trace=trace,
+                fast_mode=fast_mode,
             )
             if fallback_results:
                 fallback_global_used = True
@@ -152,8 +155,8 @@ class SourceAwareSearch:
                 },
             )
 
-        reranked = self._apply_unit_reranker(query=query, results=raw_unit_results, trace=trace)
-        reranked = self._apply_unit_mmr(query=query, results=reranked, top_k=top_k, trace=trace)
+        reranked = self._apply_unit_reranker(query=query, results=raw_unit_results, trace=trace, fast_mode=fast_mode)
+        reranked = self._apply_unit_mmr(query=query, results=reranked, top_k=top_k, trace=trace, fast_mode=fast_mode)
         reranked = self._apply_unit_dedup(results=reranked, trace=trace)
         final_results = reranked[:top_k]
 
@@ -184,6 +187,7 @@ class SourceAwareSearch:
             ),
             "unit_kind_distribution": dict(unit_kind_distribution),
             "fallback_global_used": fallback_global_used,
+            "fast_mode": fast_mode,
             **textbook_stats,
         }
         return SourceAwareSearchResult(
@@ -322,6 +326,7 @@ class SourceAwareSearch:
         filters: Optional[Dict[str, Any]],
         query_vector: Optional[List[float]],
         trace: Optional[Any],
+        fast_mode: bool,
     ) -> list[RetrievalResult]:
         try:
             results = self._hybrid_search.search(
@@ -330,6 +335,7 @@ class SourceAwareSearch:
                 filters=filters,
                 query_vector=query_vector,
                 trace=trace,
+                fast_mode=fast_mode,
             )
         except TypeError:
             try:
@@ -338,6 +344,7 @@ class SourceAwareSearch:
                     top_k=top_k,
                     filters=filters,
                     trace=trace,
+                    fast_mode=fast_mode,
                 )
             except TypeError:
                 results = self._hybrid_search.search(
@@ -524,7 +531,10 @@ class SourceAwareSearch:
         query: str,
         results: List[RetrievalResult],
         trace: Optional[Any],
+        fast_mode: bool,
     ) -> List[RetrievalResult]:
+        if fast_mode:
+            return results
         reranker = getattr(self._hybrid_search, "reranker", None)
         config = getattr(self._hybrid_search, "config", None)
         rerank_enabled = self._flag_enabled(config, "rerank_enabled")
@@ -590,7 +600,10 @@ class SourceAwareSearch:
         results: List[RetrievalResult],
         top_k: int,
         trace: Optional[Any],
+        fast_mode: bool,
     ) -> List[RetrievalResult]:
+        if fast_mode:
+            return results
         config = getattr(self._hybrid_search, "config", None)
         if not self._flag_enabled(config, "mmr_enabled") or not results:
             return results

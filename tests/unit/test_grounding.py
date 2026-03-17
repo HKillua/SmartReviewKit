@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
+import pytest
+
 from src.agent.grounding import (
     GroundingEvaluator,
     build_evidence_bundle,
@@ -146,3 +150,86 @@ def test_grounding_evaluator_uses_full_evidence_text_when_snippet_is_truncated()
 def test_build_grounding_context_includes_conservative_instruction_when_no_evidence() -> None:
     context = build_grounding_context(None, course_task=True)
     assert "不要编造课程知识" in context
+
+
+@pytest.mark.asyncio
+async def test_balanced_grounding_skips_conservative_rewrite_when_evidence_exists() -> None:
+    from src.agent.agent import Agent
+    from src.agent.config import AgentConfig
+    from src.agent.tools.base import ToolRegistry
+
+    bundle = build_evidence_bundle(
+        "knowledge_query",
+        {
+            "grounding_capable": True,
+            "citations": [
+                {
+                    "index": 1,
+                    "source": "slides.pdf",
+                    "text_snippet": "TCP 是面向连接的可靠传输协议。",
+                }
+            ],
+            "evidence_summary": "[1] `slides.pdf`: TCP 是面向连接的可靠传输协议。",
+            "source_count": 1,
+        },
+    )
+    agent = Agent(
+        llm_service=AsyncMock(),
+        tool_registry=ToolRegistry(),
+        conversation_store=AsyncMock(),
+        config=AgentConfig(),
+        grounding_mode="balanced",
+    )
+    agent._rewrite_answer_conservatively = AsyncMock(return_value="不应被调用")
+
+    final_text, assessment = await agent._finalize_answer(
+        "TCP 会经历 SYN、SYN-ACK、ACK 三步建立连接。",
+        course_task=True,
+        evidence_bundle=bundle,
+    )
+
+    agent._rewrite_answer_conservatively.assert_not_called()
+    assert assessment is not None
+    assert assessment.policy_action == "low_evidence_warning"
+    assert "尽量保持贴近教材表述" in final_text
+
+
+@pytest.mark.asyncio
+async def test_strict_grounding_keeps_conservative_rewrite_path() -> None:
+    from src.agent.agent import Agent
+    from src.agent.config import AgentConfig
+    from src.agent.tools.base import ToolRegistry
+
+    bundle = build_evidence_bundle(
+        "knowledge_query",
+        {
+            "grounding_capable": True,
+            "citations": [
+                {
+                    "index": 1,
+                    "source": "slides.pdf",
+                    "text_snippet": "TCP 是面向连接的可靠传输协议。",
+                }
+            ],
+            "evidence_summary": "[1] `slides.pdf`: TCP 是面向连接的可靠传输协议。",
+            "source_count": 1,
+        },
+    )
+    agent = Agent(
+        llm_service=AsyncMock(),
+        tool_registry=ToolRegistry(),
+        conversation_store=AsyncMock(),
+        config=AgentConfig(),
+        grounding_mode="strict",
+    )
+    agent._rewrite_answer_conservatively = AsyncMock(return_value="TCP 是面向连接的可靠传输协议。[1]")
+
+    final_text, assessment = await agent._finalize_answer(
+        "TCP 会经历 SYN、SYN-ACK、ACK 三步建立连接。",
+        course_task=True,
+        evidence_bundle=bundle,
+    )
+
+    agent._rewrite_answer_conservatively.assert_called_once()
+    assert assessment is not None
+    assert final_text

@@ -71,6 +71,10 @@ def test_load_settings_success(tmp_path: Path) -> None:
     assert settings.ingestion is not None
     assert settings.llm_resilience.retry.max_retries == 3
     assert settings.llm_resilience.circuit_breaker.cooldown_seconds == 30.0
+    assert settings.grounding.mode == "balanced"
+    assert settings.grounding.low_evidence_threshold == 0.4
+    assert settings.retrieval.query_rewrite_policy == "followup_only"
+    assert settings.retrieval.query_rewrite_enabled is True
 
 
 def test_missing_required_field_raises_error(tmp_path: Path) -> None:
@@ -243,3 +247,54 @@ def test_load_settings_with_llm_resilience_overrides(tmp_path: Path) -> None:
     assert settings.llm_resilience.retry.max_delay_seconds == 9.0
     assert settings.llm_resilience.circuit_breaker.failure_threshold == 8
     assert settings.llm_resilience.circuit_breaker.cooldown_seconds == 45.0
+
+
+def test_load_settings_with_query_rewrite_policy_and_grounding_overrides(tmp_path: Path) -> None:
+    config = """
+    llm:
+      provider: openai
+      model: gpt-4o-mini
+      temperature: 0.0
+      max_tokens: 1024
+    embedding:
+      provider: openai
+      model: text-embedding-3-small
+      dimensions: 1536
+    vector_store:
+      provider: chroma
+      persist_directory: ./data/db/chroma
+      collection_name: knowledge_hub
+    retrieval:
+      dense_top_k: 20
+      sparse_top_k: 20
+      fusion_top_k: 10
+      rrf_k: 60
+      query_rewrite_policy: followup_only
+    grounding:
+      mode: strict
+      low_evidence_threshold: 0.55
+    rerank:
+      enabled: false
+      provider: none
+      model: cross-encoder/ms-marco-MiniLM-L-6-v2
+      top_k: 5
+    evaluation:
+      enabled: false
+      provider: custom
+      metrics:
+        - hit_rate
+    observability:
+      log_level: INFO
+      trace_enabled: true
+      trace_file: ./logs/traces.jsonl
+      structured_logging: true
+    """
+    settings_path = tmp_path / "settings.yaml"
+    _write_yaml(settings_path, config)
+
+    settings = load_settings(settings_path)
+
+    assert settings.retrieval.query_rewrite_policy == "followup_only"
+    assert settings.retrieval.query_rewrite_enabled is True
+    assert settings.grounding.mode == "strict"
+    assert settings.grounding.low_evidence_threshold == 0.55

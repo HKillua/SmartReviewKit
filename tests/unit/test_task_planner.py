@@ -51,6 +51,15 @@ def test_knowledge_query_is_only_advisory() -> None:
     assert decision.control_mode == ControlMode.ADVISORY
 
 
+def test_explicit_intro_query_hits_rule_before_embedding() -> None:
+    planner = TaskPlanner(embedding_fn=_fake_embed)
+    decision = planner.plan("请简单介绍一下 TCP 三次握手")
+
+    assert decision.task_intent == TaskIntent.KNOWLEDGE_QUERY
+    assert decision.match_method == "rule"
+    assert decision.control_mode == ControlMode.ADVISORY
+
+
 def test_general_chat_passes_through() -> None:
     planner = TaskPlanner()
     decision = planner.plan("你好")

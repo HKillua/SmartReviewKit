@@ -150,6 +150,7 @@ class RetrievalSettings:
     mmr_enabled: bool = False
     mmr_lambda: float = 0.7
     query_rewrite_enabled: bool = False
+    query_rewrite_policy: str = "followup_only"
     hyde_enabled: bool = False
     multi_query_enabled: bool = False
     contextual_enrichment: str = "off"
@@ -158,6 +159,12 @@ class RetrievalSettings:
     dedup_threshold: int = 3
     min_score: float = 0.0
     post_dedup_enabled: bool = True
+
+
+@dataclass(frozen=True)
+class GroundingSettings:
+    mode: str = "balanced"
+    low_evidence_threshold: float = 0.4
 
 
 @dataclass(frozen=True)
@@ -295,6 +302,7 @@ class Settings:
     sparse_store: SparseStoreSettings
     opensearch: OpenSearchSettings
     llm_resilience: LLMResilienceSettings = field(default_factory=LLMResilienceSettings)
+    grounding: GroundingSettings = field(default_factory=GroundingSettings)
     ingestion: Optional[IngestionSettings] = None
     ingestion_worker: Optional[IngestionWorkerSettings] = None
     vision_llm: Optional[VisionLLMSettings] = None
@@ -326,6 +334,7 @@ class Settings:
         object_store_cfg = data.get("object_store", {}) if isinstance(data.get("object_store", {}), dict) else {}
         sparse_store_cfg = data.get("sparse_store", {}) if isinstance(data.get("sparse_store", {}), dict) else {}
         opensearch_cfg = data.get("opensearch", {}) if isinstance(data.get("opensearch", {}), dict) else {}
+        grounding_cfg = data.get("grounding", {}) if isinstance(data.get("grounding", {}), dict) else {}
 
         ingestion_settings = None
         if "ingestion" in data:
@@ -366,6 +375,21 @@ class Settings:
                 max_attempts=int(ingestion_worker.get("max_attempts", 3)),
                 dev_fallback_sync=bool(ingestion_worker.get("dev_fallback_sync", True)),
             )
+
+        query_rewrite_policy = str(retrieval.get("query_rewrite_policy", "") or "").strip().lower()
+        if query_rewrite_policy:
+            if query_rewrite_policy not in {"off", "followup_only", "always"}:
+                raise SettingsError(
+                    "Expected retrieval.query_rewrite_policy to be one of: off, followup_only, always"
+                )
+        elif "query_rewrite_enabled" in retrieval:
+            query_rewrite_policy = "always" if bool(retrieval.get("query_rewrite_enabled", False)) else "off"
+        else:
+            query_rewrite_policy = "followup_only"
+
+        grounding_mode = str(grounding_cfg.get("mode", "balanced") or "balanced").strip().lower()
+        if grounding_mode not in {"balanced", "strict"}:
+            raise SettingsError("Expected grounding.mode to be one of: balanced, strict")
 
         settings = cls(
             llm=LLMSettings(
@@ -416,7 +440,8 @@ class Settings:
                 rerank_top_k=int(retrieval.get("rerank_top_k", 5)),
                 mmr_enabled=bool(retrieval.get("mmr_enabled", False)),
                 mmr_lambda=float(retrieval.get("mmr_lambda", 0.7)),
-                query_rewrite_enabled=bool(retrieval.get("query_rewrite_enabled", False)),
+                query_rewrite_enabled=query_rewrite_policy != "off",
+                query_rewrite_policy=query_rewrite_policy,
                 hyde_enabled=bool(retrieval.get("hyde_enabled", False)),
                 multi_query_enabled=bool(retrieval.get("multi_query_enabled", False)),
                 contextual_enrichment=str(retrieval.get("contextual_enrichment", "off")),
@@ -464,6 +489,10 @@ class Settings:
                     failure_threshold=int(circuit_breaker_cfg.get("failure_threshold", 5)),
                     cooldown_seconds=float(circuit_breaker_cfg.get("cooldown_seconds", 30.0)),
                 ),
+            ),
+            grounding=GroundingSettings(
+                mode=grounding_mode,
+                low_evidence_threshold=float(grounding_cfg.get("low_evidence_threshold", 0.4)),
             ),
             object_store=ObjectStoreSettings(
                 provider=str(object_store_cfg.get("provider", "local")),

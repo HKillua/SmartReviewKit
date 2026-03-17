@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field
@@ -20,6 +21,23 @@ from src.core.trace.trace_collector import TraceCollector
 from src.core.trace.trace_context import TraceContext
 
 logger = logging.getLogger(__name__)
+
+_FOLLOWUP_QUERY_RE = re.compile(
+    r"^(它|这个|那个|这些|那些|上面|前面|这里|那里|继续|再|然后|接着|那|其|该|这种|这一步|下一步|为什么|怎么|如何|过程呢|区别呢)",
+    re.IGNORECASE,
+)
+_FOLLOWUP_ANYWHERE_RE = re.compile(
+    r"(它|这个|那个|上面|前面|继续讲|继续说|再讲讲|再说说|展开讲|详细讲|过程呢|原理呢|区别呢)",
+    re.IGNORECASE,
+)
+_FAST_QUERY_KEYWORDS_RE = re.compile(
+    r"(解释|讲解|说明|介绍|概述|简述|流程|为什么|原理|区别|对比|比较|是什么|讲讲|聊聊)",
+    re.IGNORECASE,
+)
+_SLOW_QUERY_HINT_RE = re.compile(
+    r"(总结|复习|考点|出题|练习|判分|批改|评估|生成|整理|梳理|同时|并且|以及|然后|先.*再|结合)",
+    re.IGNORECASE,
+)
 
 
 def _int_metadata(value: Any, default: int = -1) -> int:
@@ -75,9 +93,23 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
         retrieval_cfg = None
         if settings and hasattr(settings, 'retrieval'):
             retrieval_cfg = settings.retrieval
-        self._rewrite_enabled = bool(getattr(retrieval_cfg, 'query_rewrite_enabled', False))
+        rewrite_policy = "off"
+        if retrieval_cfg is not None:
+            rewrite_policy = str(
+                getattr(retrieval_cfg, "query_rewrite_policy", "") or ""
+            ).strip().lower()
+            if not rewrite_policy:
+                rewrite_policy = (
+                    "always" if bool(getattr(retrieval_cfg, "query_rewrite_enabled", False)) else "off"
+                )
+        if rewrite_policy not in {"off", "followup_only", "always"}:
+            rewrite_policy = "off"
+        self._rewrite_policy = rewrite_policy
+        self._rewrite_enabled = rewrite_policy != "off"
         self._hyde_enabled = bool(getattr(retrieval_cfg, 'hyde_enabled', False))
         self._multi_query_enabled = bool(getattr(retrieval_cfg, 'multi_query_enabled', False))
+        self._compact_result_limit = 3
+        self._compact_result_chars = 420
 
     @property
     def name(self) -> str:
@@ -112,6 +144,62 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
             query_router=self._query_router,
         )
         return self._source_aware_search
+
+    @staticmethod
+    def _normalize_query(query: str) -> str:
+        return " ".join((query or "").split())
+
+    def _should_rewrite_query(self, query: str, recent_messages: list[dict[str, Any]]) -> tuple[bool, bool]:
+        if not self._rewrite_enabled or self._query_enhancer is None:
+            return False, False
+
+        policy = self._rewrite_policy
+        has_history = len(recent_messages) > 1
+        normalized = self._normalize_query(query)
+        if policy == "always":
+            return True, has_history
+        if policy == "off":
+            return False, False
+
+        followup = False
+        if normalized and len(normalized) <= 14 and not _FAST_QUERY_KEYWORDS_RE.search(normalized):
+            followup = True
+        if _FOLLOWUP_QUERY_RE.search(normalized) or _FOLLOWUP_ANYWHERE_RE.search(normalized):
+            followup = True
+        if normalized.endswith(("呢", "吗", "么")) and len(normalized) <= 32:
+            followup = True
+        if not has_history:
+            return False, False
+        return followup, followup
+
+    def _should_use_fast_path(self, query: str, recent_messages: list[dict[str, Any]]) -> bool:
+        normalized = self._normalize_query(query)
+        if not normalized:
+            return False
+        if len(normalized) > 48:
+            return False
+        if len(recent_messages) > 1 and self._should_rewrite_query(normalized, recent_messages)[0]:
+            return False
+        if _SLOW_QUERY_HINT_RE.search(normalized):
+            return False
+        return bool(_FAST_QUERY_KEYWORDS_RE.search(normalized) or normalized.endswith(("?", "？")))
+
+    def _build_compact_result_text(self, results: list[Any]) -> str:
+        citations = self._citation_generator.generate(results)
+        lines = [
+            "以下是与问题最相关的课程证据。回答时优先依据这些证据，并在核心结论后保留对应引用标记。",
+            "",
+        ]
+        for citation, result in zip(citations[: self._compact_result_limit], results[: self._compact_result_limit], strict=False):
+            source = resolve_source_display(result.metadata) or str(citation.source or "未知来源")
+            title = str(result.metadata.get("title", "") or "")
+            header = f"[{citation.index}] `{source}`"
+            if title:
+                header += f" · {title}"
+            lines.append(header)
+            lines.append(sanitize_retrieval_text(result.text)[: self._compact_result_chars])
+            lines.append("")
+        return "\n".join(lines).strip()
 
     def _ensure_initialized(self, collection: str = "computer_network") -> None:
         if self._initialized and self._current_collection == collection:
@@ -240,11 +328,16 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
 
             effective_query = args.query
             hyde_vector = None
+            rewrite_needed = False
 
             if self._query_enhancer is not None:
-                if self._rewrite_enabled:
+                rewrite_needed, use_conversation_rewrite = self._should_rewrite_query(
+                    args.query,
+                    context.recent_messages,
+                )
+                if rewrite_needed:
                     try:
-                        if context.recent_messages and len(context.recent_messages) > 1:
+                        if use_conversation_rewrite:
                             effective_query = await self._query_enhancer.conversation_aware_rewrite(
                                 args.query, context.recent_messages,
                             )
@@ -265,15 +358,21 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
 
             if query_trace is not None:
                 query_trace.metadata["effective_query"] = effective_query[:200]
+                fast_mode = self._should_use_fast_path(effective_query, context.recent_messages)
                 query_trace.record_stage(
                     "agent_query_setup",
                     {
                         "rewrite_enabled": self._rewrite_enabled,
+                        "rewrite_policy": self._rewrite_policy,
+                        "rewrite_applied": rewrite_needed,
                         "hyde_enabled": self._hyde_enabled,
                         "multi_query_enabled": self._multi_query_enabled,
                         "used_hyde_vector": hyde_vector is not None,
+                        "fast_mode": fast_mode,
                     },
                 )
+            else:
+                fast_mode = self._should_use_fast_path(effective_query, context.recent_messages)
 
             search_kwargs: dict[str, Any] = {}
             route_filter = None
@@ -346,6 +445,7 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                         filters=search_kwargs.get("filters"),
                         route_decision=routing,
                         query_vector=hyde_vector,
+                        fast_mode=fast_mode,
                     )
                     return list(normalized.results), dict(normalized.routing_metadata)
                 r = await asyncio.to_thread(
@@ -353,6 +453,7 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                     query=q,
                     top_k=args.top_k,
                     trace=trace_arg,
+                    fast_mode=fast_mode,
                     **search_kwargs,
                 )
                 return (r if isinstance(r, list) else []), {}
@@ -419,19 +520,7 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                 except Exception:
                     logger.warning("Conflict detection failed, skipping", exc_info=True)
 
-            lines: list[str] = [f"检索到 {len(results)} 条相关内容：\n"]
-            for i, r in enumerate(results, 1):
-                source = resolve_source_display(r.metadata) or "未知来源"
-                title = r.metadata.get("title", "")
-                ct = r.metadata.get("content_type", "")
-                ct_tag = f" [{ct}]" if ct else ""
-                chunk_ref = r.chunk_id[:12]
-                header = f"**[{i}]** {title}{ct_tag} — `{source}` (chunk: {chunk_ref})" if title else f"**[{i}]{ct_tag}** `{source}` (chunk: {chunk_ref})"
-                lines.append(f"{header} (相关度: {r.score:.2f})")
-                lines.append(sanitize_retrieval_text(r.text)[:1600])
-                lines.append("")
-
-            result_text = "\n".join(lines)
+            result_text = self._build_compact_result_text(results)
             if conflict_section:
                 result_text += "\n" + conflict_section
 
@@ -446,6 +535,7 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                 "source_count": len(citations),
                 "collection": effective_collection,
                 "query_trace_ids": query_trace_ids,
+                "fast_mode": fast_mode,
             }
             metadata.update(normalized_metadata)
             if composite_mode:

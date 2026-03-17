@@ -17,6 +17,7 @@ from typing import Any, AsyncGenerator, Optional
 from src.agent.config import AgentConfig
 from src.agent.conversation import ConversationStore
 from src.agent.grounding import (
+    DEFAULT_BALANCED_LOW_EVIDENCE_NOTE,
     DEFAULT_LOW_EVIDENCE_MESSAGE,
     EvidenceBundle,
     GroundingAssessment,
@@ -334,6 +335,8 @@ class Agent:
         review_hook: object | None = None,
         trace_enabled: bool = False,
         trace_collector: TraceCollector | None = None,
+        grounding_mode: str = "balanced",
+        grounding_low_evidence_threshold: float = 0.4,
     ) -> None:
         self.llm = llm_service
         self.tools = tool_registry
@@ -350,7 +353,8 @@ class Agent:
         self._bg_tasks: set[asyncio.Task] = set()
         self._trace_enabled = trace_enabled
         self._trace_collector = trace_collector or (TraceCollector() if trace_enabled else None)
-        self._grounding_evaluator = GroundingEvaluator()
+        self._grounding_mode = grounding_mode
+        self._grounding_evaluator = GroundingEvaluator(threshold=grounding_low_evidence_threshold)
 
     async def chat(
         self,
@@ -1554,6 +1558,10 @@ class Agent:
             return content, assessment
 
         if evidence_bundle is not None and evidence_bundle.has_evidence:
+            if self._grounding_mode != "strict":
+                assessment.policy_action = GroundingPolicyAction.LOW_EVIDENCE_WARNING.value
+                softened = content or fallback_text or DEFAULT_LOW_EVIDENCE_MESSAGE
+                return _append_warning(softened, DEFAULT_BALANCED_LOW_EVIDENCE_NOTE), assessment
             rewritten = await self._rewrite_answer_conservatively(content, evidence_bundle)
             if rewritten:
                 rewritten_assessment = self._grounding_evaluator.assess(rewritten, evidence_bundle)

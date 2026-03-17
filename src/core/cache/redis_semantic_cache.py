@@ -62,6 +62,14 @@ class RedisSemanticCache:
         self._entries_key = f"{namespace}:entries"
         self._stats_key = f"{namespace}:stats"
 
+    @staticmethod
+    def _normalize_query(query: str) -> str:
+        return " ".join((query or "").split()).casefold()
+
+    @classmethod
+    def _entry_key(cls, query: str, collection: str = "") -> str:
+        return f"{collection}::{cls._normalize_query(query)}"
+
     async def _get_embedding(self, text: str) -> Optional[List[float]]:
         try:
             if not text or not text.strip():
@@ -96,11 +104,27 @@ class RedisSemanticCache:
             return None
 
     async def get(self, query: str, collection: str = "") -> Optional[RedisCacheEntry]:
+        def _get_exact() -> Optional[RedisCacheEntry]:
+            now = time.time()
+            exact_key = self._entry_key(query, collection)
+            exact_raw = self._redis.hget(self._entries_key, exact_key)
+            if exact_raw:
+                payload = json.loads(exact_raw)
+                if now - float(payload["created_at"]) <= self._ttl:
+                    self._redis.hincrby(self._stats_key, "hits", 1)
+                    return RedisCacheEntry(**payload)
+                self._redis.hdel(self._entries_key, exact_key)
+            return None
+
+        exact_entry = await asyncio.to_thread(_get_exact)
+        if exact_entry is not None:
+            return exact_entry
+
         embedding = await self._get_embedding(query)
         if not embedding:
             return None
 
-        def _get() -> Optional[RedisCacheEntry]:
+        def _get_semantic() -> Optional[RedisCacheEntry]:
             now = time.time()
             data = self._redis.hgetall(self._entries_key)
             best_entry: Optional[RedisCacheEntry] = None
@@ -125,7 +149,7 @@ class RedisSemanticCache:
             self._redis.hincrby(self._stats_key, "misses", 1)
             return None
 
-        return await asyncio.to_thread(_get)
+        return await asyncio.to_thread(_get_semantic)
 
     async def put(
         self,
@@ -149,7 +173,7 @@ class RedisSemanticCache:
         )
 
         def _put() -> None:
-            cache_key = f"{effective_collection}::{query}"
+            cache_key = self._entry_key(query, effective_collection)
             self._redis.hset(self._entries_key, cache_key, json.dumps(entry.__dict__, ensure_ascii=False))
             size = self._redis.hlen(self._entries_key)
             if size > self._max_size:

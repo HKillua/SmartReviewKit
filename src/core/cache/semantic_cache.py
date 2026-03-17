@@ -68,19 +68,35 @@ class SemanticCache:
         self._stats = {"hits": 0, "misses": 0}
 
     @staticmethod
-    def _entry_key(query: str, collection: str = "") -> str:
-        return f"{collection}::{query}"
+    def _normalize_query(query: str) -> str:
+        return " ".join((query or "").split()).casefold()
+
+    @classmethod
+    def _entry_key(cls, query: str, collection: str = "") -> str:
+        return f"{collection}::{cls._normalize_query(query)}"
 
     async def get(self, query: str, collection: str = "") -> Optional[CacheEntry]:
         """Look up a semantically similar cached result."""
+        now = time.time()
+        entry_key = self._entry_key(query, collection)
+
+        with self._lock:
+            exact_entry = self._entries.get(entry_key)
+            if exact_entry is not None:
+                if now - exact_entry.created_at <= self._ttl:
+                    self._entries.move_to_end(entry_key)
+                    self._stats["hits"] += 1
+                    logger.debug("Semantic cache EXACT HIT: %s", query[:60])
+                    return exact_entry
+                self._entries.pop(entry_key, None)
+
         embedding = await self._get_embedding(query)
         if not embedding:
             return None
 
-        now = time.time()
         best_entry: Optional[CacheEntry] = None
         best_sim = 0.0
-        best_key = ""
+        best_cache_key = ""
 
         with self._lock:
             expired_keys: list[str] = []
@@ -94,13 +110,13 @@ class SemanticCache:
                 if sim > best_sim:
                     best_sim = sim
                     best_entry = entry
-                    best_key = key
+                    best_cache_key = key
 
             for k in expired_keys:
                 self._entries.pop(k, None)
 
             if best_entry is not None and best_sim >= self._threshold:
-                self._entries.move_to_end(best_key)
+                self._entries.move_to_end(best_cache_key)
                 self._stats["hits"] += 1
                 logger.debug("Semantic cache HIT (sim=%.3f): %s", best_sim, query[:60])
                 return best_entry

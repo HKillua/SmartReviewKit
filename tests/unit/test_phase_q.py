@@ -111,10 +111,13 @@ class TestQ1RerankerWiring:
 class TestQ2ConfigDrivenEnhancement:
     """Verify enhancement steps are gated by settings flags."""
 
-    def _make_settings(self, rewrite=False, hyde=False, multi=False):
+    def _make_settings(self, rewrite=False, hyde=False, multi=False, rewrite_policy=None):
+        if rewrite_policy is None:
+            rewrite_policy = "always" if rewrite else "off"
         return SimpleNamespace(
             retrieval=SimpleNamespace(
                 query_rewrite_enabled=rewrite,
+                query_rewrite_policy=rewrite_policy,
                 hyde_enabled=hyde,
                 multi_query_enabled=multi,
             ),
@@ -186,6 +189,66 @@ class TestQ2ConfigDrivenEnhancement:
 
         await tool.execute(ctx, args)
         mock_enhancer.rewrite.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_followup_only_policy_skips_rewrite_for_explicit_query(self):
+        from src.agent.tools.knowledge_query import KnowledgeQueryTool, KnowledgeQueryArgs
+        from src.agent.types import ToolContext
+
+        mock_enhancer = AsyncMock()
+        mock_hs = MagicMock()
+        mock_hs.search = MagicMock(return_value=[])
+
+        tool = KnowledgeQueryTool(
+            settings=self._make_settings(rewrite=True, rewrite_policy="followup_only"),
+            hybrid_search=mock_hs,
+            query_enhancer=mock_enhancer,
+        )
+        tool._current_collection = "computer_network"
+
+        ctx = ToolContext(
+            user_id="u",
+            conversation_id="c",
+            recent_messages=[
+                {"role": "user", "content": "上一个问题"},
+                {"role": "assistant", "content": "上一个回答"},
+            ],
+        )
+        args = KnowledgeQueryArgs(query="请简单介绍一下 TCP 三次握手", collection="computer_network")
+
+        await tool.execute(ctx, args)
+        mock_enhancer.rewrite.assert_not_called()
+        mock_enhancer.conversation_aware_rewrite.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_followup_only_policy_rewrites_pronoun_followup(self):
+        from src.agent.tools.knowledge_query import KnowledgeQueryTool, KnowledgeQueryArgs
+        from src.agent.types import ToolContext
+
+        mock_enhancer = AsyncMock()
+        mock_enhancer.conversation_aware_rewrite.return_value = "TCP 三次握手过程"
+        mock_hs = MagicMock()
+        mock_hs.search = MagicMock(return_value=[])
+
+        tool = KnowledgeQueryTool(
+            settings=self._make_settings(rewrite=True, rewrite_policy="followup_only"),
+            hybrid_search=mock_hs,
+            query_enhancer=mock_enhancer,
+        )
+        tool._current_collection = "computer_network"
+
+        ctx = ToolContext(
+            user_id="u",
+            conversation_id="c",
+            recent_messages=[
+                {"role": "user", "content": "TCP 是什么"},
+                {"role": "assistant", "content": "TCP 是传输控制协议"},
+            ],
+        )
+        args = KnowledgeQueryArgs(query="它的握手过程呢", collection="computer_network")
+
+        await tool.execute(ctx, args)
+        mock_enhancer.conversation_aware_rewrite.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_hyde_skipped_when_disabled(self):
@@ -310,6 +373,39 @@ class TestQ2ConfigDrivenEnhancement:
         assert result.success is True
         assert mock_hs.search.called
         assert result.metadata["source_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_compact_evidence_pack_is_shorter_than_raw_chunks(self):
+        from src.agent.tools.knowledge_query import KnowledgeQueryTool, KnowledgeQueryArgs
+        from src.agent.types import ToolContext
+
+        long_text = "TCP 使用三次握手建立连接。" * 200
+        mock_hs = MagicMock()
+        mock_hs.search = MagicMock(
+            return_value=[
+                RetrievalResult(
+                    chunk_id="chunk_1",
+                    score=0.95,
+                    text=long_text,
+                    metadata={"source_path": "network.md", "title": "TCP"},
+                )
+            ]
+        )
+
+        tool = KnowledgeQueryTool(
+            settings=self._make_settings(),
+            hybrid_search=mock_hs,
+        )
+        tool._current_collection = "computer_network"
+
+        result = await tool.execute(
+            ToolContext(user_id="u", conversation_id="c"),
+            KnowledgeQueryArgs(query="解释 TCP 三次握手", collection="computer_network"),
+        )
+
+        assert result.success is True
+        assert result.metadata["source_count"] == 1
+        assert len(result.result_for_llm) < len(long_text)
 
 
 # ===================================================================

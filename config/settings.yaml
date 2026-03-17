@@ -81,6 +81,10 @@ llm_resilience:
     failure_threshold: 5
     cooldown_seconds: 30.0
 
+grounding:
+  mode: "balanced"          # balanced / strict
+  low_evidence_threshold: 0.4
+
 object_store:
   provider: "local"          # local / minio
   local_root: "./data/object_store"
@@ -118,7 +122,7 @@ retrieval:
   rerank_top_k: 5
   mmr_enabled: true            # N13: 启用 MMR 多样性控制
   mmr_lambda: 0.7
-  query_rewrite_enabled: true  # N13: 启用 query rewrite
+  query_rewrite_policy: "followup_only"  # off / followup_only / always
   hyde_enabled: false           # HyDE 需要额外 LLM 调用，按需开启
   multi_query_enabled: false    # Multi-query 需要额外 LLM 调用，按需开启
   contextual_enrichment: "rule" # rule / llm / off
@@ -237,7 +241,7 @@ memory:
   review_schedule_enabled: true  # 启用主动复习推荐
   decay_on_session_start: true   # 新会话开始时触发 Ebbinghaus 衰减
   compaction_enabled: true       # 启用上下文压缩 (CoPaw-style Compaction)
-  compaction_threshold_messages: 30  # 超过此消息数时触发压缩
+  compaction_threshold_messages: 45  # 超过此消息数时再触发压缩
 
 # =============================================================================
 # Routing Configuration (Adaptive Retrieval Router)

@@ -58,7 +58,7 @@ class MemoryConfig(BaseModel):
     review_schedule_enabled: bool = True
     decay_on_session_start: bool = True
     compaction_enabled: bool = True
-    compaction_threshold_messages: int = Field(default=30, ge=10)
+    compaction_threshold_messages: int = Field(default=45, ge=10)
 
 
 def load_agent_config(settings: dict[str, Any]) -> AgentConfig:

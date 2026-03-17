@@ -349,6 +349,16 @@ class QueryRouter:
         if rule_result is not None:
             return self._apply_planner_context(rule_result, planner_intent)
 
+        if planner_intent == "knowledge_query":
+            return self._apply_planner_context(
+                self._build_decision(
+                    QueryIntent.DEEP_UNDERSTANDING,
+                    confidence=0.0,
+                    method="planner_context_default",
+                ),
+                planner_intent,
+            )
+
         # ── Layer 2: embedding classification ──
         if self._embedding_ready and self._embed_fn is not None:
             embed_result = self._embedding_match(q)

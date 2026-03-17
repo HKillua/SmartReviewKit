@@ -30,6 +30,16 @@ class TestSemanticCache(unittest.TestCase):
         self.assertIn("TCP", result.result)
         loop.close()
 
+    def test_exact_hit_skips_extra_embedding_call(self):
+        cache, counter = self._make_cache(similarity_threshold=0.5)
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(cache.put(" what   is TCP ", "TCP is a protocol", {"collection": "test"}))
+        calls_after_put = counter["calls"]
+        result = loop.run_until_complete(cache.get("what is tcp", collection="test"))
+        self.assertIsNotNone(result)
+        self.assertEqual(counter["calls"], calls_after_put)
+        loop.close()
+
     def test_miss_on_different_query(self):
         """Ensure miss when threshold is extremely high and queries differ."""
         from src.core.cache.semantic_cache import SemanticCache

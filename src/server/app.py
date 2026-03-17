@@ -410,6 +410,8 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         review_hook=review_hook,
         trace_enabled=bool(settings.get("observability", {}).get("trace_enabled", False)),
         trace_collector=shared_trace_collector,
+        grounding_mode=core_settings.grounding.mode,
+        grounding_low_evidence_threshold=core_settings.grounding.low_evidence_threshold,
     )
 
     chat_handler = ChatHandler(agent)

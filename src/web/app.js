@@ -203,7 +203,7 @@ function renderAssistantMeta(bodyEl, metadata) {
     warning.className = 'assistant-warning';
     warning.textContent = groundingAction === 'conservative_rewrite'
       ? '证据偏弱，回答已按可验证范围保守收敛。'
-      : '当前回答的课程证据不足，请结合课件再次确认。';
+      : '课件中可直接引用的证据较少，回答已尽量贴近现有课程证据，请结合课件再次确认。';
     wrapper.appendChild(warning);
   }
 

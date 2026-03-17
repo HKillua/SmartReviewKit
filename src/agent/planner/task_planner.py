@@ -90,7 +90,7 @@ _REVIEW_RULES = re.compile(
     re.IGNORECASE,
 )
 _KNOWLEDGE_RULES = re.compile(
-    r"解释|讲解|说明|为什么|原理|怎么理解|如何理解|详细介绍|详细解释|区别|对比|比较|分析|是什么",
+    r"解释|讲解|说明|为什么|原理|怎么理解|如何理解|详细介绍|详细解释|介绍(?:一下)?|概述|简述|流程|讲讲|聊聊|区别|对比|比较|分析|是什么",
     re.IGNORECASE,
 )
 _DOCUMENT_RULES = re.compile(

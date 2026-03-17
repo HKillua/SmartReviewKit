@@ -16,6 +16,10 @@ DEFAULT_LOW_EVIDENCE_MESSAGE = (
     "根据当前知识库证据，我暂时无法可靠地完整回答这个课程问题。"
     "请缩小范围、指定章节，或先补充相关课件后再试。"
 )
+DEFAULT_BALANCED_LOW_EVIDENCE_NOTE = (
+    "> 注：课件中可直接引用的证据较少，以下回答在现有课程证据范围内尽量保持贴近教材表述，"
+    "建议结合原课件再次确认。"
+)
 
 
 class GroundingPolicyAction(str, Enum):
@@ -146,6 +150,7 @@ def build_grounding_context(
         lines = [
             "你必须优先基于以下课程证据回答，不要编造超出证据范围的课程内容。",
             "若使用来源，请在对应句子后保留 `[1]`、`[2]` 这类引用标记。",
+            "有证据支撑的核心结论，优先在对应句子后添加内联引用。",
             "可用证据:",
             bundle.evidence_summary,
         ]

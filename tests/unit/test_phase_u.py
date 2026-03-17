@@ -214,6 +214,27 @@ class TestQueryRouter(unittest.TestCase):
         self.assertGreaterEqual(budgets["slide"], budgets["textbook"])
         self.assertGreaterEqual(budgets["textbook"], budgets["question_bank"])
 
+    def test_knowledge_query_planner_context_skips_embedding_layer(self):
+        from src.core.query_engine.query_router import QueryRouter
+
+        calls = {"count": 0}
+
+        def embed(texts):
+            calls["count"] += 1
+            return [[0.1] * 8 for _ in texts]
+
+        router = QueryRouter(embedding_fn=embed)
+        init_calls = calls["count"]
+
+        decision = router.route(
+            "TCP拥塞窗口公平性",
+            planner_task_intent="knowledge_query",
+        )
+
+        self.assertEqual(calls["count"], init_calls)
+        self.assertEqual(decision.intent.value, "deep_understanding")
+        self.assertEqual(decision.match_method, "planner_context_default")
+
 
 # ---------------------------------------------------------------------------
 # U4b: QueryRouter Embedding Layer
