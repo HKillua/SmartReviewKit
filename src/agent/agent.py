@@ -27,6 +27,7 @@ from src.agent.grounding import (
     build_conservative_rewrite_messages,
     build_evidence_bundle,
     build_grounding_context,
+    extract_citation_indices,
 )
 from src.agent.hooks.lifecycle import LifecycleHook
 from src.agent.hooks.middleware import LlmMiddleware
@@ -206,6 +207,21 @@ def _append_warning(text: str, warning: str) -> str:
     if not warning or warning in text:
         return text
     return f"{text.rstrip()}\n\n{warning}"
+
+
+def _ensure_direct_answer_has_citation(
+    text: str,
+    bundle: EvidenceBundle | None,
+) -> str:
+    cleaned = (text or "").strip()
+    if not cleaned or bundle is None or not bundle.citations:
+        return cleaned
+    if extract_citation_indices(cleaned):
+        return cleaned
+    first_index = int(bundle.citations[0].get("index") or 1)
+    if re.search(r"[。！？!?]$", cleaned):
+        return f"{cleaned}[{first_index}]"
+    return f"{cleaned} [{first_index}]"
 
 
 def _tool_output_kind(metadata: dict[str, Any] | None) -> str:
@@ -903,6 +919,7 @@ class Agent:
                 fallback_text=fallback_text,
             )
         content = (response.content or "").strip() or tool_result.result_for_llm or DEFAULT_LOW_EVIDENCE_MESSAGE
+        content = _ensure_direct_answer_has_citation(content, evidence_bundle)
         return await self._finalize_answer(
             content,
             course_task=True,

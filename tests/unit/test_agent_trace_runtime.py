@@ -301,12 +301,13 @@ class _DirectKnowledgeEvidenceTool(_TraceAwareTool):
 
 
 class _DirectKnowledgeAnswerLlm:
-    def __init__(self) -> None:
+    def __init__(self, content: str = "博主的笔记价格是 199 元 [1]。") -> None:
         self.calls = 0
+        self.content = content
 
     async def send_request(self, request):
         self.calls += 1
-        return LlmResponse(content="博主的笔记价格是 199 元 [1]。")
+        return LlmResponse(content=self.content)
 
 
 class _ReviewPassthroughTool:
@@ -726,6 +727,52 @@ async def test_direct_knowledge_query_evidence_context_generates_user_answer(tmp
     assert done_event.metadata["generation_mode"] == "direct_knowledge_query"
     assert done_event.metadata["query_trace_ids"] == ["query-trace-199"]
     assert len(done_event.metadata["citations"]) == 1
+    assert done_event.metadata["grounding_policy_action"] == "normal"
+    assert done_event.metadata["low_evidence"] is False
+    assert done_event.metadata["valid_citation_indices"] == [1]
+
+
+@pytest.mark.asyncio
+async def test_direct_knowledge_query_repairs_missing_inline_citation(tmp_path: Path) -> None:
+    from src.agent.agent import Agent
+    from src.agent.config import AgentConfig
+    from src.agent.conversation import ConversationStore
+    from src.agent.tools.base import ToolRegistry
+
+    trace_path = tmp_path / "direct_knowledge_answer_missing_citation.jsonl"
+    collector = TraceCollector(traces_path=trace_path)
+
+    conversation = Conversation(id="conv_direct_knowledge_no_cite", user_id="u1", messages=[])
+    store = AsyncMock(spec=ConversationStore)
+    store.get.return_value = conversation
+    store.create.return_value = conversation
+    store.update.return_value = None
+
+    registry = ToolRegistry()
+    registry.register(_DirectKnowledgeEvidenceTool())
+
+    llm = _DirectKnowledgeAnswerLlm(content="博主的笔记价格是 199 元。")
+    agent = Agent(
+        llm_service=llm,
+        tool_registry=registry,
+        conversation_store=store,
+        config=AgentConfig(stream_responses=False, max_tool_iterations=1, response_profile="balanced_fast"),
+        task_planner=_KnowledgeForcePlanner(),
+        trace_enabled=True,
+        trace_collector=collector,
+    )
+
+    events = [event async for event in agent.chat("博主的笔记价格是多少？", "u1", "conv_direct_knowledge_no_cite")]
+
+    final_text = "".join(event.content or "" for event in events if event.type.value == "text_delta")
+    done_event = next(event for event in events if event.type.value == "done")
+
+    assert llm.calls == 1
+    assert "199" in final_text
+    assert "[1]" in final_text
+    assert done_event.metadata["grounding_policy_action"] == "normal"
+    assert done_event.metadata["low_evidence"] is False
+    assert done_event.metadata["valid_citation_indices"] == [1]
 
 
 @pytest.mark.asyncio
