@@ -134,15 +134,17 @@ class ProtocolStateSimulatorTool(Tool[ProtocolStateSimulatorArgs]):
                 }
             )
 
-        lines = [
-            "TCP 三次握手模拟：",
-            *[
+        step_lines = []
+        for item in steps:
+            ack_suffix = ""
+            if item["ack"] is not None:
+                ack_suffix = f", ack={item['ack']}"
+            step_lines.append(
                 f"{item['step']}. {item['from']} -> {item['to']} 发送 {item['segment']}"
-                f" (seq={item['seq']}{'' if item['ack'] is None else f', ack={item['ack']}'})；"
+                f" (seq={item['seq']}{ack_suffix})；"
                 f" 客户端状态={item['client_state']}，服务端状态={item['server_state']}；{item['note']}"
-                for item in steps
-            ],
-        ]
+            )
+        lines = ["TCP 三次握手模拟：", *step_lines]
         if timeout:
             lines.append("故障结论：由于 SYN-ACK 丢失，客户端会在超时后重传 SYN，直到收到确认或达到重试上限。")
 
