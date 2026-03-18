@@ -60,6 +60,23 @@ def _int_metadata(value: Any, default: int = -1) -> int:
     except (TypeError, ValueError):
         return default
 
+
+def _response_profile(context: ToolContext) -> str:
+    value = str(context.metadata.get("response_profile", "") or "").strip().lower()
+    return value if value in {"balanced_fast", "quality_first"} else "quality_first"
+
+
+def _extract_summary_snippet(text: str, *, limit: int = 140) -> str:
+    cleaned = sanitize_retrieval_text(text).replace("\n", " ").strip()
+    if not cleaned:
+        return ""
+    for separator in ("。", "！", "？", ". "):
+        if separator in cleaned:
+            head = cleaned.split(separator, 1)[0].strip()
+            if head:
+                return head[:limit]
+    return cleaned[:limit]
+
 REVIEW_PROMPT_TEMPLATE = """请根据以下知识库检索内容，生成一份结构化的考点复习摘要。
 
 主题: {topic}
@@ -130,6 +147,39 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
         self._source_aware_search = SourceAwareSearch(hybrid_search=self._search)
         return self._source_aware_search
 
+    def _build_fast_summary(
+        self,
+        *,
+        topic: str,
+        results: list,
+        citations: list[dict[str, Any]],
+        weak_section: str,
+    ) -> str:
+        lines = [f"# {sanitize_user_input(topic, max_length=80)} 复习摘要", "", "## 核心概念"]
+        for index, result in enumerate(results[:3], start=1):
+            snippet = _extract_summary_snippet(getattr(result, "text", ""))
+            if not snippet:
+                continue
+            lines.append(f"- {snippet} `[{index}]`")
+        if len(lines) == 3:
+            lines.append("- 请结合原课件继续细化本节重点。")
+        lines.extend(
+            [
+                "",
+                "## 复习提示",
+                "- 先掌握定义、流程和易混点，再回看原课件核对细节。",
+            ]
+        )
+        if weak_section:
+            lines.append(f"- ⚠️ {weak_section}")
+        if citations:
+            lines.extend(["", "## 来源编号"])
+            for citation in citations[:4]:
+                lines.append(
+                    f"- [{citation.get('index', '?')}] {citation.get('source', '未知来源')}"
+                )
+        return "\n".join(lines).strip()
+
     async def execute(self, context: ToolContext, args: ReviewSummaryArgs) -> ToolResult:
         query_trace: TraceContext | None = None
         normalized_metadata: dict[str, Any] = {}
@@ -172,13 +222,15 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
 
         try:
             source_aware = self._ensure_source_aware_search()
+            top_k = 6 if _response_profile(context) == "balanced_fast" else 8
             if source_aware is not None:
                 normalized = await asyncio.to_thread(
                     source_aware.search,
                     query=args.topic,
                     task_intent="review_summary",
-                    top_k=8,
+                    top_k=top_k,
                     trace=query_trace,
+                    fast_mode=_response_profile(context) == "balanced_fast",
                 )
                 results = normalized.results
                 normalized_metadata = dict(normalized.routing_metadata)
@@ -186,8 +238,9 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
                 results = await asyncio.to_thread(
                     self._search.search,
                     query=args.topic,
-                    top_k=8,
+                    top_k=top_k,
                     trace=query_trace,
+                    fast_mode=_response_profile(context) == "balanced_fast",
                 )
         except Exception as exc:
             logger.exception("HybridSearch failed in ReviewSummaryTool")
@@ -202,6 +255,7 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
         citations: list[dict[str, Any]] = []
         evidence_summary = ""
         knowledge_text = ""
+        result_chars = 420 if _response_profile(context) == "balanced_fast" else 600
         if results:
             citations = [
                 citation.to_dict()
@@ -209,7 +263,7 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
             ]
             evidence_summary = build_evidence_summary(citations)
             knowledge_text = "\n\n".join(
-                f"[{i}] {sanitize_retrieval_text(r.text)[:600]}" for i, r in enumerate(results, 1)
+                f"[{i}] {sanitize_retrieval_text(r.text)[:result_chars]}" for i, r in enumerate(results, 1)
             )
         else:
             knowledge_text = _handoff_context_text(context)
@@ -263,6 +317,33 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
 
         chapter_line = f"章节: {sanitize_user_input(args.chapter, max_length=100)}" if args.chapter else ""
 
+        if _response_profile(context) == "balanced_fast":
+            fast_summary = self._build_fast_summary(
+                topic=args.topic,
+                results=results,
+                citations=citations,
+                weak_section=weak_section,
+            )
+            return ToolResult(
+                success=True,
+                result_for_llm=fast_summary,
+                metadata={
+                    "grounding_capable": True,
+                    "citations": citations,
+                    "evidence_summary": evidence_summary,
+                    "source_count": len(citations),
+                    "query_trace_id": query_trace.trace_id if query_trace is not None else "",
+                    "query_trace_ids": [query_trace.trace_id] if query_trace is not None else [],
+                    "final_response_preferred": True,
+                    "grounding_passthrough": True,
+                    "generation_mode": "review_summary_fast_path",
+                    "composite_parent_request_id": composite_parent_request_id if composite_mode else "",
+                    "composite_subtask_index": composite_subtask_index if composite_mode else -1,
+                    "composite_subtask_intent": composite_subtask_intent if composite_mode else "",
+                    **normalized_metadata,
+                },
+            )
+
         prompt = REVIEW_PROMPT_TEMPLATE.format(
             topic=sanitize_user_input(args.topic),
             chapter_line=chapter_line,
@@ -299,6 +380,7 @@ class ReviewSummaryTool(Tool[ReviewSummaryArgs]):
                     LlmMessage(role="user", content=prompt),
                 ],
                 temperature=0.3,
+                max_tokens=900 if _response_profile(context) == "balanced_fast" else None,
             )
             resp = await self._llm.send_request(req)
             if resp.error:

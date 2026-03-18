@@ -26,6 +26,7 @@ class AgentConfig(BaseModel):
     conversation_store_dir: str = "data/conversations"
     default_collection: str = "computer_network"
     auto_ingest_dir: str = ""
+    response_profile: str = Field(default="balanced_fast", pattern=r"^(balanced_fast|quality_first)$")
     rate_limit_rpm: int = Field(default=20, ge=1, le=1000)
 
 

@@ -31,7 +31,7 @@ _FOLLOWUP_ANYWHERE_RE = re.compile(
     re.IGNORECASE,
 )
 _FAST_QUERY_KEYWORDS_RE = re.compile(
-    r"(解释|讲解|说明|介绍|概述|简述|流程|为什么|原理|区别|对比|比较|是什么|讲讲|聊聊)",
+    r"(解释|讲解|说明|介绍|介绍一下|概述|简述|流程|为什么|原理|区别|对比|比较|是什么|讲讲|讲一下|说一下|聊聊)",
     re.IGNORECASE,
 )
 _SLOW_QUERY_HINT_RE = re.compile(
@@ -47,6 +47,11 @@ def _int_metadata(value: Any, default: int = -1) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _response_profile(context: ToolContext) -> str:
+    value = str(context.metadata.get("response_profile", "") or "").strip().lower()
+    return value if value in {"balanced_fast", "quality_first"} else "quality_first"
 
 
 class KnowledgeQueryArgs(BaseModel):
@@ -180,7 +185,8 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
             return False
         if len(recent_messages) > 1 and self._should_rewrite_query(normalized, recent_messages)[0]:
             return False
-        if _SLOW_QUERY_HINT_RE.search(normalized):
+        normalized_for_hints = normalized.replace("结合知识库", "").replace("结合课件", "").strip()
+        if _SLOW_QUERY_HINT_RE.search(normalized_for_hints):
             return False
         return bool(_FAST_QUERY_KEYWORDS_RE.search(normalized) or normalized.endswith(("?", "？")))
 
@@ -537,6 +543,14 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                 "query_trace_ids": query_trace_ids,
                 "fast_mode": fast_mode,
             }
+            if fast_mode and _response_profile(context) == "balanced_fast":
+                metadata.update(
+                    {
+                        "final_response_preferred": True,
+                        "grounding_passthrough": True,
+                        "generation_mode": "knowledge_query_extract",
+                    }
+                )
             metadata.update(normalized_metadata)
             if composite_mode:
                 metadata.update(

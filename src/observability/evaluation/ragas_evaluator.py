@@ -13,6 +13,8 @@ Design Principles:
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -166,30 +168,32 @@ class RagasEvaluator(BaseEvaluator):
         )
 
         # Build LLM / Embedding wrappers from settings
-        llm, embeddings = self._build_wrappers()
+        llm, embeddings, clients = self._build_wrappers()
+        try:
+            scores: Dict[str, float] = {}
 
-        scores: Dict[str, float] = {}
+            for metric_name in self._metric_names:
+                if metric_name == FAITHFULNESS:
+                    m = Faithfulness(llm=llm)
+                    result = m.score(
+                        user_input=query, response=answer, retrieved_contexts=contexts,
+                    )
+                elif metric_name == ANSWER_RELEVANCY:
+                    m = AnswerRelevancy(llm=llm, embeddings=embeddings)
+                    result = m.score(user_input=query, response=answer)
+                elif metric_name == CONTEXT_PRECISION:
+                    m = ContextPrecisionWithoutReference(llm=llm)
+                    result = m.score(
+                        user_input=query, response=answer, retrieved_contexts=contexts,
+                    )
+                else:
+                    continue
 
-        for metric_name in self._metric_names:
-            if metric_name == FAITHFULNESS:
-                m = Faithfulness(llm=llm)
-                result = m.score(
-                    user_input=query, response=answer, retrieved_contexts=contexts,
-                )
-            elif metric_name == ANSWER_RELEVANCY:
-                m = AnswerRelevancy(llm=llm, embeddings=embeddings)
-                result = m.score(user_input=query, response=answer)
-            elif metric_name == CONTEXT_PRECISION:
-                m = ContextPrecisionWithoutReference(llm=llm)
-                result = m.score(
-                    user_input=query, response=answer, retrieved_contexts=contexts,
-                )
-            else:
-                continue
+                scores[metric_name] = float(result.value) if result.value is not None else 0.0
 
-            scores[metric_name] = float(result.value) if result.value is not None else 0.0
-
-        return scores
+            return scores
+        finally:
+            self._close_clients(clients)
 
     def _build_wrappers(self) -> tuple:
         """Build Ragas LLM and Embedding wrappers from project settings.
@@ -212,21 +216,31 @@ class RagasEvaluator(BaseEvaluator):
         llm_cfg = self.settings.llm
         provider = llm_cfg.provider.lower()
 
+        llm_provider_for_ragas = "openai" if provider == "zhipu" else provider
+
         if provider == "azure":
             llm_client = AsyncAzureOpenAI(
                 api_key=llm_cfg.api_key,
                 azure_endpoint=llm_cfg.azure_endpoint,
                 api_version=llm_cfg.api_version or "2024-02-15-preview",
             )
-        elif provider == "openai":
-            llm_client = AsyncOpenAI(api_key=llm_cfg.api_key)
+        elif provider in {"openai", "zhipu"}:
+            client_kwargs = {"api_key": llm_cfg.api_key}
+            if llm_cfg.base_url:
+                client_kwargs["base_url"] = llm_cfg.base_url
+            llm_client = AsyncOpenAI(**client_kwargs)
         else:
             raise ValueError(
                 f"Unsupported LLM provider for Ragas: '{provider}'. "
-                "Supported: azure, openai"
+                "Supported: azure, openai, zhipu"
             )
 
-        llm = llm_factory(llm_cfg.model, client=llm_client, max_tokens=8192)
+        llm = llm_factory(
+            llm_cfg.model,
+            provider=llm_provider_for_ragas,
+            client=llm_client,
+            max_tokens=8192,
+        )
 
         # ── Embeddings ──
         emb_cfg = self.settings.embedding
@@ -238,17 +252,38 @@ class RagasEvaluator(BaseEvaluator):
                 azure_endpoint=emb_cfg.azure_endpoint,
                 api_version=emb_cfg.api_version or "2024-02-15-preview",
             )
-        elif emb_provider == "openai":
-            emb_client = AsyncOpenAI(api_key=emb_cfg.api_key)
+        elif emb_provider in {"openai", "zhipu"}:
+            emb_kwargs = {"api_key": emb_cfg.api_key}
+            if emb_cfg.base_url:
+                emb_kwargs["base_url"] = emb_cfg.base_url
+            emb_client = AsyncOpenAI(**emb_kwargs)
         else:
             raise ValueError(
                 f"Unsupported embedding provider for Ragas: '{emb_provider}'. "
-                "Supported: azure, openai"
+                "Supported: azure, openai, zhipu"
             )
 
         embeddings = OpenAIEmbeddings(model=emb_cfg.model, client=emb_client)
 
-        return llm, embeddings
+        return llm, embeddings, [llm_client, emb_client]
+
+    def _close_clients(self, clients: Sequence[Any]) -> None:
+        for client in clients:
+            close = getattr(client, "close", None)
+            if not callable(close):
+                continue
+            try:
+                result = close()
+                if inspect.isawaitable(result):
+                    try:
+                        asyncio.run(result)
+                    except RuntimeError:
+                        close_coro = getattr(result, "close", None)
+                        if callable(close_coro):
+                            close_coro()
+                        logger.debug("Skipping async client close inside running loop", exc_info=True)
+            except Exception:
+                logger.debug("Best-effort RAGAS client close failed", exc_info=True)
 
     def _extract_texts(self, chunks: List[Any]) -> List[str]:
         """Extract text strings from various chunk representations.

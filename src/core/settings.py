@@ -158,6 +158,8 @@ class RetrievalSettings:
     dedup_enabled: bool = True
     dedup_threshold: int = 3
     min_score: float = 0.0
+    post_rerank_min_score: float = 0.0
+    empty_result_fallback_enabled: bool = True
     post_dedup_enabled: bool = True
 
 
@@ -449,6 +451,12 @@ class Settings:
                 dedup_enabled=bool(retrieval.get("dedup_enabled", True)),
                 dedup_threshold=int(retrieval.get("dedup_threshold", 3)),
                 min_score=float(retrieval.get("min_score", 0.0)),
+                post_rerank_min_score=float(
+                    retrieval.get("post_rerank_min_score", retrieval.get("min_score", 0.0))
+                ),
+                empty_result_fallback_enabled=bool(
+                    retrieval.get("empty_result_fallback_enabled", True)
+                ),
                 post_dedup_enabled=bool(retrieval.get("post_dedup_enabled", True)),
             ),
             rerank=RerankSettings(

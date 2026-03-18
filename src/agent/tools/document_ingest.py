@@ -155,6 +155,9 @@ class DocumentIngestTool(Tool[DocumentIngestArgs]):
                         "status": "queued",
                         "doc_id": file_hash,
                         "object_uri": object_uri,
+                        "final_response_preferred": True,
+                        "grounding_passthrough": True,
+                        "generation_mode": "direct_passthrough",
                     },
                 )
             except Exception:
@@ -238,6 +241,9 @@ class DocumentIngestTool(Tool[DocumentIngestArgs]):
                         "task_id": task_id,
                         "status": "succeeded",
                         "object_uri": object_uri,
+                        "final_response_preferred": True,
+                        "grounding_passthrough": True,
+                        "generation_mode": "direct_passthrough",
                     },
                 )
             else:

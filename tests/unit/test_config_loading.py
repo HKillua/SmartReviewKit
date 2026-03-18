@@ -75,6 +75,8 @@ def test_load_settings_success(tmp_path: Path) -> None:
     assert settings.grounding.low_evidence_threshold == 0.4
     assert settings.retrieval.query_rewrite_policy == "followup_only"
     assert settings.retrieval.query_rewrite_enabled is True
+    assert settings.retrieval.post_rerank_min_score == 0.0
+    assert settings.retrieval.empty_result_fallback_enabled is True
 
 
 def test_missing_required_field_raises_error(tmp_path: Path) -> None:
@@ -298,3 +300,52 @@ def test_load_settings_with_query_rewrite_policy_and_grounding_overrides(tmp_pat
     assert settings.retrieval.query_rewrite_enabled is True
     assert settings.grounding.mode == "strict"
     assert settings.grounding.low_evidence_threshold == 0.55
+
+
+def test_load_settings_with_post_rerank_threshold_and_empty_result_fallback(tmp_path: Path) -> None:
+    config = """
+    llm:
+      provider: openai
+      model: gpt-4o-mini
+      temperature: 0.0
+      max_tokens: 1024
+    embedding:
+      provider: openai
+      model: text-embedding-3-small
+      dimensions: 1536
+    vector_store:
+      provider: chroma
+      persist_directory: ./data/db/chroma
+      collection_name: knowledge_hub
+    retrieval:
+      dense_top_k: 20
+      sparse_top_k: 20
+      fusion_top_k: 10
+      rrf_k: 60
+      min_score: 0.15
+      post_rerank_min_score: 0.33
+      empty_result_fallback_enabled: false
+    rerank:
+      enabled: false
+      provider: none
+      model: cross-encoder/ms-marco-MiniLM-L-6-v2
+      top_k: 5
+    evaluation:
+      enabled: false
+      provider: custom
+      metrics:
+        - hit_rate
+    observability:
+      log_level: INFO
+      trace_enabled: true
+      trace_file: ./logs/traces.jsonl
+      structured_logging: true
+    """
+    settings_path = tmp_path / "settings.yaml"
+    _write_yaml(settings_path, config)
+
+    settings = load_settings(settings_path)
+
+    assert settings.retrieval.min_score == 0.15
+    assert settings.retrieval.post_rerank_min_score == 0.33
+    assert settings.retrieval.empty_result_fallback_enabled is False

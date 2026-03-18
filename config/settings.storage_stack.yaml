@@ -129,7 +129,9 @@ retrieval:
   embedding_cache_size: 4096
   dedup_enabled: true           # 入库阶段 SimHash 去重
   dedup_threshold: 3
-  min_score: 0.15              # N13: 最低相关度阈值，过滤低质量结果
+  min_score: 0.15              # 兼容旧配置，仅映射到 rerank 后阈值
+  post_rerank_min_score: 0.15  # 仅在 Cross-Encoder rerank 后使用的最低相关度阈值
+  empty_result_fallback_enabled: true
   post_dedup_enabled: true     # N13: 检索后语义去重
 
 # =============================================================================
@@ -210,6 +212,7 @@ agent:
   conversation_store_dir: "data/conversations"
   default_collection: "computer_network"
   auto_ingest_dir: "docs/computer_internet"  # startup auto-ingest directory
+  response_profile: "balanced_fast"
 
 # =============================================================================
 # Server Configuration

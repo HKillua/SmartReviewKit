@@ -182,9 +182,22 @@ class OpenAIVisionLLM(BaseVisionLLM):
 
         img = Image.open(io.BytesIO(image_bytes))
         
-        # Convert unsupported formats (e.g. GIF, WMF) to RGB for saving as JPEG/PNG
-        if img.format in ('GIF', 'WMF') or img.mode not in ('RGB', 'RGBA'):
-            img = img.convert('RGB')
+        # Normalize image mode before saving to JPEG.
+        # RGBA/LA/P-mode images can carry transparency, which Pillow cannot write
+        # directly as JPEG. Composite them onto a white background first so PPTX/PDF
+        # extracted slide images remain captionable instead of failing hard.
+        if img.mode in ("RGBA", "LA"):
+            background = Image.new("RGB", img.size, (255, 255, 255))
+            alpha = img.getchannel("A") if "A" in img.getbands() else None
+            background.paste(img.convert("RGBA"), mask=alpha)
+            img = background
+        elif img.mode == "P" and "transparency" in img.info:
+            rgba = img.convert("RGBA")
+            background = Image.new("RGB", rgba.size, (255, 255, 255))
+            background.paste(rgba, mask=rgba.getchannel("A"))
+            img = background
+        elif img.format in ("GIF", "WMF") or img.mode != "RGB":
+            img = img.convert("RGB")
             
         w, h = img.size
         max_w, max_h = max_size

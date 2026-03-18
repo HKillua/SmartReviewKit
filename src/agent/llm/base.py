@@ -26,6 +26,10 @@ class LlmService(ABC):
         ...
         yield  # pragma: no cover — makes this a valid async generator stub
 
+    async def close(self) -> None:
+        """Release provider resources if the implementation keeps any."""
+        return None
+
     def validate_tools(self, tools: list[dict]) -> list[str]:
         """Validate tool schemas for provider compatibility.
 

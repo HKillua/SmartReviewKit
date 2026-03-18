@@ -445,6 +445,16 @@ class AgentEvalRunner:
         if not results:
             return {}
 
+        def _intent_of(result: AgentEvalCaseResult) -> str:
+            return result.expected_planner_intent or result.actual_planner_intent
+
+        def _avg_latency(filtered: List[AgentEvalCaseResult]) -> float:
+            return (
+                sum(result.elapsed_ms for result in filtered) / len(filtered)
+                if filtered
+                else 0.0
+            )
+
         success_rate = sum(result.metrics.get("success", 0.0) for result in results) / len(results)
         expected_tool_recall = sum(
             result.metrics.get("expected_tool_recall", 0.0) for result in results
@@ -495,6 +505,17 @@ class AgentEvalRunner:
         avg_tool_calls = sum(len(result.actual_tool_chain) for result in results) / len(results)
         avg_iterations = sum(result.iterations for result in results) / len(results)
         avg_latency_ms = sum(result.elapsed_ms for result in results) / len(results)
+        knowledge_results = [
+            result for result in results if _intent_of(result) == "knowledge_query"
+        ]
+        heavy_results = [
+            result
+            for result in results
+            if _intent_of(result) in {"review_summary", "quiz_generator", "quiz_evaluator"}
+        ]
+        document_ingest_results = [
+            result for result in results if _intent_of(result) == "document_ingest"
+        ]
 
         return {
             "success_rate": success_rate,
@@ -515,4 +536,7 @@ class AgentEvalRunner:
             "avg_tool_calls": avg_tool_calls,
             "avg_iterations": avg_iterations,
             "avg_latency_ms": avg_latency_ms,
+            "knowledge_query_latency_ms": _avg_latency(knowledge_results),
+            "heavy_task_latency_ms": _avg_latency(heavy_results),
+            "document_ingest_latency_ms": _avg_latency(document_ingest_results),
         }

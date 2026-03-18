@@ -8,6 +8,8 @@ and embedding-2 (1024 dims).
 from __future__ import annotations
 
 import os
+import re
+import unicodedata
 from typing import Any, List, Optional
 
 from src.libs.embedding.base_embedding import BaseEmbedding
@@ -31,6 +33,7 @@ class ZhipuEmbedding(BaseEmbedding):
     """
 
     DEFAULT_BASE_URL = "https://open.bigmodel.cn/api/paas/v4/"
+    MAX_INPUT_CHARS = 6000
 
     def __init__(
         self,
@@ -93,7 +96,8 @@ class ZhipuEmbedding(BaseEmbedding):
             ValueError: If texts list is empty or contains invalid entries.
             ZhipuEmbeddingError: If API call fails.
         """
-        self.validate_texts(texts)
+        sanitized_texts = [self._sanitize_text(text) for text in texts]
+        self.validate_texts(sanitized_texts)
 
         try:
             from openai import OpenAI
@@ -107,7 +111,7 @@ class ZhipuEmbedding(BaseEmbedding):
 
         # Build API params
         api_params: dict[str, Any] = {
-            "input": texts,
+            "input": sanitized_texts,
             "model": self.model,
         }
 
@@ -131,12 +135,27 @@ class ZhipuEmbedding(BaseEmbedding):
                 f"Failed to parse ZhiPu Embeddings API response: {e}"
             ) from e
 
-        if len(embeddings) != len(texts):
+        if len(embeddings) != len(sanitized_texts):
             raise ZhipuEmbeddingError(
-                f"Output length mismatch: expected {len(texts)}, got {len(embeddings)}"
+                f"Output length mismatch: expected {len(sanitized_texts)}, got {len(embeddings)}"
             )
 
         return embeddings
+
+    @staticmethod
+    def _sanitize_text(text: str) -> str:
+        normalized = unicodedata.normalize("NFKC", text or "")
+        normalized = normalized.replace("\u0000", " ").replace("\u00a0", " ")
+        cleaned = "".join(
+            ch if ch in "\n\r\t" or unicodedata.category(ch)[0] != "C" else " "
+            for ch in normalized
+        )
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        cleaned = cleaned.strip()
+        if len(cleaned) > ZhipuEmbedding.MAX_INPUT_CHARS:
+            cleaned = cleaned[: ZhipuEmbedding.MAX_INPUT_CHARS].rstrip()
+        return cleaned or " "
 
     def get_dimension(self) -> Optional[int]:
         """Get the embedding dimension for the configured model."""

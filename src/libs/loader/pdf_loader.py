@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+from functools import cached_property
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -19,6 +20,12 @@ try:
     PYMUPDF_AVAILABLE = True
 except ImportError:
     PYMUPDF_AVAILABLE = False
+
+try:
+    from rapidocr_onnxruntime import RapidOCR
+    RAPIDOCR_AVAILABLE = True
+except ImportError:
+    RAPIDOCR_AVAILABLE = False
 
 from PIL import Image
 import io
@@ -55,7 +62,7 @@ def _infer_content_type(text: str) -> str:
 
 
 class PdfLoader(BaseLoader):
-    """PDF Loader using MarkItDown with math post-processing and structure detection."""
+    """PDF Loader using MarkItDown with OCR fallback for scanned textbooks."""
 
     def __init__(
         self,
@@ -83,6 +90,24 @@ class PdfLoader(BaseLoader):
             logger.error(f"Failed to parse PDF {path}: {e}")
             raise RuntimeError(f"PDF parsing failed: {e}") from e
 
+        used_ocr_fallback = False
+
+        # MarkItDown occasionally returns near-empty output on textbook PDFs.
+        # When that happens and PyMuPDF is available, fall back to direct page
+        # text extraction so production ingestion does not fail with zero-text
+        # documents.
+        if not text_content or not text_content.strip():
+            fallback_text = self._extract_text_with_pymupdf(path)
+            if fallback_text:
+                logger.info("PDF text fallback via PyMuPDF succeeded for %s", path)
+                text_content = fallback_text
+            else:
+                ocr_text = self._extract_text_with_rapidocr(path)
+                if ocr_text:
+                    logger.info("PDF text fallback via RapidOCR succeeded for %s", path)
+                    text_content = ocr_text
+                    used_ocr_fallback = True
+
         # Math post-processing
         text_content = postprocess_math(text_content)
 
@@ -90,6 +115,7 @@ class PdfLoader(BaseLoader):
             "source_path": str(path),
             "doc_type": "pdf",
             "doc_hash": doc_hash,
+            "ocr_fallback_used": used_ocr_fallback,
         }
 
         title = self._extract_title(text_content)
@@ -97,7 +123,7 @@ class PdfLoader(BaseLoader):
             metadata["title"] = title
 
         # Image extraction
-        if self.extract_images:
+        if self.extract_images and not used_ocr_fallback:
             try:
                 text_content, images_metadata = self._extract_and_process_images(
                     path, text_content, doc_hash
@@ -106,6 +132,10 @@ class PdfLoader(BaseLoader):
             except Exception as e:
                 logger.warning(f"Image extraction failed for {path}, continuing text-only: {e}")
                 metadata["images"] = []
+        elif used_ocr_fallback:
+            # Scanned PDFs are page-image based; extracting those images would
+            # only trigger redundant captioning work on the page backgrounds.
+            metadata["images"] = []
 
         # Structure detection → sections
         sections = self._detect_sections(text_content)
@@ -260,10 +290,75 @@ class PdfLoader(BaseLoader):
                         suffix = "\n" + "\n".join(page_placeholders) + "\n"
                         modified_text += suffix
 
-            if images_metadata:
-                logger.info(f"Extracted {len(images_metadata)} images from {pdf_path}")
-            return modified_text, images_metadata
-
         except Exception as e:
             logger.warning(f"Image extraction failed for {pdf_path}: {e}")
             return text_content, []
+
+        if images_metadata:
+            logger.info(f"Extracted {len(images_metadata)} images from {pdf_path}")
+        return modified_text, images_metadata
+
+    def _extract_text_with_pymupdf(self, pdf_path: Path) -> str:
+        if not PYMUPDF_AVAILABLE:
+            return ""
+        pages: list[str] = []
+        try:
+            with fitz.open(pdf_path) as doc:
+                for page_num, page in enumerate(doc, start=1):
+                    page_text = (page.get_text("text") or "").strip()
+                    if not page_text:
+                        continue
+                    pages.append(f"\n--- Page {page_num} ---\n{page_text}\n")
+        except Exception as exc:
+            logger.warning("PyMuPDF text fallback failed for %s: %s", pdf_path, exc)
+            return ""
+        return "\n".join(pages).strip()
+
+    @cached_property
+    def _rapidocr(self) -> Any | None:
+        if not RAPIDOCR_AVAILABLE:
+            return None
+        try:
+            return RapidOCR()
+        except Exception as exc:
+            logger.warning("RapidOCR initialization failed: %s", exc)
+            return None
+
+    def _extract_text_with_rapidocr(self, pdf_path: Path) -> str:
+        if not PYMUPDF_AVAILABLE:
+            return ""
+        ocr_engine = self._rapidocr
+        if ocr_engine is None:
+            return ""
+
+        pages: list[str] = []
+        try:
+            with fitz.open(pdf_path) as doc:
+                total_pages = len(doc)
+                for page_num, page in enumerate(doc, start=1):
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                    image_bytes = pix.tobytes("png")
+                    try:
+                        result, _ = ocr_engine(image_bytes)
+                    except Exception as exc:
+                        logger.warning("RapidOCR failed on %s page %d: %s", pdf_path.name, page_num, exc)
+                        continue
+
+                    lines = [
+                        str(item[1]).strip()
+                        for item in (result or [])
+                        if isinstance(item, (list, tuple)) and len(item) >= 2 and str(item[1]).strip()
+                    ]
+                    if lines:
+                        pages.append(f"\n--- Page {page_num} ---\n" + "\n".join(lines) + "\n")
+                    if page_num % 20 == 0 or page_num == total_pages:
+                        logger.info(
+                            "RapidOCR progress for %s: %d/%d pages",
+                            pdf_path.name,
+                            page_num,
+                            total_pages,
+                        )
+        except Exception as exc:
+            logger.warning("RapidOCR text fallback failed for %s: %s", pdf_path, exc)
+            return ""
+        return "\n".join(pages).strip()

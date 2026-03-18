@@ -11,6 +11,7 @@ class _FakeMilvusDeleteClient:
         self.deleted_ids = []
         self.flushed = []
         self.loaded = []
+        self.states = {}
 
     def has_collection(self, name: str) -> bool:
         return True
@@ -18,8 +19,12 @@ class _FakeMilvusDeleteClient:
     def list_indexes(self, name: str):
         return ["vector_idx"]
 
-    def load_collection(self, collection_name: str) -> None:
+    def get_load_state(self, collection_name: str):
+        return {"state": self.states.get(collection_name, "NotLoad")}
+
+    def load_collection(self, collection_name: str, timeout=None) -> None:
         self.loaded.append(collection_name)
+        self.states[collection_name] = "Loaded"
 
     def query(self, **kwargs):
         return [{"id": "chunk-1"}]

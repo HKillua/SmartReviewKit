@@ -166,3 +166,8 @@ class OpenAILlmService(LlmService):
         except Exception as exc:
             logger.exception("LLM stream failed")
             yield LlmStreamChunk(finish_reason="error")
+
+    async def close(self) -> None:
+        close = getattr(self._client, "close", None)
+        if callable(close):
+            await close()

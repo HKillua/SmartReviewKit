@@ -77,6 +77,8 @@ class HybridSearchConfig:
     mmr_enabled: bool = False
     mmr_lambda: float = 0.7
     min_score: float = 0.0
+    post_rerank_min_score: float = 0.0
+    empty_result_fallback_enabled: bool = True
     post_dedup_enabled: bool = True
 
 
@@ -210,6 +212,16 @@ class HybridSearch:
             mmr_enabled=getattr(retrieval_config, 'mmr_enabled', False),
             mmr_lambda=getattr(retrieval_config, 'mmr_lambda', 0.7),
             min_score=getattr(retrieval_config, 'min_score', 0.0),
+            post_rerank_min_score=getattr(
+                retrieval_config,
+                'post_rerank_min_score',
+                getattr(retrieval_config, 'min_score', 0.0),
+            ),
+            empty_result_fallback_enabled=getattr(
+                retrieval_config,
+                'empty_result_fallback_enabled',
+                True,
+            ),
             post_dedup_enabled=getattr(retrieval_config, 'post_dedup_enabled', True),
         )
     
@@ -322,22 +334,65 @@ class HybridSearch:
                     },
                 )
         
+        pre_postprocess_results = list(fused_results)
+
         # Step 6: Reranker (if enabled and available)
-        if rerank_enabled and self.reranker is not None:
+        rerank_applied = rerank_enabled and self.reranker is not None
+        if rerank_applied:
             fused_results = self._apply_reranker(query, fused_results, trace)
 
         # Step 7: MMR diversity (if enabled)
         if mmr_enabled and self.embedding_client is not None and fused_results:
             fused_results = self._apply_mmr(query, fused_results, effective_top_k, trace)
-        
+
+        pre_filter_results = list(fused_results)
+
         # Step 8: Min score filtering
-        if self.config.min_score > 0:
-            fused_results = [r for r in fused_results if r.score >= self.config.min_score]
-        
+        if rerank_applied and self.config.post_rerank_min_score > 0:
+            fused_results = [
+                r for r in fused_results
+                if r.score >= self.config.post_rerank_min_score
+            ]
+
         # Step 9: Post-retrieval semantic dedup
         if self.config.post_dedup_enabled and len(fused_results) > 1:
             fused_results = self._apply_post_dedup(fused_results)
-        
+
+        if (
+            not fused_results
+            and self.config.empty_result_fallback_enabled
+            and pre_filter_results
+        ):
+            fused_results = pre_filter_results
+            if trace is not None:
+                trace.record_stage(
+                    "empty_result_fallback",
+                    {
+                        "reason": "post_filtering_cleared_results",
+                        "fallback_count": len(fused_results),
+                        "rerank_applied": rerank_applied,
+                        "post_rerank_min_score": self.config.post_rerank_min_score,
+                        "post_dedup_enabled": self.config.post_dedup_enabled,
+                    },
+                )
+        elif (
+            not fused_results
+            and self.config.empty_result_fallback_enabled
+            and pre_postprocess_results
+        ):
+            fused_results = pre_postprocess_results
+            if trace is not None:
+                trace.record_stage(
+                    "empty_result_fallback",
+                    {
+                        "reason": "post_rerank_pipeline_empty",
+                        "fallback_count": len(fused_results),
+                        "rerank_applied": rerank_applied,
+                        "post_rerank_min_score": self.config.post_rerank_min_score,
+                        "post_dedup_enabled": self.config.post_dedup_enabled,
+                    },
+                )
+
         # Step 10: Limit to top_k
         final_results = fused_results[:effective_top_k]
 
@@ -351,11 +406,12 @@ class HybridSearch:
                 "score_max": round(max(scores), 4),
                 "score_min": round(min(scores), 4),
                 "score_mean": round(sum(scores) / len(scores), 4),
-                "reranker_used": rerank_enabled and self.reranker is not None,
+                "reranker_used": rerank_applied,
                 "mmr_used": mmr_enabled,
                 "dedup_used": self.config.post_dedup_enabled,
                 "fast_mode": fast_mode,
                 "pipeline": "dense+sparse+rrf",
+                "post_rerank_min_score": self.config.post_rerank_min_score,
             }, elapsed_ms=(time.monotonic() - _t0_summary) * 1000.0)
         
         logger.debug(f"HybridSearch: returning {len(final_results)} results")

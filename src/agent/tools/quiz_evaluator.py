@@ -60,6 +60,22 @@ def _int_metadata(value: Any, default: int = -1) -> int:
     except (TypeError, ValueError):
         return default
 
+
+def _response_profile(context: ToolContext) -> str:
+    value = str(context.metadata.get("response_profile", "") or "").strip().lower()
+    return value if value in {"balanced_fast", "quality_first"} else "quality_first"
+
+
+def _evidence_brief(citations: list[dict[str, Any]], *, limit: int = 2) -> str:
+    lines: list[str] = []
+    for citation in citations[:limit]:
+        snippet = str(citation.get("text_snippet", "") or "").replace("\n", " ").strip()
+        source = str(citation.get("source", "未知来源") or "未知来源")
+        index = citation.get("index", "?")
+        if snippet:
+            lines.append(f"- [{index}] {source}: {snippet[:120]}")
+    return "\n".join(lines)
+
 EVAL_PROMPT_TEMPLATE = """请评判以下题目的用户答案。
 
 题目类型: {question_type}
@@ -149,6 +165,7 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
         return self._source_aware_search
 
     async def execute(self, context: ToolContext, args: QuizEvaluatorArgs) -> ToolResult:
+        response_profile = _response_profile(context)
         composite_mode = bool(context.metadata.get("composite_mode", False))
         composite_parent_request_id = str(
             context.metadata.get("composite_parent_request_id", "") or ""
@@ -204,14 +221,21 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
                     LlmMessage(role="user", content=prompt),
                 ],
                 temperature=0.1,
+                max_tokens=320 if response_profile == "balanced_fast" else None,
             )
-            resp = await self._llm.send_request(req)
-            if resp.error:
-                return ToolResult(success=False, error=f"评判失败: {resp.error}")
+            try:
+                if response_profile == "balanced_fast":
+                    resp = await asyncio.wait_for(self._llm.send_request(req), timeout=12.0)
+                else:
+                    resp = await self._llm.send_request(req)
+            except TimeoutError:
+                resp = None
+            if resp is not None and resp.error:
+                resp = None
 
-            result = safe_parse_json(resp.content or "")
+            result = safe_parse_json(resp.content or "") if resp is not None else None
             if result is None:
-                result = {"verdict": "unknown", "explanation": resp.content, "key_concepts": []}
+                result = self._fallback_result(args)
 
             verdict = result.get("verdict", "unknown").lower().strip()
             result["verdict"] = verdict
@@ -234,14 +258,27 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
                     for citation in self._citation_generator.generate(evidence_results)
                 ]
                 evidence_summary = build_evidence_summary(citations)
-                enhanced = await self._enhance_explanation_with_evidence(
-                    args=args,
+                enhanced = ""
+                if self._should_enhance_explanation(
+                    response_profile=response_profile,
                     verdict=verdict,
-                    score=result.get("score"),
                     base_explanation=explanation,
-                    key_concepts=concepts,
-                    evidence_summary=evidence_summary,
-                )
+                ):
+                    if response_profile == "balanced_fast":
+                        enhanced = self._build_fast_evidence_explanation(
+                            base_explanation=explanation,
+                            citations=citations,
+                        )
+                    else:
+                        enhanced = await self._enhance_explanation_with_evidence(
+                            args=args,
+                            verdict=verdict,
+                            score=result.get("score"),
+                            base_explanation=explanation,
+                            key_concepts=concepts,
+                            evidence_summary=evidence_summary,
+                            response_profile=response_profile,
+                        )
                 if enhanced:
                     explanation = enhanced
                     evaluation_mode = "evidence_enhanced"
@@ -250,14 +287,27 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
                 if handoff_summary:
                     citations = _handoff_citations(context)
                     evidence_summary = handoff_summary
-                    enhanced = await self._enhance_explanation_with_evidence(
-                        args=args,
+                    enhanced = ""
+                    if self._should_enhance_explanation(
+                        response_profile=response_profile,
                         verdict=verdict,
-                        score=result.get("score"),
                         base_explanation=explanation,
-                        key_concepts=concepts,
-                        evidence_summary=evidence_summary,
-                    )
+                    ):
+                        if response_profile == "balanced_fast":
+                            enhanced = self._build_fast_evidence_explanation(
+                                base_explanation=explanation,
+                                citations=citations,
+                            )
+                        else:
+                            enhanced = await self._enhance_explanation_with_evidence(
+                                args=args,
+                                verdict=verdict,
+                                score=result.get("score"),
+                                base_explanation=explanation,
+                                key_concepts=concepts,
+                                evidence_summary=evidence_summary,
+                                response_profile=response_profile,
+                            )
                     if enhanced:
                         explanation = enhanced
                         evaluation_mode = "handoff_evidence_enhanced"
@@ -298,6 +348,43 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
             logger.exception("QuizEvaluatorTool failed")
             return ToolResult(success=False, error=f"评判异常: {exc}")
 
+    @staticmethod
+    def _fallback_result(args: QuizEvaluatorArgs) -> dict[str, Any]:
+        user_answer = " ".join((args.user_answer or "").split())
+        correct_answer = " ".join((args.correct_answer or "").split())
+        if not user_answer:
+            return {
+                "verdict": "incorrect",
+                "score": 0,
+                "explanation": "未提供有效作答内容，无法给分。",
+                "key_concepts": list(args.concepts or []),
+            }
+        if correct_answer and user_answer.lower() == correct_answer.lower():
+            return {
+                "verdict": "correct",
+                "score": 100,
+                "explanation": "答案与标准答案一致。",
+                "key_concepts": list(args.concepts or []),
+            }
+        return {
+            "verdict": "partial",
+            "score": 60,
+            "explanation": "答案包含部分合理要点，但仍缺少更完整的课程依据和关键细节。",
+            "key_concepts": list(args.concepts or []),
+        }
+
+    @staticmethod
+    def _build_fast_evidence_explanation(
+        *,
+        base_explanation: str,
+        citations: list[dict[str, Any]],
+    ) -> str:
+        normalized = (base_explanation or "").strip() or "已结合课程证据补充本题解析。"
+        brief = _evidence_brief(citations)
+        if not brief:
+            return normalized
+        return f"{normalized}\n\n课程证据：\n{brief}"
+
     async def _retrieve_supporting_evidence(
         self,
         context: ToolContext,
@@ -312,12 +399,13 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
         if not search_query:
             return [], None
         query_trace: TraceContext | None = None
+        top_k = 3 if _response_profile(context) == "balanced_fast" else 4
         if self._trace_enabled and self._trace_collector is not None:
             query_trace = TraceContext(trace_type="query")
             query_trace.metadata.update(
                 {
                     "query": search_query[:200],
-                    "top_k": 4,
+                    "top_k": top_k,
                     "collection": _collection_name(self._search),
                     "source": "quiz_evaluator",
                     "parent_agent_trace_id": context.metadata.get("agent_trace_id", ""),
@@ -350,8 +438,9 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
                     source_aware.search,
                     query=search_query,
                     task_intent="quiz_evaluator",
-                    top_k=4,
+                    top_k=top_k,
                     trace=query_trace,
+                    fast_mode=_response_profile(context) == "balanced_fast",
                 )
                 result_list = list(normalized.results)
                 if query_trace is not None:
@@ -360,8 +449,9 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
                 results = await asyncio.to_thread(
                     self._search.search,
                     query=search_query,
-                    top_k=4,
+                    top_k=top_k,
                     trace=query_trace,
+                    fast_mode=_response_profile(context) == "balanced_fast",
                 )
                 result_list = results if isinstance(results, list) else []
             if query_trace is not None:
@@ -387,6 +477,7 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
         base_explanation: str,
         key_concepts: list[str],
         evidence_summary: str,
+        response_profile: str = "quality_first",
     ) -> str:
         if self._llm is None or not evidence_summary:
             return ""
@@ -409,6 +500,7 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
                     LlmMessage(role="user", content=prompt),
                 ],
                 temperature=0.2,
+                max_tokens=700 if response_profile == "balanced_fast" else None,
             )
             resp = await self._llm.send_request(req)
             if resp.error:
@@ -417,6 +509,20 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
         except Exception:
             logger.warning("QuizEvaluator evidence enhancement failed", exc_info=True)
             return ""
+
+    @staticmethod
+    def _should_enhance_explanation(
+        *,
+        response_profile: str,
+        verdict: str,
+        base_explanation: str,
+    ) -> bool:
+        if response_profile != "balanced_fast":
+            return True
+        normalized = " ".join((base_explanation or "").split())
+        if verdict != "correct":
+            return True
+        return len(normalized) < 120
 
     async def _update_memory(
         self, context: ToolContext, args: QuizEvaluatorArgs, result: dict, is_correct: bool

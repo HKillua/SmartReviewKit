@@ -28,6 +28,7 @@ IMAGE_PLACEHOLDER_PATTERN = re.compile(r'\[IMAGE:\s*([^\]]+)\]')
 
 # Default max parallel workers for Vision API calls
 DEFAULT_MAX_WORKERS = 3  # Lower than text LLM due to higher cost/latency
+_UNSUPPORTED_IMAGE_SUFFIXES = {".wmf", ".emf", ".x-wmf", ".x-emf"}
 
 
 class ImageCaptioner(BaseTransform):
@@ -114,7 +115,10 @@ class ImageCaptioner(BaseTransform):
         if not img_path or not Path(img_path).exists():
             logger.warning(f"Image path not found: {img_path}")
             return None
-        
+        if Path(img_path).suffix.lower() in _UNSUPPORTED_IMAGE_SUFFIXES:
+            logger.info("Skipping unsupported image format for captioning: %s", img_path)
+            return None
+
         try:
             image_input = ImageInput(path=img_path)
             response = self.llm.chat_with_image(

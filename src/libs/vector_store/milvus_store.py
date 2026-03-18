@@ -46,6 +46,7 @@ class MilvusStore(BaseVectorStore):
         self.requested_collection_name = str(requested_collection_name or "knowledge_hub")
         self.collection_name = self._normalize_collection_name(self.requested_collection_name)
         self._collection_aliases: Dict[str, str] = {self.collection_name: self.requested_collection_name}
+        self._loaded_collections: set[str] = set()
         if self.collection_name != self.requested_collection_name:
             logger.info(
                 "Normalized Milvus collection name '%s' -> '%s'",
@@ -55,6 +56,7 @@ class MilvusStore(BaseVectorStore):
 
         milvus_cfg = getattr(settings, "milvus", None)
         self._dim = int(getattr(milvus_cfg, "dim", _DEFAULT_DIM))
+        self._load_timeout_s = float(getattr(milvus_cfg, "load_timeout_s", 30.0))
         mode = getattr(milvus_cfg, "mode", "lite")
 
         from src.core.settings import resolve_path
@@ -144,7 +146,30 @@ class MilvusStore(BaseVectorStore):
         )
 
     def _ensure_loaded(self, name: Optional[str] = None) -> None:
-        self.client.load_collection(collection_name=name or self.collection_name)
+        collection_name = name or self.collection_name
+        if collection_name in self._loaded_collections:
+            return
+        try:
+            state = self.client.get_load_state(collection_name)
+        except Exception:
+            state = {}
+        if self._is_loaded_state(state):
+            self._loaded_collections.add(collection_name)
+            return
+        self.client.load_collection(
+            collection_name=collection_name,
+            timeout=self._load_timeout_s,
+        )
+        self._loaded_collections.add(collection_name)
+
+    @staticmethod
+    def _is_loaded_state(state: Any) -> bool:
+        if not isinstance(state, dict):
+            return False
+        value = state.get("state")
+        if value is None:
+            return False
+        return str(value).endswith("Loaded")
 
     def _build_schema(self) -> CollectionSchema:
         fields = [
@@ -281,6 +306,7 @@ class MilvusStore(BaseVectorStore):
         name = self._normalize_collection_name(requested)
         if self.client.has_collection(name):
             self.client.drop_collection(name)
+            self._loaded_collections.discard(name)
         self._ensure_collection(name)
         self._ensure_loaded(name)
         self.collection_name = name

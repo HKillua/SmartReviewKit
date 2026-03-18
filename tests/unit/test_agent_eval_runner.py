@@ -134,6 +134,9 @@ async def test_agent_eval_runner_reconstructs_case_outputs(tmp_path: Path) -> No
     assert report.aggregate_metrics["citation_presence_rate"] == 1.0
     assert report.aggregate_metrics["evaluation_mode_hit_rate"] == 1.0
     assert report.aggregate_metrics["avg_iterations"] == 2.0
+    assert report.aggregate_metrics["knowledge_query_latency_ms"] > 0.0
+    assert report.aggregate_metrics["heavy_task_latency_ms"] == 0.0
+    assert report.aggregate_metrics["document_ingest_latency_ms"] == 0.0
 
 
 def test_agent_eval_report_to_dict_contains_agent_fields() -> None:

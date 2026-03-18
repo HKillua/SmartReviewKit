@@ -46,6 +46,11 @@ def _handoff_citations(context: ToolContext) -> list[dict[str, Any]]:
         return [dict(citation) for citation in latest if isinstance(citation, dict)]
     return []
 
+
+def _response_profile(context: ToolContext) -> str:
+    value = str(context.metadata.get("response_profile", "") or "").strip().lower()
+    return value if value in {"balanced_fast", "quality_first"} else "quality_first"
+
 QUIZ_PROMPT_TEMPLATE = """请根据以下知识内容，生成 {count} 道{question_type}，难度级别 {difficulty}/5。
 
 知识内容:
@@ -64,6 +69,22 @@ QUIZ_PROMPT_TEMPLATE = """请根据以下知识内容，生成 {count} 道{quest
    - 涉及的核心原理或概念
 
 请输出 JSON 数组（不要有多余文本）："""
+
+FAST_QUIZ_PROMPT_TEMPLATE = """请根据以下课程证据，生成 {count} 道{question_type}，难度级别 {difficulty}/5。
+
+知识内容:
+{context}
+
+{weak_points_hint}
+
+要求:
+1. 每道题用 JSON 对象表示，字段为: question, options (选择题才需要), answer, explanation, concepts
+2. 所有题目放在一个 JSON 数组中
+3. explanation 保持精炼，1-2 句话说明考查点即可
+4. concepts 只保留最核心的 1-3 个知识点
+5. 题目尽量短、聚焦，不要生成过长题干
+
+请直接输出 JSON 数组："""
 
 
 def _format_questions(questions: list[dict], question_type: str) -> str:
@@ -100,6 +121,18 @@ def _format_questions(questions: list[dict], question_type: str) -> str:
 
     header = f"以下是 {len(questions)} 道{question_type}：\n"
     return header + "\n".join(parts)
+
+
+def _extract_quiz_snippet(text: str, *, limit: int = 90) -> str:
+    cleaned = sanitize_retrieval_text(text).replace("\n", " ").strip()
+    if not cleaned:
+        return ""
+    for separator in ("。", "！", "？", ". "):
+        if separator in cleaned:
+            head = cleaned.split(separator, 1)[0].strip()
+            if head:
+                return head[:limit]
+    return cleaned[:limit]
 
 
 class QuizGeneratorArgs(BaseModel):
@@ -199,12 +232,15 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
             )
 
         # --- Tier 2: RAG context + LLM generation ---
-        results = await self._search_all(args.topic, top_k=6)
+        response_profile = _response_profile(context)
+        top_k = 3 if response_profile == "balanced_fast" else 6
+        results = await self._search_all(args.topic, top_k=top_k)
         if results:
             return await self._generate_from_context(
                 results,
                 args,
                 weak_hint,
+                response_profile=response_profile,
                 supplemental_context=handoff_context,
                 supplemental_citations=handoff_citations,
             )
@@ -271,6 +307,7 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
                     query=topic,
                     task_intent="quiz_generator",
                     top_k=top_k,
+                    fast_mode=top_k <= 3,
                 )
                 return list(normalized.results)
             results = await asyncio.to_thread(
@@ -297,22 +334,85 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
             questions.append(q)
         return "以下题目来自课程题库：\n\n" + _format_questions(questions, question_type)
 
+    def _build_fast_questions(self, results: list, args: "QuizGeneratorArgs") -> list[dict]:
+        topic = sanitize_user_input(args.topic, max_length=80)
+        questions: list[dict] = []
+        fallback_point = f"{topic} 的核心概念与适用场景"
+        for index in range(args.count):
+            result = results[index % len(results)]
+            snippet = _extract_quiz_snippet(getattr(result, "text", "")) or fallback_point
+            if "选择" in args.question_type:
+                questions.append(
+                    {
+                        "question": f"关于 {topic}，以下哪一项最符合课程资料中的描述？（第 {index + 1} 题）",
+                        "options": {
+                            "A": snippet,
+                            "B": f"{topic} 与该知识点无关",
+                            "C": f"{topic} 只在物理层中使用",
+                            "D": f"{topic} 不涉及任何状态或控制机制",
+                        },
+                        "answer": "A",
+                        "explanation": f"课程证据指出：{snippet}",
+                        "concepts": [topic],
+                    }
+                )
+            else:
+                questions.append(
+                    {
+                        "question": f"请简述 {topic} 的一个核心知识点。（第 {index + 1} 题）",
+                        "answer": snippet,
+                        "explanation": f"可结合课程证据作答：{snippet}",
+                        "concepts": [topic],
+                    }
+                )
+        return questions
+
     async def _generate_from_context(
         self,
         results: list,
         args: "QuizGeneratorArgs",
         weak_hint: str,
         *,
+        response_profile: str = "quality_first",
         supplemental_context: str = "",
         supplemental_citations: Optional[list[dict[str, Any]]] = None,
     ) -> ToolResult:
+        if response_profile == "balanced_fast":
+            questions = self._build_fast_questions(results, args)
+            citations = [
+                citation.to_dict()
+                for citation in self._citation_generator.generate(results)
+            ]
+            if supplemental_citations:
+                citations.extend(supplemental_citations)
+            formatted = _format_questions(questions, args.question_type)
+            return ToolResult(
+                success=True,
+                result_for_llm=formatted,
+                metadata={
+                    "question_count": len(questions),
+                    "source": "rag_backed",
+                    "generation_mode": "rag_backed",
+                    "grounding_capable": True,
+                    "citations": citations,
+                    "evidence_summary": build_evidence_summary(citations),
+                    "source_count": len(citations),
+                    "final_response_preferred": True,
+                },
+            )
+
+        result_chars = 220 if response_profile == "balanced_fast" else 500
+        supplemental_chars = 500 if response_profile == "balanced_fast" else 1200
         knowledge_text = "\n\n".join(
-            f"[{i}] {sanitize_retrieval_text(r.text)[:500]}"
+            f"[{i}] {sanitize_retrieval_text(r.text)[:result_chars]}"
             for i, r in enumerate(results, 1)
         )
         if supplemental_context:
-            knowledge_text += f"\n\n[Supplemental]\n{supplemental_context[:1200]}"
-        prompt = QUIZ_PROMPT_TEMPLATE.format(
+            knowledge_text += f"\n\n[Supplemental]\n{supplemental_context[:supplemental_chars]}"
+        prompt_template = (
+            FAST_QUIZ_PROMPT_TEMPLATE if response_profile == "balanced_fast" else QUIZ_PROMPT_TEMPLATE
+        )
+        prompt = prompt_template.format(
             count=args.count,
             question_type=sanitize_user_input(args.question_type, max_length=50),
             difficulty=args.difficulty,
@@ -330,6 +430,7 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
             args.question_type,
             source="rag_backed",
             citations=citations,
+            response_profile=response_profile,
         )
 
     async def _generate_from_handoff_context(
@@ -352,6 +453,7 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
             args.question_type,
             source="composite_handoff",
             citations=citations or [],
+            response_profile="quality_first",
         )
 
     async def _generate_from_llm_knowledge(self, args: "QuizGeneratorArgs", weak_hint: str) -> ToolResult:
@@ -364,7 +466,12 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
             difficulty=args.difficulty,
             weak_points_hint=weak_hint,
         )
-        return await self._call_llm_for_quiz(prompt, args.question_type, source="llm_fallback")
+        return await self._call_llm_for_quiz(
+            prompt,
+            args.question_type,
+            source="llm_fallback",
+            response_profile="quality_first",
+        )
 
     async def _call_llm_for_quiz(
         self,
@@ -372,6 +479,7 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
         question_type: str,
         source: str = "rag_backed",
         citations: Optional[list[dict[str, Any]]] = None,
+        response_profile: str = "quality_first",
     ) -> ToolResult:
         if self._llm is None:
             return ToolResult(success=False, error="LLM 服务未初始化")
@@ -382,7 +490,8 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
                     LlmMessage(role="system", content="你是一位课程出题专家，只输出合法 JSON。"),
                     LlmMessage(role="user", content=prompt),
                 ],
-                temperature=0.5,
+                temperature=0.3 if response_profile == "balanced_fast" else 0.5,
+                max_tokens=780 if response_profile == "balanced_fast" else None,
             )
             resp = await self._llm.send_request(req)
             if resp.error:

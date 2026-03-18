@@ -160,6 +160,21 @@ class SourceAwareSearch:
         reranked = self._apply_unit_dedup(results=reranked, trace=trace)
         final_results = reranked[:top_k]
 
+        if (
+            not final_results
+            and raw_unit_results
+            and bool(getattr(getattr(self._hybrid_search, "config", None), "empty_result_fallback_enabled", True))
+        ):
+            final_results = raw_unit_results[:top_k]
+            if trace is not None:
+                trace.record_stage(
+                    "answer_unit_empty_fallback",
+                    {
+                        "reason": "answer_unit_postprocessing_cleared_results",
+                        "fallback_count": len(final_results),
+                    },
+                )
+
         unit_lookup = {unit.unit_id: unit for unit in all_units}
         final_units: list[AnswerUnit] = []
         for result in final_results:

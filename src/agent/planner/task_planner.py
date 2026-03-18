@@ -274,10 +274,16 @@ class TaskPlanner:
             return None
         if _DOCUMENT_RULES.search(text) or self._looks_like_file_ingest(text):
             return None
+        if _QUIZ_EVALUATOR_RULES.search(text):
+            return None
 
         ordered_hits = self._collect_composite_hits(text)
         if len(ordered_hits) < 2:
             return None
+        if ordered_hits[0][0] in {TaskIntent.REVIEW_SUMMARY, TaskIntent.QUIZ_GENERATOR}:
+            trailing_intents = {intent for intent, *_ in ordered_hits[1:]}
+            if trailing_intents and trailing_intents <= {TaskIntent.KNOWLEDGE_QUERY}:
+                return None
 
         subtasks: list[PlannedSubtask] = []
         for index, (intent, start, end, matched_text) in enumerate(ordered_hits):

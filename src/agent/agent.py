@@ -96,6 +96,10 @@ _EVALUATOR_FIELD_PATTERNS = {
     "user_answer": re.compile(r"(?:用户答案|我的答案)[:：]\s*(.+?)(?=(?:正确答案|$))", re.S),
     "correct_answer": re.compile(r"正确答案[:：]\s*(.+)$", re.S),
 }
+_DIRECT_INGEST_PATH_RE = re.compile(
+    r"((?:/|\.{1,2}/|docs/)[^\n\r]*?\.(?:pdf|pptx))",
+    re.IGNORECASE,
+)
 
 
 def _serialize_subtasks(subtasks: list[PlannedSubtask]) -> list[dict[str, object]]:
@@ -262,6 +266,24 @@ def _extract_evaluator_fields(message: str) -> dict[str, str]:
         if match is not None:
             values[key] = " ".join(match.group(1).split())
     return values
+
+
+def _latest_user_message(conversation: Conversation) -> str:
+    return next(
+        (
+            msg.content
+            for msg in reversed(conversation.messages)
+            if msg.role == "user" and msg.content
+        ),
+        "",
+    )
+
+
+def _extract_ingest_file_path(message: str) -> str:
+    match = _DIRECT_INGEST_PATH_RE.search(message or "")
+    if match is None:
+        return ""
+    return match.group(1).strip().strip("\"'，。！？；,!?;")
 
 
 def _composite_section_title(intent: TaskIntent) -> str:
@@ -581,6 +603,7 @@ class Agent:
                 metadata={
                     **tool_metadata,
                     "default_collection": self.config.default_collection,
+                    "response_profile": self.config.response_profile,
                 },
                 recent_messages=recent_msgs,
             )
@@ -676,6 +699,371 @@ class Agent:
                 await hook.after_message(conversation)
             except Exception:
                 logger.exception("after_message hook failed in background")
+
+    def _response_profile(self) -> str:
+        value = str(getattr(self.config, "response_profile", "") or "").strip().lower()
+        return value if value in {"balanced_fast", "quality_first"} else "quality_first"
+
+    def _should_use_direct_tool_path(
+        self,
+        planner_decision: PlannerDecision | None,
+    ) -> bool:
+        if self._response_profile() != "balanced_fast":
+            return False
+        if planner_decision is None or planner_decision.is_composite:
+            return False
+        return planner_decision.task_intent in {
+            TaskIntent.KNOWLEDGE_QUERY,
+            TaskIntent.DOCUMENT_INGEST,
+            TaskIntent.REVIEW_SUMMARY,
+            TaskIntent.QUIZ_GENERATOR,
+            TaskIntent.QUIZ_EVALUATOR,
+        } and bool(planner_decision.selected_tool)
+
+    def _build_direct_tool_call(
+        self,
+        conversation: Conversation,
+        tool_ctx: ToolContext,
+        planner_decision: PlannerDecision,
+    ) -> ToolCallData | None:
+        user_message = _latest_user_message(conversation)
+        selected_tool = planner_decision.selected_tool or planner_decision.task_intent.value
+        default_collection = str(
+            tool_ctx.metadata.get("default_collection", "") or self.config.default_collection
+        ).strip()
+        if planner_decision.task_intent == TaskIntent.KNOWLEDGE_QUERY:
+            if not user_message:
+                return None
+            return ToolCallData(
+                id="direct_knowledge_query",
+                name=selected_tool,
+                arguments={
+                    "query": user_message,
+                    "top_k": 3 if self._response_profile() == "balanced_fast" else 5,
+                    "collection": default_collection,
+                },
+            )
+        if planner_decision.task_intent == TaskIntent.DOCUMENT_INGEST:
+            file_path = _extract_ingest_file_path(user_message)
+            if not file_path:
+                return None
+            return ToolCallData(
+                id="direct_document_ingest",
+                name=selected_tool,
+                arguments={
+                    "file_path": file_path,
+                    "collection": default_collection,
+                },
+            )
+        if planner_decision.task_intent == TaskIntent.REVIEW_SUMMARY:
+            topic = _clean_topic_text(user_message) or _extract_shared_topic(user_message) or user_message
+            if not topic:
+                return None
+            return ToolCallData(
+                id="direct_review_summary",
+                name=selected_tool,
+                arguments={
+                    "topic": topic,
+                },
+            )
+        if planner_decision.task_intent == TaskIntent.QUIZ_GENERATOR:
+            topic = _clean_topic_text(user_message) or _extract_shared_topic(user_message) or user_message
+            if not topic:
+                return None
+            return ToolCallData(
+                id="direct_quiz_generator",
+                name=selected_tool,
+                arguments={
+                    "topic": topic,
+                    "question_type": _extract_question_type(user_message) or "选择题",
+                    "count": _extract_quiz_count(user_message) or 3,
+                    "difficulty": _extract_quiz_difficulty(user_message) or 3,
+                },
+            )
+        if planner_decision.task_intent == TaskIntent.QUIZ_EVALUATOR:
+            parsed = _extract_evaluator_fields(user_message)
+            question = parsed.get("question") or _clean_topic_text(user_message) or user_message
+            if not question:
+                return None
+            return ToolCallData(
+                id="direct_quiz_evaluator",
+                name=selected_tool,
+                arguments={
+                    "question": question,
+                    "user_answer": parsed.get("user_answer", ""),
+                    "correct_answer": parsed.get("correct_answer", ""),
+                    "question_type": _extract_question_type(user_message) or "选择题",
+                    "topic": _extract_shared_topic(user_message) or question,
+                    "concepts": [],
+                },
+            )
+        return None
+
+    async def _generate_direct_knowledge_answer(
+        self,
+        *,
+        system_prompt: str,
+        question: str,
+        tool_result: ToolResult,
+        evidence_bundle: EvidenceBundle | None,
+        trace: TraceContext | None = None,
+    ) -> tuple[str, GroundingAssessment | None]:
+        response_profile = self._response_profile()
+        max_tokens = 320 if response_profile == "balanced_fast" else self.config.max_tokens
+        system_content = (
+            "你是一名计算机网络课程助教。你已经拿到课程证据，请直接给出准确、简洁、可引用的最终回答。"
+            if response_profile == "balanced_fast"
+            else system_prompt + "\n\n## [Direct Tool Answer]\n你已经拿到课程证据，直接形成最终回答。"
+        )
+        prompt = (
+            "你已经拿到了课程知识库证据，请直接给出最终回答。\n"
+            "要求：\n"
+            "1. 只依据给定证据回答，不要再次调用工具。\n"
+            "2. 回答尽量简洁聚焦，优先直接回答问题。\n"
+            "3. 在关键结论后保留 `[1]`、`[2]` 这类引用编号。\n"
+            "4. 如果证据不足，请明确说明缺口，但不要空泛重复。\n\n"
+            f"用户问题：{question}\n\n"
+            f"课程证据：\n{tool_result.result_for_llm}"
+        )
+        request = LlmRequest(
+            messages=[
+                LlmMessage(role="system", content=system_content),
+                LlmMessage(role="user", content=prompt),
+            ],
+            temperature=0.1 if response_profile == "balanced_fast" else 0.2,
+            max_tokens=max_tokens,
+            stream=False,
+            metadata={
+                "course_task": True,
+                "skip_reflection_warning": True,
+                "citations": evidence_bundle.citations if evidence_bundle is not None else [],
+                "evidence_summary": (
+                    evidence_bundle.evidence_summary if evidence_bundle is not None else ""
+                ),
+                "source_count": (
+                    evidence_bundle.source_count if evidence_bundle is not None else 0
+                ),
+                "generation_mode": "direct_knowledge_query",
+            },
+        )
+        iteration_started = time.monotonic()
+        for mw in self.middlewares:
+            try:
+                request = await mw.before_llm_request(request)
+            except Exception:
+                logger.exception("before_llm_request middleware failed")
+        response = await self.llm.send_request(request)
+        for mw in reversed(self.middlewares):
+            try:
+                response = await mw.after_llm_response(request, response)
+            except Exception:
+                logger.exception("after_llm_response middleware failed")
+        if trace is not None:
+            trace.record_stage(
+                "llm_iteration",
+                {
+                    "iteration": 1,
+                    "input_message_count": len(request.messages),
+                    "stream": False,
+                    "tool_names": [],
+                    "tool_call_count": 0,
+                    "output_text_length": len(response.content or ""),
+                    "had_error": bool(response.error),
+                    "planner_control_mode": "direct_tool_path",
+                    "planner_forced_tool": TaskIntent.KNOWLEDGE_QUERY.value,
+                    "visible_tool_count": 0,
+                    "has_evidence": bool(evidence_bundle and evidence_bundle.has_evidence),
+                    "generation_mode": "direct_knowledge_query",
+                },
+                elapsed_ms=(time.monotonic() - iteration_started) * 1000.0,
+            )
+        if response.error:
+            fallback_text = tool_result.result_for_llm or DEFAULT_LOW_EVIDENCE_MESSAGE
+            return await self._finalize_answer(
+                fallback_text,
+                course_task=True,
+                evidence_bundle=evidence_bundle,
+                fallback_text=fallback_text,
+            )
+        content = (response.content or "").strip() or tool_result.result_for_llm or DEFAULT_LOW_EVIDENCE_MESSAGE
+        return await self._finalize_answer(
+            content,
+            course_task=True,
+            evidence_bundle=evidence_bundle,
+            fallback_text=tool_result.result_for_llm,
+        )
+
+    async def _run_direct_tool_path(
+        self,
+        conversation: Conversation,
+        system_prompt: str,
+        tool_ctx: ToolContext,
+        *,
+        planner_decision: PlannerDecision,
+        trace: TraceContext | None = None,
+        response_state: dict[str, object] | None = None,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        tool_call = self._build_direct_tool_call(conversation, tool_ctx, planner_decision)
+        if tool_call is None:
+            return
+
+        yield StreamEvent(
+            type=StreamEventType.TOOL_START,
+            tool_name=tool_call.name,
+            metadata={"arguments": tool_call.arguments},
+        )
+
+        tool_blocked = False
+        for hook in self.hooks:
+            try:
+                await hook.before_tool(tool_call.name, tool_ctx)
+            except Exception as exc:
+                logger.warning("before_tool hook blocked %s: %s", tool_call.name, exc)
+                tool_blocked = True
+                break
+
+        tool_started = time.monotonic()
+        if tool_blocked:
+            tool_result_obj = ToolResult(
+                success=False,
+                error="Tool execution blocked by hook",
+                metadata={
+                    "tool_name": tool_call.name,
+                    "error_type": ToolErrorType.BLOCKED_BY_HOOK.value,
+                    "retryable": False,
+                },
+            )
+        else:
+            tool_result_obj = await self.tools.execute(
+                tool_call,
+                tool_ctx,
+                timeout=float(self.config.tool_timeout),
+            )
+
+        for hook in self.hooks:
+            try:
+                modified = await hook.after_tool(tool_call.name, tool_result_obj, context=tool_ctx)
+                if modified is not None:
+                    tool_result_obj = modified
+            except Exception:
+                logger.exception("after_tool hook failed")
+
+        yield StreamEvent(
+            type=StreamEventType.TOOL_RESULT,
+            tool_name=tool_call.name,
+            content=tool_result_obj.result_for_llm if tool_result_obj.success else tool_result_obj.error,
+            metadata={
+                "success": tool_result_obj.success,
+                **tool_result_obj.metadata,
+            },
+        )
+
+        if trace is not None:
+            trace.record_stage(
+                "tool_execution",
+                {
+                    "iteration": 0,
+                    "tool_name": tool_call.name,
+                    "arguments": _summarize_arguments(tool_call.arguments),
+                    "success": tool_result_obj.success,
+                    "error_type": tool_result_obj.metadata.get("error_type", ""),
+                    "retryable": bool(tool_result_obj.metadata.get("retryable", False)),
+                    "query_trace_id": tool_result_obj.metadata.get("query_trace_id"),
+                    "generation_mode": tool_result_obj.metadata.get("generation_mode", ""),
+                    "evaluation_mode": tool_result_obj.metadata.get("evaluation_mode", ""),
+                    "source_count": int(tool_result_obj.metadata.get("source_count", 0) or 0),
+                    "error_summary": _truncate_text(tool_result_obj.error),
+                    "result_summary": _truncate_text(tool_result_obj.result_for_llm),
+                    "direct_path": True,
+                },
+                elapsed_ms=(time.monotonic() - tool_started) * 1000.0,
+            )
+
+        if not tool_result_obj.success:
+            if trace is not None:
+                trace.metadata["status"] = "error"
+                trace.record_stage(
+                    "error",
+                    {
+                        "phase": "direct_tool_execution",
+                        "tool_name": tool_call.name,
+                        "error": _truncate_text(tool_result_obj.error),
+                    },
+                )
+            yield StreamEvent(
+                type=StreamEventType.ERROR,
+                content=tool_result_obj.error or f"{tool_call.name} 执行失败",
+            )
+            return
+
+        evidence_bundle = build_evidence_bundle(tool_call.name, tool_result_obj.metadata)
+        final_text = tool_result_obj.result_for_llm or ""
+        generation_mode = str(tool_result_obj.metadata.get("generation_mode", "") or "")
+        evaluation_mode = str(tool_result_obj.metadata.get("evaluation_mode", "") or "")
+        grounding_assessment: GroundingAssessment | None = None
+
+        final_response_preferred = bool(tool_result_obj.metadata.get("final_response_preferred", False))
+        grounding_passthrough = bool(tool_result_obj.metadata.get("grounding_passthrough", False))
+
+        if (
+            planner_decision.task_intent == TaskIntent.KNOWLEDGE_QUERY
+            and not final_response_preferred
+        ):
+            final_text, grounding_assessment = await self._generate_direct_knowledge_answer(
+                system_prompt=system_prompt,
+                question=_latest_user_message(conversation),
+                tool_result=tool_result_obj,
+                evidence_bundle=evidence_bundle,
+                trace=trace,
+            )
+            generation_mode = "direct_knowledge_query"
+        elif generation_mode in {"question_bank", "rag_backed"}:
+            final_text = tool_result_obj.result_for_llm or ""
+            grounding_assessment = GroundingAssessment(
+                score=1.0,
+                has_evidence=bool(evidence_bundle and evidence_bundle.has_evidence),
+                citation_count=0,
+                source_count=evidence_bundle.source_count if evidence_bundle is not None else 0,
+            )
+        elif grounding_passthrough or final_response_preferred:
+            grounding_assessment = self._grounding_evaluator.assess(final_text, evidence_bundle)
+        else:
+            final_text, grounding_assessment = await self._finalize_answer(
+                final_text,
+                course_task=_is_course_task(planner_decision),
+                evidence_bundle=evidence_bundle,
+                fallback_text=tool_result_obj.result_for_llm,
+            )
+
+        if trace is not None and grounding_assessment is not None:
+            trace.record_stage(
+                "answer_grounding",
+                {
+                    **grounding_assessment.to_metadata(),
+                    "generation_mode": generation_mode,
+                    "evaluation_mode": evaluation_mode,
+                },
+            )
+            trace.record_stage(
+                "final_response",
+                {
+                    "iteration": 1 if planner_decision.task_intent == TaskIntent.KNOWLEDGE_QUERY else 0,
+                    "content_length": len(final_text or ""),
+                    "content_preview": _truncate_text(final_text),
+                    "generation_mode": generation_mode,
+                    "evaluation_mode": evaluation_mode,
+                    "direct_path": True,
+                },
+            )
+        if response_state is not None:
+            response_state.update(_build_evidence_metadata(evidence_bundle, grounding_assessment))
+            if generation_mode:
+                response_state["generation_mode"] = generation_mode
+            if evaluation_mode:
+                response_state["evaluation_mode"] = evaluation_mode
+        if final_text:
+            yield StreamEvent(type=StreamEventType.TEXT_DELTA, content=final_text)
+        conversation.messages.append(Message(role="assistant", content=final_text or ""))
 
     def _build_composite_tool_args(
         self,
@@ -1074,6 +1462,30 @@ class Agent:
         course_task = _is_course_task(planner_decision)
         evidence_bundle: EvidenceBundle | None = None
         latest_grounded_tool_text = ""
+
+        if self._should_use_direct_tool_path(planner_decision):
+            direct_tool_call = self._build_direct_tool_call(conversation, tool_ctx, planner_decision)
+            if direct_tool_call is not None:
+                if trace is not None:
+                    trace.record_stage(
+                        "direct_tool_dispatch",
+                        {
+                            "task_intent": planner_decision.task_intent.value,
+                            "selected_tool": planner_decision.selected_tool,
+                            "arguments": _summarize_arguments(direct_tool_call.arguments),
+                            "response_profile": self._response_profile(),
+                        },
+                    )
+                async for event in self._run_direct_tool_path(
+                    conversation,
+                    system_prompt,
+                    tool_ctx,
+                    planner_decision=planner_decision,
+                    trace=trace,
+                    response_state=response_state,
+                ):
+                    yield event
+                return
 
         for iteration in range(self.config.max_tool_iterations):
             iteration_started = time.monotonic()

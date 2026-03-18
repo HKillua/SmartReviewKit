@@ -155,7 +155,7 @@ class BatchProcessor:
             batch_start = time.time()
             batch_dense: List[List[float]] = []
             batch_sparse: List[Dict[str, Any]] = []
-            dense_ok = False
+            dense_success_indices: List[int] = []
 
             # --- Parallel dense + sparse encoding ---
             # Dense = network I/O, Sparse = CPU — no dependency between them.
@@ -171,7 +171,7 @@ class BatchProcessor:
 
             try:
                 batch_dense = dense_future.result()
-                dense_ok = True
+                dense_success_indices = list(range(len(batch)))
             except Exception as e:
                 logger.error(
                     "Batch %d/%d dense encoding failed (%d chunks): %s",
@@ -183,6 +183,7 @@ class BatchProcessor:
                         f"batch_{batch_idx}_dense_error",
                         {"error": str(e), "batch_size": len(batch)}
                     )
+                batch_dense, dense_success_indices = self._salvage_dense_batch(batch, batch_idx, batch_count, trace)
 
             try:
                 batch_sparse = sparse_future.result()
@@ -199,21 +200,23 @@ class BatchProcessor:
                     )
 
             # --- Assemble results ---
-            if dense_ok and len(batch_dense) == len(batch):
+            if dense_success_indices:
                 dense_vectors.extend(batch_dense)
                 # If sparse succeeded, use it; otherwise fill with empty stats
                 if len(batch_sparse) == len(batch):
-                    sparse_stats.extend(batch_sparse)
+                    sparse_stats.extend(batch_sparse[i] for i in dense_success_indices)
                 else:
-                    for c in batch:
+                    for i in dense_success_indices:
+                        c = batch[i]
                         sparse_stats.append({
                             "chunk_id": c.id,
                             "term_frequencies": {},
                             "doc_length": 0,
                             "unique_terms": 0,
                         })
-                successful_chunks += len(batch)
-                for i in range(len(batch)):
+                successful_chunks += len(dense_success_indices)
+                failed_chunks += len(batch) - len(dense_success_indices)
+                for i in dense_success_indices:
                     successful_chunk_indices.append(global_offset + i)
             else:
                 failed_chunks += len(batch)
@@ -227,7 +230,8 @@ class BatchProcessor:
                         "batch_size": len(batch),
                         "duration_seconds": batch_duration,
                         "chunks_processed": len(batch),
-                        "dense_ok": dense_ok,
+                        "dense_ok": bool(dense_success_indices),
+                        "dense_successful_chunks": len(dense_success_indices),
                     }
                 )
 
@@ -264,6 +268,43 @@ class BatchProcessor:
             failed_chunks=failed_chunks,
             successful_chunk_indices=successful_chunk_indices,
         )
+
+    def _salvage_dense_batch(
+        self,
+        batch: List[Chunk],
+        batch_idx: int,
+        batch_count: int,
+        trace: Optional[Any] = None,
+    ) -> Tuple[List[List[float]], List[int]]:
+        """Retry a failed dense batch chunk-by-chunk so one bad chunk does not poison the whole batch."""
+        salvaged_vectors: List[List[float]] = []
+        successful_indices: List[int] = []
+
+        for item_idx, chunk in enumerate(batch):
+            try:
+                vectors = self.dense_encoder.encode([chunk], trace=trace)
+                if len(vectors) != 1:
+                    raise RuntimeError(f"expected 1 vector, got {len(vectors)}")
+                salvaged_vectors.extend(vectors)
+                successful_indices.append(item_idx)
+            except Exception as exc:
+                logger.error(
+                    "Batch %d/%d fallback dense encoding failed for chunk %s: %s",
+                    batch_idx + 1,
+                    batch_count,
+                    chunk.id,
+                    exc,
+                )
+
+        if successful_indices:
+            logger.warning(
+                "Batch %d/%d salvaged %d/%d chunks after dense batch failure",
+                batch_idx + 1,
+                batch_count,
+                len(successful_indices),
+                len(batch),
+            )
+        return salvaged_vectors, successful_indices
 
     def _create_batches(self, chunks: List[Chunk]) -> List[List[Chunk]]:
         """Divide chunks into batches of specified size.
