@@ -1,0 +1,15 @@
+name: "CRC 计算"
+user_message: "CRC 校验码怎么计算？"
+user_id: "eval_user_04"
+mock_state:
+  network_calc_args:
+    type: "crc"
+    params:
+      data_bits: "1101011011"
+      generator_bits: "10011"
+expectations:
+  tool_must_include: ["network_calc"]
+  control_mode: "autonomous"
+  min_steps: 1
+  max_steps: 2
+  output_must_contain: ["CRC"]

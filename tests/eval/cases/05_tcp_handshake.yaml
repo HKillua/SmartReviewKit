@@ -1,0 +1,16 @@
+name: "TCP 三次握手模拟"
+user_message: "讲讲 TCP 三次握手"
+user_id: "eval_user_05"
+mock_state:
+  protocol_args:
+    protocol: "tcp_handshake"
+    params:
+      initial_seq: 100
+      server_seq: 500
+    fault_injection: {}
+expectations:
+  tool_must_include: ["protocol_state_simulator"]
+  control_mode: "autonomous"
+  min_steps: 1
+  max_steps: 2
+  output_must_contain: ["TCP 三次握手"]

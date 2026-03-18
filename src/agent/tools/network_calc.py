@@ -58,7 +58,9 @@ class NetworkCalcTool(Tool[NetworkCalcArgs]):
             success=True,
             result_for_llm=payload["text"],
             metadata={
-                "tool_output_kind": "analysis_context",
+                "tool_output_kind": "final_answer",
+                "final_response_preferred": True,
+                "grounding_passthrough": True,
                 "structured_result": payload["structured"],
                 "calculation_type": calc_type,
             },

@@ -1,0 +1,17 @@
+name: "知识库证据不足时触发 Replan"
+user_message: "帮我复习传输层"
+user_id: "eval_user_07"
+mock_state:
+  graph_topic: "传输层"
+  knowledge_map:
+    - { concept: "拥塞控制", chapter: "传输层", mastery: 0.22, last_reviewed_days: 5 }
+  retrieval:
+    default:
+      - { source: "tcp_single.pdf", text: "TCP 拥塞控制包括慢启动。" }
+expectations:
+  tool_must_include: ["concept_graph_query", "knowledge_query"]
+  control_mode: "autonomous"
+  min_steps: 2
+  max_steps: 5
+  replan_triggered: true
+  output_must_contain: ["拥塞控制"]

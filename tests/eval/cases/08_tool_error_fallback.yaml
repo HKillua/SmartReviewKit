@@ -1,0 +1,19 @@
+name: "工具失败自动回退"
+user_message: "如果 SYN-ACK 丢了会怎样？"
+user_id: "eval_user_08"
+mock_state:
+  protocol_args:
+    protocol: "unsupported_protocol"
+    params: {}
+    fault_injection: {}
+  retrieval:
+    default:
+      - { source: "tcp_handshake.pdf", text: "TCP 三次握手通过 SYN、SYN-ACK、ACK 建立连接。" }
+      - { source: "tcp_faults.pdf", text: "SYN-ACK 丢失后，客户端会超时重传 SYN。" }
+expectations:
+  tool_must_include: ["protocol_state_simulator", "knowledge_query"]
+  control_mode: "autonomous"
+  min_steps: 2
+  max_steps: 5
+  replan_triggered: true
+  output_must_contain: ["SYN-ACK"]

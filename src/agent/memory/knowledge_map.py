@@ -124,6 +124,20 @@ class KnowledgeMapMemory:
         nodes = await self._get_all_nodes(user_id)
         return [n for n in nodes if n.mastery_level < threshold]
 
+    async def get_decayed_nodes(
+        self,
+        user_id: str,
+        *,
+        threshold: float = 0.45,
+        limit: int = 5,
+    ) -> list[KnowledgeNode]:
+        """Return low-mastery nodes after applying decay, weakest first."""
+        await self.apply_decay(user_id)
+        nodes = await self._get_all_nodes(user_id)
+        filtered = [node for node in nodes if node.mastery_level < threshold]
+        filtered.sort(key=lambda node: (node.mastery_level, node.concept))
+        return filtered[: max(limit, 0)]
+
     async def get_due_for_review(self, user_id: str) -> list[KnowledgeNode]:
         now = datetime.now(timezone.utc)
         nodes = await self._get_all_nodes(user_id)

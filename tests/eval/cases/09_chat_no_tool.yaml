@@ -1,0 +1,11 @@
+name: "普通聊天不使用工具"
+user_message: "你好"
+user_id: "eval_user_09"
+mock_state: {}
+expectations:
+  tool_must_not_include: ["knowledge_query", "network_calc", "protocol_state_simulator", "document_ingest"]
+  control_mode: "pass_through"
+  min_steps: 0
+  max_steps: 0
+  output_must_contain: ["你好"]
+  proactive_triggered: false

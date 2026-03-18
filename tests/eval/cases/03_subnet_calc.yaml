@@ -1,0 +1,16 @@
+name: "子网划分计算"
+user_message: "192.168.1.0/24 划分成 4 个子网，每个子网能容纳多少主机？"
+user_id: "eval_user_03"
+mock_state:
+  network_calc_args:
+    type: "subnet_division"
+    params:
+      network: "192.168.1.0/24"
+      num_subnets: 4
+expectations:
+  tool_must_include: ["network_calc"]
+  tool_must_not_include: ["document_ingest"]
+  control_mode: "autonomous"
+  min_steps: 1
+  max_steps: 2
+  output_must_contain: ["62"]

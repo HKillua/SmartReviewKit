@@ -39,6 +39,7 @@ from src.agent.planner import (
     TaskIntent,
     TaskPlanner,
 )
+from src.agent.pacing import compute_pacing_from_conversation
 from src.agent.prompt_builder import SystemPromptBuilder
 from src.agent.skills.registry import SkillPolicy
 from src.agent.tools.base import ToolRegistry
@@ -110,6 +111,15 @@ _PROTOCOL_SIM_HINT_RE = re.compile(
     r"(三次握手|四次挥手|拥塞控制|慢启动|快速重传|快速恢复|syn|ack|fin|超时|丢包|乱序|状态机|rip|路由更新)",
     re.IGNORECASE,
 )
+REPLAN_POLICY = """
+## [Replan Policy]
+每次工具调用后都评估结果是否足够：
+1. knowledge_query 返回结果过少或证据不足：优先换更宽泛的主题、切换到 concept_graph_query，最后才允许做有限常识补充。
+2. concept_graph_query 未找到结果：放宽主题名或切换到 knowledge_query 获取课程证据。
+3. protocol_state_simulator 不支持当前协议：降级为 knowledge_query + 文字讲解。
+4. network_calc 参数错误：优先向用户确认参数，不要强行计算。
+当你决定调整计划时，请在 Thought 中明确说明原因和新的工具选择。
+""".strip()
 
 
 def _serialize_subtasks(subtasks: list[PlannedSubtask]) -> list[dict[str, object]]:
@@ -300,6 +310,22 @@ def _tool_result_is_final_answer(tool_name: str, metadata: dict[str, Any] | None
     if tool_name == "knowledge_query":
         return False
     return bool((metadata or {}).get("final_response_preferred", False))
+
+
+def _build_pacing_prompt(pacing_level: str, pacing_reason: str) -> str:
+    guidance = ""
+    if pacing_level == "accelerate":
+        guidance = "建议：减少基础铺垫，直接推进到更高阶内容或更难的问题。"
+    elif pacing_level == "decelerate":
+        guidance = "建议：放慢速度，多举例，必要时先查前置知识依赖。"
+    else:
+        guidance = "建议：保持正常节奏，先完成当前讲解或练习。"
+    return (
+        "## [Adaptive Pacing]\n"
+        f"当前学习节奏: {pacing_level}\n"
+        f"依据: {pacing_reason}\n"
+        f"{guidance}"
+    )
 
 
 def _parse_count_token(token: str) -> int | None:
@@ -563,10 +589,24 @@ class Agent:
             async def _fetch_review() -> str:
                 if self.review_hook and hasattr(self.review_hook, "get_review_context"):
                     try:
-                        return await self.review_hook.get_review_context(user_id)
+                        try:
+                            result = await self.review_hook.get_review_context(
+                                user_id,
+                                effective_message,
+                            )
+                        except TypeError:
+                            result = await self.review_hook.get_review_context(user_id)
+                        if isinstance(result, tuple) and len(result) == 2:
+                            return result
+                        metadata = {}
+                        if hasattr(self.review_hook, "last_metadata"):
+                            candidate = getattr(self.review_hook, "last_metadata")
+                            if isinstance(candidate, dict):
+                                metadata = dict(candidate)
+                        return result or "", metadata
                     except Exception:
                         logger.exception("Review hook failed")
-                return ""
+                return "", {}
 
             async def _fetch_skill() -> object | None:
                 if self.skill_workflow and hasattr(self.skill_workflow, "try_handle"):
@@ -577,12 +617,26 @@ class Agent:
                 return None
 
             preprocess_started = time.monotonic()
-            memory_ctx, review_ctx, wf_result = await asyncio.gather(
+            memory_ctx, review_payload, wf_result = await asyncio.gather(
                 _fetch_memory(), _fetch_review(), _fetch_skill()
             )
+            review_ctx = ""
+            review_meta: dict[str, object] = {}
+            if isinstance(review_payload, tuple) and len(review_payload) == 2:
+                review_ctx = str(review_payload[0] or "")
+                raw_meta = review_payload[1] or {}
+                if isinstance(raw_meta, dict):
+                    review_meta = dict(raw_meta)
+            elif isinstance(review_payload, str):
+                review_ctx = review_payload
 
             if review_ctx:
                 memory_ctx = (memory_ctx + "\n\n" + review_ctx).strip() if memory_ctx else review_ctx
+            preprocess_metadata: dict[str, object] = {
+                "proactive_triggered": bool(review_meta.get("proactive_triggered", False)),
+                "proactive_reason": str(review_meta.get("proactive_reason", "") or ""),
+                "proactive_signals": dict(review_meta.get("proactive_signals", {}) or {}),
+            }
 
             skill_ctx = ""
             direct_response = ""
@@ -663,8 +717,17 @@ class Agent:
                         "has_memory_context": bool(memory_ctx),
                         "has_skill_instruction": bool(skill_ctx),
                         "has_direct_response": bool(direct_response),
+                        "proactive_triggered": bool(preprocess_metadata["proactive_triggered"]),
                     },
                     elapsed_ms=(time.monotonic() - preprocess_started) * 1000.0,
+                )
+                agent_trace.record_stage(
+                    "proactive_review",
+                    {
+                        "triggered": bool(preprocess_metadata["proactive_triggered"]),
+                        "reason": preprocess_metadata["proactive_reason"],
+                        "signals": preprocess_metadata["proactive_signals"],
+                    },
                 )
                 if planner_decision is not None:
                     agent_trace.record_stage("planner_decision", planner_decision.to_metadata())
@@ -724,6 +787,7 @@ class Agent:
                 }
                 if agent_trace is not None:
                     done_metadata["trace_id"] = agent_trace.trace_id
+                done_metadata.update(preprocess_metadata)
                 done_metadata.update(_planner_metadata(planner_decision))
                 done_metadata["planner_final_control_mode"] = planner_runtime["final_control_mode"]
                 done_metadata["planner_violation_count"] = planner_runtime["violation_count"]
@@ -758,8 +822,8 @@ class Agent:
             )
 
             use_composite_runtime = False
+            response_state: dict[str, object] = dict(preprocess_metadata)
             try:
-                response_state: dict[str, object] = {}
                 use_composite_runtime = (
                     planner_decision is not None
                     and planner_decision.is_composite
@@ -952,6 +1016,39 @@ class Agent:
     def _response_profile(self) -> str:
         value = str(getattr(self.config, "response_profile", "") or "").strip().lower()
         return value if value in {"balanced_fast", "quality_first"} else "quality_first"
+
+    def _compute_pacing(self, conversation: Conversation) -> tuple[str, str]:
+        return compute_pacing_from_conversation(conversation)
+
+    def _assess_replan_signal(
+        self,
+        tool_name: str,
+        tool_result: ToolResult,
+    ) -> tuple[bool, str, str]:
+        metadata = tool_result.metadata or {}
+        if not tool_result.success:
+            if tool_name == "concept_graph_query":
+                return True, tool_result.error or "知识图谱查询失败", "broaden_topic"
+            if tool_name == "protocol_state_simulator":
+                return True, tool_result.error or "协议模拟器当前不支持该场景", "fallback_to_knowledge_query"
+            if tool_name == "network_calc":
+                return True, tool_result.error or "网络计算参数不足或不合法", "clarify_parameters"
+            return True, tool_result.error or "工具执行失败", "try_alternative_tool"
+
+        if tool_name == "knowledge_query":
+            source_count = int(metadata.get("source_count", 0) or 0)
+            result_text = (tool_result.result_for_llm or "").strip()
+            if source_count < 2:
+                if "未找到与查询相关的知识库内容" in result_text or source_count == 0:
+                    return True, f"knowledge_query 仅返回 {source_count} 条可用证据", "broaden_query_then_switch_tool"
+                return True, f"knowledge_query 仅返回 {source_count} 条证据，证据较弱", "switch_tool_then_common_knowledge"
+
+        if tool_name == "concept_graph_query":
+            rows = list(metadata.get("graph_rows", []) or [])
+            if not rows:
+                return True, "concept_graph_query 未返回图谱节点", "broaden_topic"
+
+        return False, "", ""
 
     def _should_use_direct_tool_path(
         self,
@@ -1320,6 +1417,11 @@ class Agent:
                 response_state["generation_mode"] = generation_mode
             if evaluation_mode:
                 response_state["evaluation_mode"] = evaluation_mode
+            response_state.setdefault("tool_path", [tool_call.name])
+            response_state.setdefault(
+                "effective_control_mode",
+                planner_decision.control_mode.value,
+            )
         if final_text:
             yield StreamEvent(type=StreamEventType.TEXT_DELTA, content=final_text)
         conversation.messages.append(Message(role="assistant", content=final_text or ""))
@@ -1744,6 +1846,16 @@ class Agent:
         )
         autonomous_tool_counts: dict[str, int] = {}
         tool_path: list[str] = []
+        replan_count = 0
+        last_replan_notice = ""
+
+        if autonomous_active and response_state is not None:
+            response_state.setdefault("replan_triggered", False)
+            response_state.setdefault("replan_reason", "")
+            response_state.setdefault("replan_count", 0)
+            response_state.setdefault("fallback_strategy", "")
+            response_state.setdefault("pacing_level", "normal")
+            response_state.setdefault("pacing_reason", "")
 
         def _update_autonomous_state(stop_reason: str | None = None) -> None:
             if not autonomous_active:
@@ -1809,6 +1921,9 @@ class Agent:
             )
 
             if autonomous_active:
+                pacing_level, pacing_reason = self._compute_pacing(conversation)
+                replan_notice = last_replan_notice
+                last_replan_notice = ""
                 visible_tools = {
                     name
                     for name in autonomous_allowed_tools
@@ -1825,7 +1940,16 @@ class Agent:
                     + "若已有足够信息，请直接收敛并回答用户。\n"
                     + f"允许工具: {', '.join(sorted(visible_tools))}\n"
                     + f"最大工具步数: {autonomous_max_steps}"
+                    + "\n\n"
+                    + REPLAN_POLICY
+                    + "\n\n"
+                    + _build_pacing_prompt(pacing_level, pacing_reason)
                 )
+                if replan_notice:
+                    iteration_prompt += f"\n\n## [Replan Signal]\n{replan_notice}"
+                if response_state is not None:
+                    response_state["pacing_level"] = pacing_level
+                    response_state["pacing_reason"] = pacing_reason
                 if trace is not None:
                     trace.record_stage(
                         "autonomous_iteration",
@@ -1833,6 +1957,14 @@ class Agent:
                             "iteration": iteration + 1,
                             "allowed_tools": sorted(visible_tools),
                             "used_tool_counts": dict(autonomous_tool_counts),
+                        },
+                    )
+                    trace.record_stage(
+                        "adaptive_pacing",
+                        {
+                            "iteration": iteration + 1,
+                            "pacing_level": pacing_level,
+                            "pacing_reason": pacing_reason,
                         },
                     )
             elif force_active and planner_decision is not None:
@@ -1974,6 +2106,7 @@ class Agent:
 
             if (
                 not response.tool_calls
+                and not autonomous_active
                 and planner_decision is not None
                 and planner_decision.task_intent == TaskIntent.KNOWLEDGE_QUERY
                 and evidence_bundle is None
@@ -2133,7 +2266,38 @@ class Agent:
                     if bundle is not None:
                         evidence_bundle = bundle
                         latest_grounded_tool_text = tool_result_obj.result_for_llm or ""
-                    if _tool_result_is_final_answer(tc.name, tool_result_obj.metadata):
+                    replan_needed = False
+                    replan_reason = ""
+                    fallback_strategy = ""
+                    if autonomous_active:
+                        replan_needed, replan_reason, fallback_strategy = self._assess_replan_signal(
+                            tc.name,
+                            tool_result_obj,
+                        )
+                        if replan_needed:
+                            replan_count += 1
+                            last_replan_notice = (
+                                f"工具 `{tc.name}` 的结果不足以完成任务：{replan_reason}。"
+                                f"优先采用策略：{fallback_strategy}。"
+                            )
+                            if response_state is not None:
+                                response_state["replan_triggered"] = True
+                                response_state["replan_reason"] = replan_reason
+                                response_state["replan_count"] = replan_count
+                                response_state["fallback_strategy"] = fallback_strategy
+                            if trace is not None:
+                                trace.record_stage(
+                                    "replan_signal",
+                                    {
+                                        "iteration": iteration + 1,
+                                        "tool_name": tc.name,
+                                        "reason": replan_reason,
+                                        "fallback_strategy": fallback_strategy,
+                                    },
+                                )
+                    if _tool_result_is_final_answer(tc.name, tool_result_obj.metadata) and not (
+                        autonomous_active and replan_needed
+                    ):
                         passthrough_payload = (
                             tool_result_obj.result_for_llm if tool_result_obj.success else (tool_result_obj.error or ""),
                             tool_result_obj.metadata,
@@ -2270,6 +2434,8 @@ class Agent:
                 continue
 
             if (
+                not autonomous_active
+                and
                 planner_decision is not None
                 and planner_decision.task_intent == TaskIntent.KNOWLEDGE_QUERY
                 and evidence_bundle is None

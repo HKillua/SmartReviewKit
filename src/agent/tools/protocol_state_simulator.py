@@ -55,7 +55,9 @@ class ProtocolStateSimulatorTool(Tool[ProtocolStateSimulatorArgs]):
             success=True,
             result_for_llm=payload["text"],
             metadata={
-                "tool_output_kind": "analysis_context",
+                "tool_output_kind": "final_answer",
+                "final_response_preferred": True,
+                "grounding_passthrough": True,
                 "simulation_protocol": protocol,
                 "simulation_steps": payload["steps"],
                 "mermaid": payload.get("mermaid", ""),

@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from src.agent.hooks.lifecycle import LifecycleHook
+from src.agent.pacing import compute_pacing_from_conversation
 from src.agent.types import Conversation
 from src.core.trace.trace_collector import TraceCollector
 from src.core.trace.trace_context import TraceContext
@@ -396,6 +397,8 @@ class MemoryRecordHook(LifecycleHook):
                         "total_sessions": profile.total_sessions + 1,
                         "last_active": datetime.now(timezone.utc),
                     }
+                    pacing_level, pacing_reason = compute_pacing_from_conversation(conversation)
+                    updates["learning_pace"] = pacing_level
 
                     # Merge preference updates
                     if preference_updates and should_update_preferences:
@@ -458,6 +461,8 @@ class MemoryRecordHook(LifecycleHook):
                                 "status": profile_status,
                                 "reason": profile_reason,
                                 "updated_fields": sorted(updates.keys()),
+                                "learning_pace": pacing_level,
+                                "pacing_reason": pacing_reason,
                             },
                         )
                 except Exception as exc:

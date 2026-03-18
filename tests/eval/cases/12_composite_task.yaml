@@ -1,0 +1,10 @@
+name: "复合学习任务"
+user_message: "先帮我总结 TCP 的重点，再出 2 道题"
+user_id: "eval_user_12"
+mock_state: {}
+expectations:
+  tool_must_include: ["review_summary", "quiz_generator"]
+  control_mode: "autonomous"
+  min_steps: 2
+  max_steps: 5
+  output_must_contain: ["已生成"]

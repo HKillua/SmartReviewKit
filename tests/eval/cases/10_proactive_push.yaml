@@ -1,0 +1,18 @@
+name: "低信息量开场触发主动推荐"
+user_message: "你好"
+user_id: "eval_user_10"
+mock_state:
+  knowledge_map:
+    - { concept: "拥塞控制", chapter: "传输层", mastery: 0.25, last_reviewed_days: 6 }
+    - { concept: "流量控制", chapter: "传输层", mastery: 0.38, last_reviewed_days: 5 }
+  error_memory:
+    - { concept: "拥塞控制", count: 4, question: "为什么会进入慢启动？" }
+  profile:
+    last_active_days: 7
+expectations:
+  tool_must_not_include: ["document_ingest"]
+  control_mode: "pass_through"
+  min_steps: 0
+  max_steps: 0
+  proactive_triggered: true
+  output_must_contain: ["你好"]

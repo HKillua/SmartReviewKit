@@ -1,0 +1,19 @@
+name: "新用户复习（无历史）"
+user_message: "帮我复习 TCP"
+user_id: "eval_user_01"
+mock_state:
+  graph_topic: "传输层"
+  knowledge_map:
+    - { concept: "拥塞控制", chapter: "传输层", mastery: 0.40, last_reviewed_days: 3 }
+    - { concept: "流量控制", chapter: "传输层", mastery: 0.48, last_reviewed_days: 2 }
+  retrieval:
+    default:
+      - { source: "transport.pdf", text: "TCP 拥塞控制包括慢启动和拥塞避免。" }
+      - { source: "transport_slides.pptx", text: "流量控制通过滑动窗口协调发送速率。" }
+expectations:
+  tool_must_include: ["concept_graph_query", "knowledge_query"]
+  tool_must_not_include: ["document_ingest"]
+  control_mode: "autonomous"
+  min_steps: 2
+  max_steps: 5
+  output_must_contain: ["拥塞控制"]

@@ -254,6 +254,7 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         review_hook = ReviewScheduleHook(
             knowledge_map=kmap_mem,
             error_memory=error_mem,
+            student_profile=profile_mem,
             session_memory=session_mem,
             enable_decay=memory_cfg.decay_on_session_start,
         )

@@ -1,0 +1,17 @@
+name: "协议故障注入"
+user_message: "如果 SYN-ACK 丢了会怎样？"
+user_id: "eval_user_06"
+mock_state:
+  protocol_args:
+    protocol: "tcp_handshake"
+    params:
+      initial_seq: 100
+      server_seq: 400
+    fault_injection:
+      drop_packet: 2
+expectations:
+  tool_must_include: ["protocol_state_simulator"]
+  control_mode: "autonomous"
+  min_steps: 1
+  max_steps: 2
+  output_must_contain: ["超时"]

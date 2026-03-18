@@ -1,0 +1,24 @@
+name: "老用户复习（有错题历史）"
+user_message: "帮我复习 TCP"
+user_id: "eval_user_02"
+mock_state:
+  graph_topic: "传输层"
+  knowledge_map:
+    - { concept: "三次握手", chapter: "传输层", mastery: 0.85, last_reviewed_days: 1 }
+    - { concept: "拥塞控制", chapter: "传输层", mastery: 0.20, last_reviewed_days: 5 }
+    - { concept: "流量控制", chapter: "传输层", mastery: 0.35, last_reviewed_days: 4 }
+  error_memory:
+    - { concept: "拥塞控制", count: 3, question: "为什么超时后 cwnd 会回到 1？" }
+    - { concept: "流量控制", count: 2, question: "滑动窗口和拥塞窗口有什么区别？" }
+  profile:
+    last_active_days: 4
+  retrieval:
+    default:
+      - { source: "tcp_congestion.pdf", text: "拥塞控制通过慢启动、拥塞避免、快速重传和快速恢复调节发送窗口。" }
+      - { source: "tcp_window.pdf", text: "流量控制主要解决接收端处理能力与发送速率不匹配的问题。" }
+expectations:
+  tool_must_include: ["concept_graph_query", "knowledge_query"]
+  control_mode: "autonomous"
+  min_steps: 2
+  max_steps: 5
+  output_must_contain: ["拥塞控制", "流量控制"]
