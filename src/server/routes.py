@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import mimetypes
 import os
 import shutil
 import uuid
@@ -11,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 
 from src.server.models import ChatRequest, HealthResponse, UploadResponse
 
@@ -215,3 +217,31 @@ async def feedback_stats():
 async def health():
     tools_count = len(_agent.tools.tool_names) if _agent else 0
     return HealthResponse(tools_registered=tools_count)
+
+
+@router.get("/api/artifacts/{artifact_id}")
+async def download_artifact(artifact_id: str, user_id: str = "default_user", conversation_id: str = ""):
+    """Download a generated learning artifact from object storage."""
+    if _object_store is None:
+        raise HTTPException(status_code=503, detail="Artifact store not configured")
+    safe_name = Path(artifact_id).name
+    if safe_name != artifact_id:
+        raise HTTPException(status_code=400, detail="Invalid artifact id")
+    convo = conversation_id.strip()
+    if not convo:
+        raise HTTPException(status_code=400, detail="conversation_id is required")
+    object_key = f"artifacts/{convo}/{safe_name}"
+    try:
+        content = await asyncio.to_thread(_object_store.read_bytes, object_key)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Artifact not found") from None
+    except Exception:
+        logger.warning("Failed to read artifact %s", object_key, exc_info=True)
+        raise HTTPException(status_code=404, detail="Artifact not found") from None
+
+    media_type = mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
+    headers = {
+        "Content-Disposition": f'attachment; filename="{safe_name}"',
+        "X-Artifact-User": user_id,
+    }
+    return Response(content=content, media_type=media_type, headers=headers)

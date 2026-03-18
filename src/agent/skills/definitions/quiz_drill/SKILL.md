@@ -15,6 +15,23 @@ tools_required:
 memory_required:
   - error_memory
   - knowledge_map
+allowed_tools:
+  - quiz_generator
+  - quiz_evaluator
+  - knowledge_query
+  - network_calc
+required_memory:
+  - error_memory
+  - knowledge_map
+allow_autonomous: true
+max_steps: 4
+entry_conditions:
+  min_topics: 1
+output_contract:
+  - quiz
+  - evaluation
+post_actions:
+  - flashcard_export
 estimated_tokens: 500
 difficulty: medium
 ---

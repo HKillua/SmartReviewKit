@@ -40,6 +40,7 @@ from src.agent.planner import (
     TaskPlanner,
 )
 from src.agent.prompt_builder import SystemPromptBuilder
+from src.agent.skills.registry import SkillPolicy
 from src.agent.tools.base import ToolRegistry
 from src.agent.types import (
     Conversation,
@@ -101,6 +102,14 @@ _DIRECT_INGEST_PATH_RE = re.compile(
     r"((?:/|\.{1,2}/|docs/)[^\n\r]*?\.(?:pdf|pptx))",
     re.IGNORECASE,
 )
+_NETWORK_CALC_HINT_RE = re.compile(
+    r"(子网|掩码|cidr|crc|香农|奈奎斯特|吞吐|时延|rtt|利用率|窗口|go-back-n|selective repeat|/\d{1,2}|(?:\d{1,3}\.){3}\d{1,3})",
+    re.IGNORECASE,
+)
+_PROTOCOL_SIM_HINT_RE = re.compile(
+    r"(三次握手|四次挥手|拥塞控制|慢启动|快速重传|快速恢复|syn|ack|fin|超时|丢包|乱序|状态机|rip|路由更新)",
+    re.IGNORECASE,
+)
 
 
 def _serialize_subtasks(subtasks: list[PlannedSubtask]) -> list[dict[str, object]]:
@@ -137,6 +146,21 @@ def _restrict_tool_schemas(tool_schemas: list[dict], tool_name: str) -> list[dic
         schema
         for schema in tool_schemas
         if schema.get("function", {}).get("name") == tool_name
+    ]
+    return restricted or tool_schemas
+
+
+def _restrict_tool_schemas_to_allowed(
+    tool_schemas: list[dict],
+    allowed_tools: set[str] | list[str],
+) -> list[dict]:
+    allowed = {str(name) for name in allowed_tools if str(name).strip()}
+    if not allowed:
+        return tool_schemas
+    restricted = [
+        schema
+        for schema in tool_schemas
+        if schema.get("function", {}).get("name") in allowed
     ]
     return restricted or tool_schemas
 
@@ -179,6 +203,26 @@ def _build_planner_context(decision: PlannerDecision | None) -> str:
     return "\n".join(f"- {line}" for line in lines)
 
 
+def _build_skill_policy_context(
+    matched_skill: str,
+    policy: SkillPolicy | None,
+) -> str:
+    if not matched_skill or policy is None:
+        return ""
+    lines = [f"- 命中技能: {matched_skill}"]
+    if policy.allowed_tools:
+        lines.append(f"- 允许工具: {', '.join(policy.allowed_tools)}")
+    if policy.required_memory:
+        lines.append(f"- 需参考记忆: {', '.join(policy.required_memory)}")
+    lines.append(f"- 是否允许自主模式: {'是' if policy.allow_autonomous else '否'}")
+    lines.append(f"- 最大工具步数: {policy.max_steps}")
+    if policy.output_contract:
+        lines.append(f"- 回答应包含: {', '.join(policy.output_contract)}")
+    if policy.post_actions:
+        lines.append(f"- 结束后动作: {', '.join(policy.post_actions)}")
+    return "\n".join(lines)
+
+
 def _planner_metadata(decision: PlannerDecision | None) -> dict[str, object]:
     if decision is None:
         return {}
@@ -197,6 +241,23 @@ def _planner_metadata(decision: PlannerDecision | None) -> dict[str, object]:
     if decision.subtasks:
         metadata["subtask_plan"] = _serialize_subtasks(decision.subtasks)
     return metadata
+
+
+def _detect_specialized_tool_hint(message: str) -> tuple[str, str] | None:
+    text = (message or "").strip()
+    if not text:
+        return None
+    if _NETWORK_CALC_HINT_RE.search(text):
+        return (
+            "network_calc",
+            "这是需要精确数值计算的网络题，优先考虑调用 network_calc，必要时再结合课程证据解释。",
+        )
+    if _PROTOCOL_SIM_HINT_RE.search(text):
+        return (
+            "protocol_state_simulator",
+            "这是协议过程或故障推演题，优先考虑调用 protocol_state_simulator，再结合课程证据解释。",
+        )
+    return None
 
 
 def _is_course_task(decision: PlannerDecision | None) -> bool:
@@ -388,6 +449,7 @@ class Agent:
         skill_workflow: object | None = None,
         context_filter: object | None = None,
         review_hook: object | None = None,
+        post_action_adapter: object | None = None,
         trace_enabled: bool = False,
         trace_collector: TraceCollector | None = None,
         grounding_mode: str = "balanced",
@@ -405,6 +467,7 @@ class Agent:
         self.skill_workflow = skill_workflow
         self.context_filter = context_filter
         self.review_hook = review_hook
+        self.post_action_adapter = post_action_adapter
         self._bg_tasks: set[asyncio.Task] = set()
         self._trace_enabled = trace_enabled
         self._trace_collector = trace_collector or (TraceCollector() if trace_enabled else None)
@@ -524,6 +587,7 @@ class Agent:
             skill_ctx = ""
             direct_response = ""
             matched_skill = ""
+            skill_policy: SkillPolicy | None = None
             if wf_result is not None:
                 if hasattr(wf_result, "direct_response") and wf_result.direct_response:
                     direct_response = wf_result.direct_response
@@ -531,6 +595,8 @@ class Agent:
                     skill_ctx = wf_result.skill_instruction
                 if hasattr(wf_result, "matched_skill") and wf_result.matched_skill:
                     matched_skill = wf_result.matched_skill
+                if hasattr(wf_result, "skill_policy"):
+                    skill_policy = wf_result.skill_policy
 
             planner_decision: PlannerDecision | None = None
             planner_context = ""
@@ -541,7 +607,31 @@ class Agent:
                         effective_message,
                         matched_skill=matched_skill or None,
                     )
+                    planner_decision = self._apply_skill_policy(
+                        planner_decision,
+                        matched_skill=matched_skill,
+                        skill_policy=skill_policy,
+                    )
+                    if (
+                        matched_skill == ""
+                        and planner_decision is not None
+                        and planner_decision.task_intent == TaskIntent.KNOWLEDGE_QUERY
+                    ):
+                        specialized = _detect_specialized_tool_hint(effective_message)
+                        if specialized is not None:
+                            tool_name, hint = specialized
+                            planner_decision.control_mode = ControlMode.AUTONOMOUS
+                            planner_decision.selected_tool = tool_name
+                            planner_decision.planner_hint = hint
                     planner_context = _build_planner_context(planner_decision)
+                    if skill_policy is not None and matched_skill:
+                        skill_policy_context = _build_skill_policy_context(matched_skill, skill_policy)
+                        if skill_policy_context:
+                            planner_context = (
+                                planner_context + "\n" + skill_policy_context
+                                if planner_context
+                                else skill_policy_context
+                            )
                     course_task = _is_course_task(planner_decision)
                 except Exception:
                     logger.exception("Task planner failed")
@@ -556,6 +646,11 @@ class Agent:
                 "force_retry_count": 0,
                 "knowledge_retry_count": 0,
             }
+            if matched_skill:
+                planner_runtime["matched_skill"] = matched_skill
+            if skill_policy is not None:
+                planner_runtime["skill_allowed_tools"] = list(skill_policy.allowed_tools)
+                planner_runtime["skill_max_steps"] = min(int(skill_policy.max_steps), 5)
 
             if planner_decision is None or planner_decision.task_intent != TaskIntent.DOCUMENT_INGEST:
                 tool_schemas = _exclude_tool_schema(tool_schemas, "document_ingest")
@@ -574,10 +669,28 @@ class Agent:
                 if planner_decision is not None:
                     agent_trace.record_stage("planner_decision", planner_decision.to_metadata())
                     agent_trace.metadata.update(_planner_metadata(planner_decision))
+                if skill_policy is not None and matched_skill:
+                    agent_trace.record_stage(
+                        "skill_policy_applied",
+                        {
+                            "matched_skill": matched_skill,
+                            "allowed_tools": list(skill_policy.allowed_tools),
+                            "required_memory": list(skill_policy.required_memory),
+                            "allow_autonomous": bool(skill_policy.allow_autonomous),
+                            "max_steps": min(int(skill_policy.max_steps), 5),
+                            "post_actions": list(skill_policy.post_actions),
+                        },
+                    )
 
             prompt_started = time.monotonic()
+            prompt_tool_schemas = tool_schemas
+            if skill_policy is not None and skill_policy.allowed_tools:
+                prompt_tool_schemas = _restrict_tool_schemas_to_allowed(
+                    tool_schemas,
+                    set(skill_policy.allowed_tools),
+                )
             system_prompt = self.prompt_builder.build(
-                tool_schemas=tool_schemas,
+                tool_schemas=prompt_tool_schemas,
                 memory_context=memory_ctx,
                 planner_context=planner_context,
                 grounding_context=build_grounding_context(None, course_task=course_task),
@@ -637,13 +750,22 @@ class Agent:
                     **tool_metadata,
                     "default_collection": self.config.default_collection,
                     "response_profile": self.config.response_profile,
+                    "skill_allowed_tools": list(skill_policy.allowed_tools) if skill_policy is not None else [],
+                    "skill_max_steps": min(int(skill_policy.max_steps), 5) if skill_policy is not None else 0,
+                    "skill_post_actions": list(skill_policy.post_actions) if skill_policy is not None else [],
                 },
                 recent_messages=recent_msgs,
             )
 
+            use_composite_runtime = False
             try:
                 response_state: dict[str, object] = {}
-                if planner_decision is not None and planner_decision.is_composite:
+                use_composite_runtime = (
+                    planner_decision is not None
+                    and planner_decision.is_composite
+                    and planner_decision.control_mode != ControlMode.AUTONOMOUS
+                )
+                if use_composite_runtime:
                     async for event in self._run_composite_plan(
                         conversation,
                         tool_ctx,
@@ -662,6 +784,7 @@ class Agent:
                         planner_decision=planner_decision,
                         planner_runtime=planner_runtime,
                         response_state=response_state,
+                        skill_policy=skill_policy,
                     ):
                         yield event
             except Exception as exc:
@@ -673,13 +796,32 @@ class Agent:
                         {
                             "phase": (
                                 "composite_execution"
-                                if planner_decision is not None and planner_decision.is_composite
+                                if use_composite_runtime
                                 else "tool_loop"
                             ),
                             "error": _truncate_text(str(exc)),
                         },
                     )
                 yield StreamEvent(type=StreamEventType.ERROR, content=str(exc))
+
+            response_state.setdefault(
+                "effective_control_mode",
+                str(planner_runtime.get("final_control_mode") or ""),
+            )
+            if matched_skill:
+                response_state.setdefault("matched_skill", matched_skill)
+            if skill_policy is not None:
+                response_state.setdefault("skill_allowed_tools", list(skill_policy.allowed_tools))
+            artifacts = await self._run_post_actions(
+                conversation=conversation,
+                user_id=user_id,
+                matched_skill=matched_skill,
+                skill_policy=skill_policy,
+                response_state=response_state,
+                trace=agent_trace,
+            )
+            if artifacts:
+                response_state["artifacts"] = artifacts
 
             done_metadata = {
                 "conversation_id": conversation.id,
@@ -733,6 +875,80 @@ class Agent:
             except Exception:
                 logger.exception("after_message hook failed in background")
 
+    def _apply_skill_policy(
+        self,
+        planner_decision: PlannerDecision | None,
+        *,
+        matched_skill: str,
+        skill_policy: SkillPolicy | None,
+    ) -> PlannerDecision | None:
+        if planner_decision is None or skill_policy is None:
+            return planner_decision
+        if planner_decision.task_intent == TaskIntent.DOCUMENT_INGEST:
+            return planner_decision
+        if skill_policy.allowed_tools:
+            selected = planner_decision.selected_tool
+            if not selected or selected not in skill_policy.allowed_tools:
+                planner_decision.selected_tool = skill_policy.allowed_tools[0]
+        if skill_policy.allow_autonomous:
+            planner_decision.control_mode = ControlMode.AUTONOMOUS
+            planner_decision.planner_hint = (
+                planner_decision.planner_hint
+                + f" 当前命中技能「{matched_skill}」，请在允许工具范围内进行受控自主决策。"
+            ).strip()
+        return planner_decision
+
+    async def _run_post_actions(
+        self,
+        *,
+        conversation: Conversation,
+        user_id: str,
+        matched_skill: str,
+        skill_policy: SkillPolicy | None,
+        response_state: dict[str, object],
+        trace: TraceContext | None = None,
+    ) -> list[dict[str, str]]:
+        if self.post_action_adapter is None or skill_policy is None or not skill_policy.post_actions:
+            return []
+        final_message = next(
+            (
+                msg.content or ""
+                for msg in reversed(conversation.messages)
+                if msg.role == "assistant"
+            ),
+            "",
+        ).strip()
+        if not final_message:
+            return []
+        tool_path = [str(value) for value in response_state.get("tool_path", []) if str(value)]
+        try:
+            artifacts = await self.post_action_adapter.run(
+                user_id=user_id,
+                conversation_id=conversation.id,
+                matched_skill=matched_skill,
+                post_actions=list(skill_policy.post_actions),
+                final_text=final_message,
+                tool_path=tool_path,
+            )
+        except Exception:
+            logger.exception("post actions failed")
+            if trace is not None:
+                trace.record_stage(
+                    "post_actions",
+                    {"status": "error", "post_actions": list(skill_policy.post_actions)},
+                )
+            return []
+        if trace is not None:
+            trace.record_stage(
+                "post_actions",
+                {
+                    "status": "success" if artifacts else "skipped",
+                    "post_actions": list(skill_policy.post_actions),
+                    "artifact_count": len(artifacts),
+                },
+            )
+        return artifacts
+
     def _response_profile(self) -> str:
         value = str(getattr(self.config, "response_profile", "") or "").strip().lower()
         return value if value in {"balanced_fast", "quality_first"} else "quality_first"
@@ -740,10 +956,18 @@ class Agent:
     def _should_use_direct_tool_path(
         self,
         planner_decision: PlannerDecision | None,
+        latest_message: str = "",
     ) -> bool:
         if self._response_profile() != "balanced_fast":
             return False
         if planner_decision is None or planner_decision.is_composite:
+            return False
+        if planner_decision.control_mode == ControlMode.AUTONOMOUS:
+            return False
+        if (
+            planner_decision.task_intent == TaskIntent.KNOWLEDGE_QUERY
+            and _detect_specialized_tool_hint(latest_message) is not None
+        ):
             return False
         return planner_decision.task_intent in {
             TaskIntent.KNOWLEDGE_QUERY,
@@ -1481,6 +1705,7 @@ class Agent:
         planner_decision: PlannerDecision | None = None,
         planner_runtime: dict[str, object] | None = None,
         response_state: dict[str, object] | None = None,
+        skill_policy: SkillPolicy | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Inner ReAct loop: call LLM -> execute tools -> repeat.
 
@@ -1497,8 +1722,48 @@ class Agent:
         course_task = _is_course_task(planner_decision)
         evidence_bundle: EvidenceBundle | None = None
         latest_grounded_tool_text = ""
+        policy_allowed_tools = (
+            set(skill_policy.allowed_tools)
+            if skill_policy is not None and skill_policy.allowed_tools
+            else set()
+        )
+        autonomous_active = (
+            planner_decision is not None
+            and planner_decision.control_mode == ControlMode.AUTONOMOUS
+        )
+        autonomous_allowed_tools = (
+            set(policy_allowed_tools or self.tools.tool_names)
+            if autonomous_active
+            else set()
+        )
+        if autonomous_active:
+            autonomous_allowed_tools.discard("document_ingest")
+        autonomous_max_steps = min(
+            self.config.max_tool_iterations,
+            int(getattr(skill_policy, "max_steps", 5) or 5) if autonomous_active else self.config.max_tool_iterations,
+        )
+        autonomous_tool_counts: dict[str, int] = {}
+        tool_path: list[str] = []
 
-        if self._should_use_direct_tool_path(planner_decision):
+        def _update_autonomous_state(stop_reason: str | None = None) -> None:
+            if not autonomous_active:
+                return
+            if response_state is not None:
+                response_state["autonomous_step_count"] = len(tool_path)
+                response_state["tool_path"] = list(tool_path)
+                if stop_reason:
+                    response_state["autonomous_stop_reason"] = stop_reason
+            if trace is not None and stop_reason:
+                trace.record_stage(
+                    "autonomous_stop_reason",
+                    {
+                        "reason": stop_reason,
+                        "tool_path": list(tool_path),
+                        "step_count": len(tool_path),
+                    },
+                )
+
+        if self._should_use_direct_tool_path(planner_decision, _latest_user_message(conversation)):
             direct_tool_call = self._build_direct_tool_call(conversation, tool_ctx, planner_decision)
             if direct_tool_call is not None:
                 if trace is not None:
@@ -1522,7 +1787,7 @@ class Agent:
                     yield event
                 return
 
-        for iteration in range(self.config.max_tool_iterations):
+        for iteration in range(autonomous_max_steps if autonomous_active else self.config.max_tool_iterations):
             iteration_started = time.monotonic()
             iteration_prompt = system_prompt
             available_tool_schemas = tool_schemas
@@ -1543,7 +1808,34 @@ class Agent:
                 )
             )
 
-            if force_active and planner_decision is not None:
+            if autonomous_active:
+                visible_tools = {
+                    name
+                    for name in autonomous_allowed_tools
+                    if autonomous_tool_counts.get(name, 0) < 2
+                } or set(autonomous_allowed_tools)
+                available_tool_schemas = _restrict_tool_schemas_to_allowed(
+                    tool_schemas,
+                    visible_tools,
+                )
+                iteration_prompt = (
+                    system_prompt
+                    + "\n\n## [Autonomous Policy]\n"
+                    + "你处于受控自主模式。请根据上一步观察决定下一步，只调用最必要的一个工具；"
+                    + "若已有足够信息，请直接收敛并回答用户。\n"
+                    + f"允许工具: {', '.join(sorted(visible_tools))}\n"
+                    + f"最大工具步数: {autonomous_max_steps}"
+                )
+                if trace is not None:
+                    trace.record_stage(
+                        "autonomous_iteration",
+                        {
+                            "iteration": iteration + 1,
+                            "allowed_tools": sorted(visible_tools),
+                            "used_tool_counts": dict(autonomous_tool_counts),
+                        },
+                    )
+            elif force_active and planner_decision is not None:
                 available_tool_schemas = _restrict_tool_schemas(
                     tool_schemas,
                     planner_decision.selected_tool,
@@ -1574,6 +1866,12 @@ class Agent:
                     system_prompt
                     + "\n\n## [Grounding Context]\n"
                     + build_grounding_context(evidence_bundle, course_task=course_task)
+                )
+
+            if not autonomous_active and policy_allowed_tools:
+                available_tool_schemas = _restrict_tool_schemas_to_allowed(
+                    available_tool_schemas,
+                    policy_allowed_tools,
                 )
 
             llm_messages = await self._build_llm_messages(conversation, iteration_prompt)
@@ -1730,16 +2028,67 @@ class Agent:
                         metadata={"arguments": tc.arguments},
                     )
 
-                    tool_blocked = False
-                    for hook in self.hooks:
-                        try:
-                            await hook.before_tool(tc.name, tool_ctx)
-                        except Exception as exc:
-                            logger.warning("before_tool hook blocked %s: %s", tc.name, exc)
-                            tool_blocked = True
-                            break
+                    tool_result_obj: ToolResult
+                    policy_blocked = False
+                    effective_allowed_tools = autonomous_allowed_tools if autonomous_active else policy_allowed_tools
+                    if effective_allowed_tools and tc.name not in effective_allowed_tools:
+                        policy_blocked = True
+                        tool_result_obj = ToolResult(
+                            success=False,
+                            error=f"工具 `{tc.name}` 不在当前技能允许范围内",
+                            metadata={
+                                "tool_name": tc.name,
+                                "error_type": "policy_blocked",
+                                "retryable": False,
+                            },
+                        )
+                        if trace is not None:
+                            trace.record_stage(
+                                "autonomous_guardrail",
+                                {
+                                    "iteration": iteration + 1,
+                                    "tool_name": tc.name,
+                                    "reason": "tool_not_allowed",
+                                },
+                            )
+                    elif autonomous_active and autonomous_tool_counts.get(tc.name, 0) >= 2:
+                        policy_blocked = True
+                        tool_result_obj = ToolResult(
+                            success=False,
+                            error=f"工具 `{tc.name}` 在本轮任务中已达到最大调用次数",
+                            metadata={
+                                "tool_name": tc.name,
+                                "error_type": "policy_blocked",
+                                "retryable": False,
+                            },
+                        )
+                        if trace is not None:
+                            trace.record_stage(
+                                "autonomous_guardrail",
+                                {
+                                    "iteration": iteration + 1,
+                                    "tool_name": tc.name,
+                                    "reason": "tool_reuse_limit",
+                                },
+                            )
+                    else:
+                        if autonomous_active:
+                            autonomous_tool_counts[tc.name] = autonomous_tool_counts.get(tc.name, 0) + 1
+                            tool_path.append(tc.name)
 
-                    if tool_blocked:
+                    tool_blocked = False
+                    if not policy_blocked:
+                        for hook in self.hooks:
+                            try:
+                                await hook.before_tool(tc.name, tool_ctx)
+                            except Exception as exc:
+                                logger.warning("before_tool hook blocked %s: %s", tc.name, exc)
+                                tool_blocked = True
+                                break
+
+                    if policy_blocked:
+                        pass
+                    elif tool_blocked:
                         tool_result_obj = ToolResult(
                             success=False,
                             error="Tool execution blocked by hook",
@@ -1789,6 +2138,9 @@ class Agent:
                             tool_result_obj.result_for_llm if tool_result_obj.success else (tool_result_obj.error or ""),
                             tool_result_obj.metadata,
                         )
+                    if autonomous_active and response_state is not None:
+                        response_state["tool_path"] = list(tool_path)
+                        response_state["autonomous_step_count"] = len(tool_path)
 
                     if trace is not None:
                         trace.record_stage(
@@ -1871,6 +2223,7 @@ class Agent:
                                 "evaluation_mode": evaluation_mode,
                             },
                         )
+                    _update_autonomous_state("tool_final_answer")
                     conversation.messages.append(Message(role="assistant", content=final_text or ""))
                     return
 
@@ -1957,6 +2310,9 @@ class Agent:
                 )
             if response_state is not None:
                 response_state.update(_build_evidence_metadata(evidence_bundle, grounding_assessment))
+                if autonomous_active:
+                    response_state["tool_path"] = list(tool_path)
+                    response_state["autonomous_step_count"] = len(tool_path)
             if trace is not None:
                 trace.record_stage(
                     "final_response",
@@ -1972,6 +2328,7 @@ class Agent:
                         ),
                     },
                 )
+            _update_autonomous_state("assistant_answer")
             conversation.messages.append(Message(role="assistant", content=final_content or ""))
             return
 
@@ -1981,12 +2338,13 @@ class Agent:
                 "error",
                 {
                     "phase": "tool_loop",
-                    "error": f"max_iterations_exceeded:{self.config.max_tool_iterations}",
+                    "error": f"max_iterations_exceeded:{autonomous_max_steps if autonomous_active else self.config.max_tool_iterations}",
                 },
             )
+        _update_autonomous_state("max_iterations_exceeded")
         yield StreamEvent(
             type=StreamEventType.ERROR,
-            content=f"达到最大工具调用轮次 ({self.config.max_tool_iterations})，请简化问题后重试。",
+            content=f"达到最大工具调用轮次 ({autonomous_max_steps if autonomous_active else self.config.max_tool_iterations})，请简化问题后重试。",
         )
 
     async def _finalize_answer(

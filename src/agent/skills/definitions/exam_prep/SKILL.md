@@ -14,6 +14,26 @@ tools_required:
 memory_required:
   - error_memory
   - knowledge_map
+allowed_tools:
+  - concept_graph_query
+  - knowledge_query
+  - review_summary
+  - quiz_generator
+  - network_calc
+required_memory:
+  - knowledge_map
+  - error_memory
+  - student_profile
+allow_autonomous: true
+max_steps: 5
+entry_conditions:
+  min_topics: 1
+output_contract:
+  - review_summary
+  - weak_points_highlight
+  - optional_quiz
+post_actions:
+  - schedule_export
 estimated_tokens: 800
 difficulty: medium
 ---

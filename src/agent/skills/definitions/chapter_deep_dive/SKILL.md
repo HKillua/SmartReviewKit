@@ -11,6 +11,23 @@ tools_required:
   - review_summary
 memory_required:
   - knowledge_map
+allowed_tools:
+  - concept_graph_query
+  - knowledge_query
+  - protocol_state_simulator
+  - network_calc
+required_memory:
+  - knowledge_map
+allow_autonomous: true
+max_steps: 4
+entry_conditions:
+  min_topics: 1
+output_contract:
+  - structured_explanation
+  - optional_simulation
+  - mind_map
+post_actions:
+  - notes_export
 estimated_tokens: 700
 difficulty: hard
 ---

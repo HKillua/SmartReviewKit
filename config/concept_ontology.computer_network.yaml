@@ -1,0 +1,145 @@
+concepts:
+  - key: 传输层
+    title: 传输层
+    aliases: [transport layer]
+    chapter: 第3章 运输层
+    summary: 负责端到端通信、复用分解、可靠传输与拥塞控制。
+    subtopics: [TCP, UDP, 复用与分解, 可靠传输, 流量控制, 拥塞控制]
+    prerequisites: [网络层, IP]
+    confusable: [网络层]
+  - key: TCP
+    title: TCP
+    aliases: [tcp]
+    chapter: 第3章 运输层
+    summary: 面向连接、可靠、按字节流传输的运输层协议。
+    subtopics: [三次握手, 四次挥手, 流量控制, 拥塞控制, 滑动窗口, 超时重传]
+    prerequisites: [传输层, 复用与分解, 可靠传输]
+    confusable: [UDP]
+  - key: UDP
+    title: UDP
+    aliases: [udp]
+    chapter: 第3章 运输层
+    summary: 无连接、尽力而为、报文导向的运输层协议。
+    subtopics: [报文传输, 检验和, 多媒体应用]
+    prerequisites: [传输层]
+    confusable: [TCP]
+  - key: 三次握手
+    title: TCP 三次握手
+    aliases: [tcp三次握手, 三次握手, handshake]
+    chapter: 第3章 运输层
+    summary: TCP 建立连接时的三步交互过程，用于同步序号并确认收发能力。
+    subtopics: [SYN, SYN-ACK, ACK]
+    prerequisites: [TCP, 序列号, 确认号]
+    confusable: [四次挥手]
+  - key: 四次挥手
+    title: TCP 四次挥手
+    aliases: [tcp四次挥手, 四次挥手]
+    chapter: 第3章 运输层
+    summary: TCP 释放连接的四步过程。
+    subtopics: [FIN, ACK, TIME_WAIT]
+    prerequisites: [TCP, 三次握手]
+    confusable: [三次握手]
+  - key: 流量控制
+    title: 流量控制
+    aliases: [flow control]
+    chapter: 第3章 运输层
+    summary: 发送方根据接收窗口调节发送速度，防止接收方来不及处理。
+    subtopics: [接收窗口, 零窗口, 滑动窗口]
+    prerequisites: [TCP, 滑动窗口]
+    confusable: [拥塞控制]
+  - key: 拥塞控制
+    title: 拥塞控制
+    aliases: [congestion control]
+    chapter: 第3章 运输层
+    summary: 发送方根据网络拥塞状态调节发送速率。
+    subtopics: [慢启动, 拥塞避免, 快重传, 快恢复]
+    prerequisites: [TCP, 滑动窗口, RTT]
+    confusable: [流量控制]
+  - key: 滑动窗口
+    title: 滑动窗口
+    aliases: [窗口机制, sliding window]
+    chapter: 第3章 运输层
+    summary: 利用窗口提升链路利用率并支撑可靠传输。
+    subtopics: [发送窗口, 接收窗口, Go-Back-N, Selective Repeat]
+    prerequisites: [序列号, ACK]
+    confusable: [停等协议]
+  - key: Go-Back-N
+    title: Go-Back-N
+    aliases: [gbn, 回退n帧]
+    chapter: 第3章 运输层
+    summary: 接收方只按序接收，发送方超时后回退重传。
+    subtopics: [窗口利用率, 累计确认]
+    prerequisites: [滑动窗口]
+    confusable: [Selective Repeat]
+  - key: Selective Repeat
+    title: Selective Repeat
+    aliases: [sr, 选择重传]
+    chapter: 第3章 运输层
+    summary: 对出错或丢失帧按需选择性重传。
+    subtopics: [缓存乱序分组, 独立确认]
+    prerequisites: [滑动窗口]
+    confusable: [Go-Back-N]
+  - key: 网络层
+    title: 网络层
+    aliases: [network layer]
+    chapter: 第4章 网络层
+    summary: 负责主机到主机的分组转发与路由选择。
+    subtopics: [IP, 路由, 子网划分, NAT, ARP]
+    prerequisites: [链路层]
+    confusable: [传输层]
+  - key: IP
+    title: IP
+    aliases: [ip, 网际协议]
+    chapter: 第4章 网络层
+    summary: 提供无连接、尽力而为的数据报服务。
+    subtopics: [IP 地址, 分片, TTL, 首部]
+    prerequisites: [网络层]
+    confusable: [TCP]
+  - key: 子网划分
+    title: 子网划分
+    aliases: [cidr, 子网, 子网掩码]
+    chapter: 第4章 网络层
+    summary: 通过借位和掩码划分网络，提升地址利用率和路由聚合能力。
+    subtopics: [CIDR, 广播地址, 可用主机数]
+    prerequisites: [IP, 二进制]
+    confusable: [路由聚合]
+  - key: ARP
+    title: ARP
+    aliases: [arp]
+    chapter: 第4章 网络层
+    summary: 完成 IP 地址到 MAC 地址的解析。
+    subtopics: [ARP 请求, ARP 应答, ARP 缓存]
+    prerequisites: [IP, 以太网]
+    confusable: [DNS]
+  - key: 应用层
+    title: 应用层
+    aliases: [application layer]
+    chapter: 第2章 应用层
+    summary: 为应用进程提供网络服务。
+    subtopics: [DNS, HTTP, HTTPS, SMTP, FTP]
+    prerequisites: [传输层]
+    confusable: []
+  - key: DNS
+    title: DNS
+    aliases: [dns]
+    chapter: 第2章 应用层
+    summary: 层次化分布式域名系统，完成人类可读域名到 IP 的解析。
+    subtopics: [递归查询, 迭代查询, 根域名服务器, 本地域名服务器]
+    prerequisites: [应用层, UDP]
+    confusable: [ARP, DHCP]
+  - key: HTTP
+    title: HTTP
+    aliases: [http]
+    chapter: 第2章 应用层
+    summary: Web 传输协议，基于请求-响应模型。
+    subtopics: [请求方法, 状态码, 持久连接]
+    prerequisites: [应用层, TCP]
+    confusable: [HTTPS]
+  - key: HTTPS
+    title: HTTPS
+    aliases: [https]
+    chapter: 第2章 应用层
+    summary: 在 HTTP 之上叠加 TLS 实现加密和身份验证。
+    subtopics: [TLS 握手, 证书, 对称加密]
+    prerequisites: [HTTP, TCP]
+    confusable: [HTTP]

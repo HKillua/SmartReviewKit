@@ -7,7 +7,7 @@ from typing import Optional
 
 from pydantic import BaseModel
 
-from src.agent.skills.registry import SkillRegistry
+from src.agent.skills.registry import SkillPolicy, SkillRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +17,7 @@ class WorkflowResult(BaseModel):
     skill_instruction: Optional[str] = None
     matched_skill: Optional[str] = None
     direct_response: Optional[str] = None
+    skill_policy: Optional[SkillPolicy] = None
 
 
 class SkillWorkflowHandler:
@@ -46,6 +47,7 @@ class SkillWorkflowHandler:
 
         # Load Level 2 instruction
         instruction = self._registry.load_instruction(matched)
+        policy = self._registry.load_policy(matched)
         if instruction is None:
             logger.warning("Matched skill '%s' but failed to load instruction", matched)
             return WorkflowResult()
@@ -59,4 +61,5 @@ class SkillWorkflowHandler:
         return WorkflowResult(
             skill_instruction=skill_text,
             matched_skill=matched,
+            skill_policy=policy,
         )

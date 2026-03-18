@@ -24,6 +24,7 @@ from src.agent.config import (
     load_server_config,
 )
 from src.agent.llm.factory import create_llm_service
+from src.agent.post_actions import ArtifactPostActionAdapter
 from src.agent.hooks.retry_middleware import RetryWithBackoffMiddleware
 from src.agent.hooks.review_schedule import ReviewScheduleHook
 from src.agent.memory.context_filter import ContextEngineeringFilter
@@ -33,8 +34,11 @@ from src.agent.prompt_builder import SystemPromptBuilder
 from src.agent.skills.registry import SkillRegistry
 from src.agent.skills.workflow import SkillWorkflowHandler
 from src.agent.tools.base import ToolRegistry
+from src.agent.tools.concept_graph_query import ConceptGraphQueryTool
 from src.agent.tools.document_ingest import DocumentIngestTool
 from src.agent.tools.knowledge_query import KnowledgeQueryTool
+from src.agent.tools.network_calc import NetworkCalcTool
+from src.agent.tools.protocol_state_simulator import ProtocolStateSimulatorTool
 from src.agent.tools.quiz_evaluator import QuizEvaluatorTool
 from src.agent.tools.quiz_generator import QuizGeneratorTool
 from src.agent.tools.review_summary import ReviewSummaryTool
@@ -355,6 +359,12 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         trace_enabled=bool(settings.get("observability", {}).get("trace_enabled", False)),
         trace_collector=shared_trace_collector,
     ))
+    tool_registry.register(NetworkCalcTool())
+    tool_registry.register(ConceptGraphQueryTool(
+        knowledge_map=kmap_mem,
+        error_memory=error_mem,
+    ))
+    tool_registry.register(ProtocolStateSimulatorTool())
 
     # --- Skills ---
     skill_registry = SkillRegistry(agent_cfg.skills_dir)
@@ -395,6 +405,10 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         )
         llm_middlewares.append(reflection_mw)
 
+    post_action_adapter = ArtifactPostActionAdapter(
+        object_store=ingestion_backends.object_store,
+    )
+
     agent = Agent(
         llm_service=llm,
         tool_registry=tool_registry,
@@ -408,6 +422,7 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
         skill_workflow=skill_workflow,
         context_filter=context_filter,
         review_hook=review_hook,
+        post_action_adapter=post_action_adapter,
         trace_enabled=bool(settings.get("observability", {}).get("trace_enabled", False)),
         trace_collector=shared_trace_collector,
         grounding_mode=core_settings.grounding.mode,

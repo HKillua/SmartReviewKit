@@ -25,6 +25,7 @@ class ControlMode(str, Enum):
     PASS_THROUGH = "pass_through"
     ADVISORY = "advisory"
     FORCE_TOOL = "force_tool"
+    AUTONOMOUS = "autonomous"
 
 
 @dataclass
@@ -107,33 +108,33 @@ _SKILL_TO_INTENT: Dict[str, PlannerDecision] = {
         task_intent=TaskIntent.QUIZ_GENERATOR,
         confidence=1.0,
         match_method="skill",
-        control_mode=ControlMode.FORCE_TOOL,
+        control_mode=ControlMode.AUTONOMOUS,
         selected_tool=TaskIntent.QUIZ_GENERATOR.value,
-        planner_hint="这是习题训练任务，优先先调用 quiz_generator 生成练习题。",
+        planner_hint="这是习题训练任务，允许在受控范围内自主决定出题、判题和针对性解释。",
     ),
     "exam_prep": PlannerDecision(
         task_intent=TaskIntent.REVIEW_SUMMARY,
         confidence=1.0,
         match_method="skill",
-        control_mode=ControlMode.FORCE_TOOL,
+        control_mode=ControlMode.AUTONOMOUS,
         selected_tool=TaskIntent.REVIEW_SUMMARY.value,
-        planner_hint="这是考试复习任务，优先先调用 review_summary 生成复习摘要。",
+        planner_hint="这是考试复习任务，允许先看掌握情况，再决定检索、总结和补题顺序。",
     ),
     "chapter_deep_dive": PlannerDecision(
         task_intent=TaskIntent.KNOWLEDGE_QUERY,
         confidence=0.92,
         match_method="skill",
-        control_mode=ControlMode.ADVISORY,
+        control_mode=ControlMode.AUTONOMOUS,
         selected_tool=TaskIntent.KNOWLEDGE_QUERY.value,
-        planner_hint="这是章节深入讲解任务，建议先调用 knowledge_query 获取课程证据。",
+        planner_hint="这是章节深入讲解任务，允许在知识检索、概念图谱和协议模拟之间自主选择。",
     ),
     "error_review": PlannerDecision(
-        task_intent=TaskIntent.QUIZ_GENERATOR,
+        task_intent=TaskIntent.KNOWLEDGE_QUERY,
         confidence=0.82,
         match_method="skill",
-        control_mode=ControlMode.ADVISORY,
-        selected_tool=TaskIntent.QUIZ_GENERATOR.value,
-        planner_hint="这是错题回顾任务，建议优先从练习和历史错误视角组织回答。",
+        control_mode=ControlMode.AUTONOMOUS,
+        selected_tool=TaskIntent.KNOWLEDGE_QUERY.value,
+        planner_hint="这是错题回顾任务，允许先分析薄弱点，再决定讲解、模拟或补救练习。",
     ),
     "knowledge_check": PlannerDecision(
         task_intent=TaskIntent.KNOWLEDGE_QUERY,
@@ -307,9 +308,9 @@ class TaskPlanner:
             task_intent=primary_intent,
             confidence=1.0,
             match_method="rule_composite",
-            control_mode=ControlMode.FORCE_TOOL,
+            control_mode=ControlMode.AUTONOMOUS,
             selected_tool=subtasks[0].selected_tool,
-            planner_hint=self._build_composite_hint(subtasks),
+            planner_hint=self._build_composite_hint(subtasks, autonomous=True),
             is_composite=True,
             subtasks=subtasks,
             primary_intent=primary_intent,
@@ -461,12 +462,14 @@ class TaskPlanner:
         )
 
     @staticmethod
-    def _build_composite_hint(subtasks: list[PlannedSubtask]) -> str:
+    def _build_composite_hint(subtasks: list[PlannedSubtask], *, autonomous: bool = False) -> str:
         ordered_tools = " -> ".join(subtask.selected_tool for subtask in subtasks)
-        return (
-            "这是复合学习任务，请严格按用户表达顺序依次执行子任务："
-            f"{ordered_tools}。"
-        )
+        if autonomous:
+            return (
+                "这是复合学习任务。以下是初始分解建议："
+                f"{ordered_tools}。请在观察结果后可控地调整下一步，但不要偏离用户目标。"
+            )
+        return f"这是复合学习任务，请严格按用户表达顺序依次执行子任务：{ordered_tools}。"
 
     @property
     def embedding_ready(self) -> bool:
