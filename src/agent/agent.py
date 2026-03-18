@@ -208,6 +208,23 @@ def _append_warning(text: str, warning: str) -> str:
     return f"{text.rstrip()}\n\n{warning}"
 
 
+def _tool_output_kind(metadata: dict[str, Any] | None) -> str:
+    if not metadata:
+        return ""
+    return str(metadata.get("tool_output_kind", "") or "").strip().lower()
+
+
+def _tool_result_is_final_answer(tool_name: str, metadata: dict[str, Any] | None) -> bool:
+    kind = _tool_output_kind(metadata)
+    if kind == "final_answer":
+        return True
+    if kind == "evidence_context":
+        return False
+    if tool_name == "knowledge_query":
+        return False
+    return bool((metadata or {}).get("final_response_preferred", False))
+
+
 def _parse_count_token(token: str) -> int | None:
     token = token.strip()
     if token.isdigit():
@@ -1002,12 +1019,13 @@ class Agent:
         evaluation_mode = str(tool_result_obj.metadata.get("evaluation_mode", "") or "")
         grounding_assessment: GroundingAssessment | None = None
 
-        final_response_preferred = bool(tool_result_obj.metadata.get("final_response_preferred", False))
+        final_response_preferred = _tool_result_is_final_answer(tool_call.name, tool_result_obj.metadata)
         grounding_passthrough = bool(tool_result_obj.metadata.get("grounding_passthrough", False))
+        tool_output_kind = _tool_output_kind(tool_result_obj.metadata)
 
         if (
             planner_decision.task_intent == TaskIntent.KNOWLEDGE_QUERY
-            and not final_response_preferred
+            and tool_output_kind != "final_answer"
         ):
             final_text, grounding_assessment = await self._generate_direct_knowledge_answer(
                 system_prompt=system_prompt,
@@ -1749,7 +1767,7 @@ class Agent:
                     if bundle is not None:
                         evidence_bundle = bundle
                         latest_grounded_tool_text = tool_result_obj.result_for_llm or ""
-                    if tool_result_obj.metadata.get("final_response_preferred"):
+                    if _tool_result_is_final_answer(tc.name, tool_result_obj.metadata):
                         passthrough_payload = (
                             tool_result_obj.result_for_llm if tool_result_obj.success else (tool_result_obj.error or ""),
                             tool_result_obj.metadata,

@@ -491,6 +491,7 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                     "collection": effective_collection,
                     "query_trace_ids": [query_trace.trace_id] if query_trace is not None else [],
                     "final_response_preferred": True,
+                    "tool_output_kind": "final_answer",
                 }
                 if composite_mode:
                     metadata.update(
@@ -542,15 +543,8 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                 "collection": effective_collection,
                 "query_trace_ids": query_trace_ids,
                 "fast_mode": fast_mode,
+                "tool_output_kind": "evidence_context",
             }
-            if fast_mode and _response_profile(context) == "balanced_fast":
-                metadata.update(
-                    {
-                        "final_response_preferred": True,
-                        "grounding_passthrough": True,
-                        "generation_mode": "knowledge_query_extract",
-                    }
-                )
             metadata.update(normalized_metadata)
             if composite_mode:
                 metadata.update(

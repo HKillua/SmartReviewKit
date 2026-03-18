@@ -217,6 +217,20 @@ class _KnowledgePlanner:
         )
 
 
+class _KnowledgeForcePlanner:
+    def plan(self, message, matched_skill=None):
+        from src.agent.planner import ControlMode, PlannerDecision, TaskIntent
+
+        return PlannerDecision(
+            task_intent=TaskIntent.KNOWLEDGE_QUERY,
+            confidence=1.0,
+            match_method="rule",
+            control_mode=ControlMode.FORCE_TOOL,
+            selected_tool="knowledge_query",
+            planner_hint="Use course evidence immediately.",
+        )
+
+
 class _GroundedTool(_TraceAwareTool):
     async def execute(self, context, args):
         from src.agent.types import ToolResult
@@ -256,6 +270,43 @@ class _GroundedAnswerLlm(_ToolThenAnswerLlm):
                 ],
             )
         return LlmResponse(content="TCP 通过三次握手建立连接 [1]。")
+
+
+class _DirectKnowledgeEvidenceTool(_TraceAwareTool):
+    async def execute(self, context, args):
+        from src.agent.types import ToolResult
+
+        return ToolResult(
+            success=True,
+            result_for_llm=(
+                "以下是与问题最相关的课程证据。回答时优先依据这些证据，并在核心结论后保留对应引用标记。\n\n"
+                "[1] `blogger_intro.pdf` · 笔记价格说明\n价格为 199 元。"
+            ),
+            metadata={
+                "grounding_capable": True,
+                "tool_output_kind": "evidence_context",
+                "query_trace_id": "query-trace-199",
+                "query_trace_ids": ["query-trace-199"],
+                "source_count": 1,
+                "citations": [
+                    {
+                        "index": 1,
+                        "source": "blogger_intro.pdf",
+                        "text_snippet": "价格为 199 元。",
+                    }
+                ],
+                "evidence_summary": "[1] `blogger_intro.pdf`: 价格为 199 元。",
+            },
+        )
+
+
+class _DirectKnowledgeAnswerLlm:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def send_request(self, request):
+        self.calls += 1
+        return LlmResponse(content="博主的笔记价格是 199 元 [1]。")
 
 
 class _ReviewPassthroughTool:
@@ -574,7 +625,7 @@ async def test_agent_done_event_contains_grounding_metadata(tmp_path: Path) -> N
         llm_service=_GroundedAnswerLlm(),
         tool_registry=registry,
         conversation_store=store,
-        config=AgentConfig(stream_responses=False, max_tool_iterations=2),
+        config=AgentConfig(stream_responses=False, max_tool_iterations=2, response_profile="quality_first"),
         task_planner=_KnowledgePlanner(),
         trace_enabled=True,
         trace_collector=collector,
@@ -618,7 +669,7 @@ async def test_grounding_passthrough_tool_skips_conservative_rewrite(tmp_path: P
         llm_service=llm,
         tool_registry=registry,
         conversation_store=store,
-        config=AgentConfig(stream_responses=False, max_tool_iterations=2),
+        config=AgentConfig(stream_responses=False, max_tool_iterations=2, response_profile="quality_first"),
         task_planner=_ReviewPlanner(),
         trace_enabled=True,
         trace_collector=collector,
@@ -632,6 +683,49 @@ async def test_grounding_passthrough_tool_skips_conservative_rewrite(tmp_path: P
     assert "DNS 解析包含递归查询" in final_text
     assert done_event.metadata["grounding_score"] >= 0.4
     assert done_event.metadata["grounding_policy_action"] == "normal"
+
+
+@pytest.mark.asyncio
+async def test_direct_knowledge_query_evidence_context_generates_user_answer(tmp_path: Path) -> None:
+    from src.agent.agent import Agent
+    from src.agent.config import AgentConfig
+    from src.agent.conversation import ConversationStore
+    from src.agent.tools.base import ToolRegistry
+
+    trace_path = tmp_path / "direct_knowledge_answer.jsonl"
+    collector = TraceCollector(traces_path=trace_path)
+
+    conversation = Conversation(id="conv_direct_knowledge", user_id="u1", messages=[])
+    store = AsyncMock(spec=ConversationStore)
+    store.get.return_value = conversation
+    store.create.return_value = conversation
+    store.update.return_value = None
+
+    registry = ToolRegistry()
+    registry.register(_DirectKnowledgeEvidenceTool())
+
+    llm = _DirectKnowledgeAnswerLlm()
+    agent = Agent(
+        llm_service=llm,
+        tool_registry=registry,
+        conversation_store=store,
+        config=AgentConfig(stream_responses=False, max_tool_iterations=1, response_profile="balanced_fast"),
+        task_planner=_KnowledgeForcePlanner(),
+        trace_enabled=True,
+        trace_collector=collector,
+    )
+
+    events = [event async for event in agent.chat("博主的笔记价格是多少？", "u1", "conv_direct_knowledge")]
+
+    final_text = "".join(event.content or "" for event in events if event.type.value == "text_delta")
+    done_event = next(event for event in events if event.type.value == "done")
+
+    assert llm.calls == 1
+    assert "199" in final_text
+    assert "以下是与问题最相关的课程证据" not in final_text
+    assert done_event.metadata["generation_mode"] == "direct_knowledge_query"
+    assert done_event.metadata["query_trace_ids"] == ["query-trace-199"]
+    assert len(done_event.metadata["citations"]) == 1
 
 
 @pytest.mark.asyncio
@@ -928,7 +1022,7 @@ async def test_force_tool_first_round_only_exposes_selected_tool_schema(tmp_path
         llm_service=llm,
         tool_registry=registry,
         conversation_store=store,
-        config=AgentConfig(stream_responses=False, max_tool_iterations=3),
+        config=AgentConfig(stream_responses=False, max_tool_iterations=3, response_profile="quality_first"),
         task_planner=_StubPlanner(),
         trace_enabled=True,
         trace_collector=collector,
@@ -983,7 +1077,7 @@ async def test_planner_violation_retries_then_downgrades_to_advisory(tmp_path: P
         llm_service=llm,
         tool_registry=registry,
         conversation_store=store,
-        config=AgentConfig(stream_responses=False, max_tool_iterations=4),
+        config=AgentConfig(stream_responses=False, max_tool_iterations=4, response_profile="quality_first"),
         task_planner=_StubPlanner(),
         trace_enabled=True,
         trace_collector=collector,

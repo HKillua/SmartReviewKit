@@ -406,6 +406,31 @@ class TestQ2ConfigDrivenEnhancement:
         assert result.success is True
         assert result.metadata["source_count"] == 1
         assert len(result.result_for_llm) < len(long_text)
+        assert result.metadata["tool_output_kind"] == "evidence_context"
+        assert result.metadata.get("final_response_preferred") is not True
+
+    @pytest.mark.asyncio
+    async def test_no_result_response_is_marked_as_final_answer(self):
+        from src.agent.tools.knowledge_query import KnowledgeQueryArgs, KnowledgeQueryTool
+        from src.agent.types import ToolContext
+
+        mock_hs = MagicMock()
+        mock_hs.search = MagicMock(return_value=[])
+
+        tool = KnowledgeQueryTool(
+            settings=self._make_settings(),
+            hybrid_search=mock_hs,
+        )
+        tool._current_collection = "computer_network"
+
+        result = await tool.execute(
+            ToolContext(user_id="u", conversation_id="c"),
+            KnowledgeQueryArgs(query="一个不存在的知识点", collection="computer_network"),
+        )
+
+        assert result.success is True
+        assert result.metadata["tool_output_kind"] == "final_answer"
+        assert result.metadata["final_response_preferred"] is True
 
 
 # ===================================================================
