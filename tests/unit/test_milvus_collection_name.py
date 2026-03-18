@@ -32,6 +32,26 @@ class _FakeMilvusClient:
         return {"row_count": 0}
 
 
+class _FakeMilvusWriteClient(_FakeMilvusClient):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.upsert_calls = []
+        self.flush_calls = []
+        self.get_calls = 0
+
+    def upsert(self, *, collection_name: str, data):
+        self.upsert_calls.append((collection_name, list(data)))
+
+    def flush(self, collection_name: str) -> None:
+        self.flush_calls.append(collection_name)
+
+    def get(self, *, collection_name: str, ids, output_fields):
+        self.get_calls += 1
+        if self.get_calls == 1:
+            return []
+        return [{"id": item} for item in ids]
+
+
 def test_milvus_store_normalizes_invalid_collection_name(monkeypatch) -> None:
     monkeypatch.setattr("src.libs.vector_store.milvus_store.PYMILVUS_AVAILABLE", True)
     monkeypatch.setattr("src.libs.vector_store.milvus_store.MilvusClient", _FakeMilvusClient)
@@ -100,3 +120,38 @@ def test_milvus_store_skips_repeat_load_when_state_is_cached(monkeypatch) -> Non
 
     assert len(initial_calls) == 1
     assert store.client.loaded == initial_calls
+
+
+def test_milvus_service_upsert_skips_flush_and_waits_for_visibility(monkeypatch) -> None:
+    monkeypatch.setattr("src.libs.vector_store.milvus_store.PYMILVUS_AVAILABLE", True)
+    monkeypatch.setattr("src.libs.vector_store.milvus_store.MilvusClient", _FakeMilvusWriteClient)
+
+    settings = SimpleNamespace(
+        vector_store=SimpleNamespace(collection_name="default"),
+        milvus=SimpleNamespace(
+            mode="service",
+            uri="http://127.0.0.1:19530",
+            host="127.0.0.1",
+            port=19530,
+            token="",
+            user="",
+            password="",
+            db_name="",
+            dim=4,
+            post_upsert_visibility_timeout_s=0.2,
+            post_upsert_poll_interval_s=0.0,
+        ),
+    )
+
+    store = MilvusStore(settings)
+    store.upsert([
+        {
+            "id": "chunk-1",
+            "vector": [0.1, 0.2, 0.3, 0.4],
+            "metadata": {"text": "price 199", "source_path": "tmp.pdf"},
+        }
+    ])
+
+    assert store.client.upsert_calls
+    assert store.client.flush_calls == []
+    assert store.client.get_calls >= 2

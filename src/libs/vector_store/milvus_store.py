@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -58,6 +59,13 @@ class MilvusStore(BaseVectorStore):
         self._dim = int(getattr(milvus_cfg, "dim", _DEFAULT_DIM))
         self._load_timeout_s = float(getattr(milvus_cfg, "load_timeout_s", 30.0))
         mode = getattr(milvus_cfg, "mode", "lite")
+        self._service_mode = mode == "service"
+        self._post_upsert_visibility_timeout_s = float(
+            getattr(milvus_cfg, "post_upsert_visibility_timeout_s", 2.0)
+        )
+        self._post_upsert_poll_interval_s = float(
+            getattr(milvus_cfg, "post_upsert_poll_interval_s", 0.1)
+        )
 
         from src.core.settings import resolve_path
 
@@ -162,6 +170,38 @@ class MilvusStore(BaseVectorStore):
         )
         self._loaded_collections.add(collection_name)
 
+    def _wait_for_ids_visible(self, ids: List[str]) -> None:
+        if not ids or self._post_upsert_visibility_timeout_s <= 0:
+            return
+
+        remaining = set(str(i) for i in ids[:5])
+        deadline = time.time() + self._post_upsert_visibility_timeout_s
+        while remaining and time.time() < deadline:
+            try:
+                results = self.client.get(
+                    collection_name=self.collection_name,
+                    ids=list(remaining),
+                    output_fields=["id"],
+                )
+            except Exception:
+                results = []
+            visible = {
+                str(record.get("id"))
+                for record in results
+                if isinstance(record, dict) and record.get("id") is not None
+            }
+            remaining.difference_update(visible)
+            if not remaining:
+                return
+            time.sleep(self._post_upsert_poll_interval_s)
+
+        if remaining:
+            logger.warning(
+                "Milvus visibility wait timed out for %d id(s) in collection '%s'",
+                len(remaining),
+                self.collection_name,
+            )
+
     @staticmethod
     def _is_loaded_state(state: Any) -> bool:
         if not isinstance(state, dict):
@@ -238,8 +278,14 @@ class MilvusStore(BaseVectorStore):
             })
 
         self.client.upsert(collection_name=self.collection_name, data=rows)
-        self.client.flush(self.collection_name)
-        self._ensure_loaded(self.collection_name)
+        if self._service_mode:
+            # Service-mode flush can block for many seconds on tiny writes.
+            # Poll lightweight visibility instead so uploads finish quickly
+            # while still making freshly-ingested chunks queryable.
+            self._wait_for_ids_visible([row["id"] for row in rows])
+        else:
+            self.client.flush(self.collection_name)
+            self._ensure_loaded(self.collection_name)
         logger.debug(f"Upserted {len(rows)} records to Milvus")
 
     def query(

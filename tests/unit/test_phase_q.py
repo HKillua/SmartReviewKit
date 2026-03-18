@@ -432,6 +432,41 @@ class TestQ2ConfigDrivenEnhancement:
         assert result.metadata["tool_output_kind"] == "final_answer"
         assert result.metadata["final_response_preferred"] is True
 
+    @pytest.mark.asyncio
+    async def test_compact_evidence_pack_keeps_query_matched_tail_fact(self):
+        from src.agent.tools.knowledge_query import KnowledgeQueryArgs, KnowledgeQueryTool
+        from src.agent.types import ToolContext
+
+        long_text = (
+            "博主介绍与笔记说明。" * 60
+            + "笔记目前在小红书链接售卖，价格199元。"
+        )
+        mock_hs = MagicMock()
+        mock_hs.search = MagicMock(
+            return_value=[
+                RetrievalResult(
+                    chunk_id="chunk_price",
+                    score=0.93,
+                    text=long_text,
+                    metadata={"source_path": "blogger_intro.pdf", "title": "商品介绍"},
+                )
+            ]
+        )
+
+        tool = KnowledgeQueryTool(
+            settings=self._make_settings(),
+            hybrid_search=mock_hs,
+        )
+        tool._current_collection = "computer_network"
+
+        result = await tool.execute(
+            ToolContext(user_id="u", conversation_id="c"),
+            KnowledgeQueryArgs(query="博主的笔记价格是多少", collection="computer_network"),
+        )
+
+        assert result.success is True
+        assert "199" in result.result_for_llm
+
 
 # ===================================================================
 # Q3: Conversation-aware rewriting

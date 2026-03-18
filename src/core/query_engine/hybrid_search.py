@@ -262,7 +262,10 @@ class HybridSearch:
             raise ValueError("Query cannot be empty or whitespace-only")
         
         effective_top_k = top_k if top_k is not None else self.config.fusion_top_k
-        rerank_enabled = self.config.rerank_enabled and not fast_mode
+        # Fast mode still keeps cross-encoder rerank for answer quality and
+        # trace stability; the main latency win comes from skipping MMR and
+        # later extra LLM steps rather than removing rerank entirely.
+        rerank_enabled = self.config.rerank_enabled
         mmr_enabled = self.config.mmr_enabled and not fast_mode
         
         logger.debug(f"HybridSearch: query='{query[:50]}...', top_k={effective_top_k}")

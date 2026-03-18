@@ -38,6 +38,39 @@ _SLOW_QUERY_HINT_RE = re.compile(
     r"(总结|复习|考点|出题|练习|判分|批改|评估|生成|整理|梳理|同时|并且|以及|然后|先.*再|结合)",
     re.IGNORECASE,
 )
+_QUERY_LATIN_TOKEN_RE = re.compile(r"[A-Za-z0-9_+\-]{2,}")
+_QUERY_CHINESE_ONLY_RE = re.compile(r"[^\u4e00-\u9fff]+")
+_QUERY_STOP_TERMS = {
+    "什么",
+    "多少",
+    "几点",
+    "哪个",
+    "哪些",
+    "为什么",
+    "为何",
+    "怎么",
+    "如何",
+    "一下",
+    "介绍",
+    "介绍一下",
+    "概述",
+    "简述",
+    "流程",
+    "原理",
+    "区别",
+    "对比",
+    "比较",
+    "讲解",
+    "说明",
+    "讲讲",
+    "讲一下",
+    "说一下",
+    "聊聊",
+    "请问",
+    "一下子",
+    "什么是",
+    "是多少",
+}
 
 
 def _int_metadata(value: Any, default: int = -1) -> int:
@@ -190,7 +223,56 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
             return False
         return bool(_FAST_QUERY_KEYWORDS_RE.search(normalized) or normalized.endswith(("?", "？")))
 
-    def _build_compact_result_text(self, results: list[Any]) -> str:
+    def _extract_focus_terms(self, query: str) -> list[str]:
+        normalized = self._normalize_query(query)
+        latin_terms = [match.group(0) for match in _QUERY_LATIN_TOKEN_RE.finditer(normalized)]
+        chinese = _QUERY_CHINESE_ONLY_RE.sub("", normalized)
+        chinese = chinese.replace("的", "").replace("了", "").replace("呢", "").replace("吗", "").replace("么", "")
+        chinese_terms: list[str] = []
+        for size in range(min(4, len(chinese)), 1, -1):
+            for start in range(len(chinese) - size, -1, -1):
+                term = chinese[start : start + size]
+                if term in _QUERY_STOP_TERMS:
+                    continue
+                chinese_terms.append(term)
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for term in [*latin_terms, *chinese_terms]:
+            lowered = term.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            ordered.append(term)
+        ordered.sort(key=len, reverse=True)
+        return ordered
+
+    def _compact_excerpt(self, text: str, query: str) -> str:
+        cleaned = sanitize_retrieval_text(text).replace("\n", " ").strip()
+        if len(cleaned) <= self._compact_result_chars:
+            return cleaned
+
+        for term in self._extract_focus_terms(query):
+            idx = cleaned.lower().find(term.lower())
+            if idx < 0:
+                continue
+            half_window = self._compact_result_chars // 2
+            start = max(0, idx - half_window)
+            end = min(len(cleaned), start + self._compact_result_chars)
+            start = max(0, end - self._compact_result_chars)
+            snippet = cleaned[start:end].strip()
+            if start > 0:
+                snippet = "..." + snippet
+            if end < len(cleaned):
+                snippet = snippet + "..."
+            return snippet
+
+        head_chars = max(120, int(self._compact_result_chars * 0.55))
+        tail_chars = max(100, self._compact_result_chars - head_chars - 8)
+        head = cleaned[:head_chars].rstrip()
+        tail = cleaned[-tail_chars:].lstrip()
+        return f"{head}\n...\n{tail}"
+
+    def _build_compact_result_text(self, query: str, results: list[Any]) -> str:
         citations = self._citation_generator.generate(results)
         lines = [
             "以下是与问题最相关的课程证据。回答时优先依据这些证据，并在核心结论后保留对应引用标记。",
@@ -203,7 +285,7 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
             if title:
                 header += f" · {title}"
             lines.append(header)
-            lines.append(sanitize_retrieval_text(result.text)[: self._compact_result_chars])
+            lines.append(self._compact_excerpt(result.text, query))
             lines.append("")
         return "\n".join(lines).strip()
 
@@ -527,7 +609,7 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                 except Exception:
                     logger.warning("Conflict detection failed, skipping", exc_info=True)
 
-            result_text = self._build_compact_result_text(results)
+            result_text = self._build_compact_result_text(effective_query, results)
             if conflict_section:
                 result_text += "\n" + conflict_section
 
