@@ -1,21 +1,22 @@
 # 项目复习题库（按当前代码组织）
 
 > 当前版本基于课程学习 Agent 的真实代码主链路。  
-> 共 8 章 32 题，每章 4 题。  
-> 难度说明：`⭐` 基础识别，`⭐⭐` 链路理解，`⭐⭐⭐` 设计取舍与源码细节。
+> 共 9 章 36 题，每章 4 题。  
+> 难度说明：`⭐` 基础识别，`⭐⭐` 链路理解，`⭐⭐⭐` 设计取舍与工程现实。
 
 ## 章节总览
 
 | 章节 | 主题 | 题数 |
 |------|------|------|
 | 第 1 章 | 项目定位与入口 | 4 |
-| 第 2 章 | Agent 主链路与流式输出 | 4 |
-| 第 3 章 | 学习工具与课程闭环 | 4 |
-| 第 4 章 | Knowledge Query 与 HybridSearch | 4 |
-| 第 5 章 | Ingestion Pipeline 与索引 | 4 |
-| 第 6 章 | Memory、Skills 与 Hooks | 4 |
-| 第 7 章 | Web 与 MCP 接口层 | 4 |
-| 第 8 章 | 配置、存储、观测与测试 | 4 |
+| 第 2 章 | 应用装配、配置与生产存储 | 4 |
+| 第 3 章 | Agent 运行时与流式交互 | 4 |
+| 第 4 章 | Planner、ToolRegistry 与学习工具 | 4 |
+| 第 5 章 | Knowledge Query 与 HybridSearch | 4 |
+| 第 6 章 | Ingestion Pipeline 与文档生命周期 | 4 |
+| 第 7 章 | Conversation、Memory 与上下文工程 | 4 |
+| 第 8 章 | Web、前端与 MCP 接口 | 4 |
+| 第 9 章 | 观测、评估、测试与工程化 | 4 |
 
 ---
 
@@ -23,87 +24,98 @@
 
 | # | 题目 | 难度 | 考察要点 | 参考答案要点 | 关键文件 |
 |---|------|------|---------|--------------|----------|
-| R1-01 | 现在最准确地描述这个项目，应该怎么说？ | ⭐ | 项目定位 | 当前主体是课程学习 Agent 平台，RAG 是底座，MCP 仍存在但不再是唯一主叙事 | `DEV_SPEC.md`, `src/server/app.py` |
-| R1-02 | 为什么说 `run_server.py` 才是当前 Web 主入口？ | ⭐⭐ | 真实入口 | `run_server.py` 读取配置后启动 `src.server.app:create_app`；这是当前可用的 Web Agent 启动路径 | `run_server.py`, `src/server/app.py` |
-| R1-03 | `main.py` 和 `pyproject.toml` 里的 `mcp-server` 脚本为什么不能代表当前主链路？ | ⭐⭐ | 历史残留识别 | `main.py` 仍是早期占位入口，而 `pyproject.toml` 里的脚本仍指向它；真实 MCP 在 `src/mcp_server/` | `main.py`, `pyproject.toml`, `src/mcp_server/server.py` |
-| R1-04 | 默认课程、默认 collection 和启动自动 ingest 分别在哪里配置或触发？ | ⭐⭐⭐ | 启动装配 | 默认 collection / auto_ingest_dir 在 `config/settings.yaml`；启动时由 `src/server/app.py` 装配并触发自动 ingest | `config/settings.yaml`, `src/server/app.py` |
+| R1-01 | 现在最准确地描述这个项目，应该怎么说？ | ⭐ | 项目定位 | 当前主产品是课程学习 Agent，RAG 是底座，MCP 是并存接口但不是唯一主叙事 | `DEV_SPEC.md`, `src/server/app.py` |
+| R1-02 | 为什么说 `run_server.py` 才是当前 Web 主入口？ | ⭐⭐ | 真实入口 | 它读取配置并启动 `src.server.app:create_app`；这是当前用户侧最完整的运行路径 | `run_server.py`, `src/server/app.py` |
+| R1-03 | `main.py` 在当前项目里处于什么位置？ | ⭐⭐ | 历史残留识别 | `main.py` 仍是历史脚本入口；真实 MCP 逻辑在 `src/mcp_server/` | `main.py`, `src/mcp_server/server.py`, `pyproject.toml` |
+| R1-04 | 如果让你用“一条主链路”概括全项目，你会怎么画？ | ⭐⭐⭐ | 全局视角 | Web/Route -> Agent -> Planner/Tools -> Retrieval/Ingestion/Memory -> Streaming + Persistence | `src/server/routes.py`, `src/agent/agent.py`, `src/storage/runtime.py` |
 
 ---
 
-## 第 2 章：Agent 主链路与流式输出
+## 第 2 章：应用装配、配置与生产存储
 
 | # | 题目 | 难度 | 考察要点 | 参考答案要点 | 关键文件 |
 |---|------|------|---------|--------------|----------|
-| R2-01 | `Agent.chat()` 的整体流程是什么？ | ⭐⭐ | 主链路 | 读取/创建会话 -> before hooks -> 拼 system prompt -> 注入 memory/skill -> tool loop -> 输出 done -> 后台保存会话与 after hooks | `src/agent/agent.py` |
-| R2-02 | system prompt 在这个项目里是怎么组装的？memory 和 skill 是在哪一步注入的？ | ⭐⭐ | prompt 组装 | `prompt_builder.build()` 接收 tool schemas、memory context、active skill；memory 和 skill 在进入 tool loop 前通过 gather 预取并注入 | `src/agent/agent.py`, `src/agent/prompt_builder.py` |
-| R2-03 | 为什么这个项目适合用 SSE 做流式输出？都流哪些事件？ | ⭐⭐ | 流式事件 | HTTP SSE 足够支撑单向推流；会输出 `text_delta`、`tool_start`、`tool_result`、`error`、`done` 等事件 | `src/agent/types.py`, `src/server/chat_handler.py` |
-| R2-04 | hooks 和 middleware 在这里分别解决什么问题？ | ⭐⭐⭐ | 扩展点边界 | hooks 更偏消息生命周期；middleware 更偏 LLM 请求前后拦截，例如重试、反思、保护 | `src/agent/hooks/*.py` |
+| R2-01 | `create_app()` 启动时主要装了哪些组件？ | ⭐⭐ | 应用工厂 | LLM、memory stores、HybridSearch、router/cache、tools、skills、Agent、routes、lifespan | `src/server/app.py` |
+| R2-02 | `src/storage/runtime.py` 在整个项目里为什么重要？ | ⭐⭐ | 运行时切换 | 它统一决定 conversation、memory、feedback、rate limit、circuit breaker、semantic cache 等后端选型 | `src/storage/runtime.py` |
+| R2-03 | 生产环境下聊天记录、长期记忆和共享状态分别存哪？ | ⭐⭐⭐ | 存储边界 | conversation / long-term memory / feedback / registry 走 Postgres；限流 / 分布式熔断 / 语义缓存可走 Redis；对象存储可走 MinIO | `src/storage/postgres_backends.py`, `src/storage/runtime.py`, `config/settings.storage_stack.yaml` |
+| R2-04 | 为什么长期记忆不直接放 Redis 或向量数据库？ | ⭐⭐⭐ | 设计取舍 | 记忆主要是结构化状态和精确更新，适合 Postgres；Redis 更适合共享运行时状态，向量库更适合知识检索 | `src/agent/memory/`, `src/storage/postgres_backends.py` |
 
 ---
 
-## 第 3 章：学习工具与课程闭环
+## 第 3 章：Agent 运行时与流式交互
 
 | # | 题目 | 难度 | 考察要点 | 参考答案要点 | 关键文件 |
 |---|------|------|---------|--------------|----------|
-| R3-01 | `knowledge_query` 在课程学习场景里承担什么角色？ | ⭐ | 工具定位 | 负责课程知识问答，是最核心的检索型工具入口 | `src/agent/tools/knowledge_query.py` |
-| R3-02 | `review_summary` 和普通问答有什么不同？ | ⭐⭐ | 工具差异 | 它不是逐句问答，而是按主题/章节把检索内容组织为结构化复习摘要，并可标记薄弱点 | `src/agent/tools/review_summary.py` |
-| R3-03 | `quiz_generator` 为什么分成“题库优先 -> RAG 生成 -> LLM fallback”三层？ | ⭐⭐⭐ | 生成策略 | 先用已有题库保证真实性，再退到知识库上下文生成，最后才是纯 LLM；兼顾质量、覆盖和兜底 | `src/agent/tools/quiz_generator.py` |
-| R3-04 | `quiz_evaluator` 评完一道题后，可能更新哪些学习记忆？ | ⭐⭐⭐ | 闭环更新 | 错题会写入 `ErrorMemory`；涉及知识点会更新 `KnowledgeMapMemory` 的掌握度 | `src/agent/tools/quiz_evaluator.py` |
+| R3-01 | `Agent.chat()` 的整体流程是什么？ | ⭐⭐ | 主链路 | 读取/创建会话 -> before hooks -> 预取 memory/review/skill -> prompt 组装 -> tool loop -> done -> 后台保存与 after hooks | `src/agent/agent.py` |
+| R3-02 | 为什么 memory、review、skill 要在进入 tool loop 之前并行获取？ | ⭐⭐ | 预处理设计 | 降低等待时间，并在首轮 LLM 调用前一次性补齐系统上下文 | `src/agent/agent.py`, `src/agent/memory/enhancer.py` |
+| R3-03 | 当前流式输出链路是怎么接起来的？ | ⭐⭐ | 流式交互 | LLM 流 -> Agent StreamEvent -> ChatHandler chunk -> SSE 推给前端 | `src/agent/agent.py`, `src/server/chat_handler.py`, `src/server/routes.py` |
+| R3-04 | `_post_message_tasks()` 和 `flush()` 分别解决什么问题？ | ⭐⭐⭐ | 后台保存 | 一个负责后台保存 conversation 和 after hooks，一个负责优雅退出时等待后台任务完成 | `src/agent/agent.py` |
 
 ---
 
-## 第 4 章：Knowledge Query 与 HybridSearch
+## 第 4 章：Planner、ToolRegistry 与学习工具
 
 | # | 题目 | 难度 | 考察要点 | 参考答案要点 | 关键文件 |
 |---|------|------|---------|--------------|----------|
-| R4-01 | 在这个项目里，为什么不能把 `knowledge_query` 简化成“直接查向量库”？ | ⭐⭐ | 工具编排 | 它前后还有 QueryRouter、Semantic Cache、query rewrite、HyDE/multi-query、parent chunk 与冲突检测等编排 | `src/agent/tools/knowledge_query.py` |
-| R4-02 | QueryRouter 和 Semantic Cache 分别解决什么问题？ | ⭐⭐ | 路由与缓存 | 路由判断是否需要 RAG、偏好来源；缓存避免高相似问题重复检索 | `src/core/query_engine/query_router.py`, `src/core/cache/semantic_cache.py` |
-| R4-03 | `HybridSearch` 的核心步骤有哪些？ | ⭐⭐ | 混合检索链路 | QueryProcessor -> Dense/Sparse 并行 -> RRF 融合 -> rerank -> MMR -> min_score / post-dedup | `src/core/query_engine/hybrid_search.py` |
-| R4-04 | rerank、MMR、min_score、post-dedup 各自解决什么问题？ | ⭐⭐⭐ | 后处理取舍 | rerank 提高排序精度；MMR 控制多样性；min_score 去掉低质量结果；post-dedup 避免语义重复 | `src/core/query_engine/hybrid_search.py`, `src/core/query_engine/mmr.py` |
+| R4-01 | TaskPlanner 在这个项目里负责什么？ | ⭐⭐ | planner 定位 | 识别 task intent、决定 control mode、必要时拆复合任务，不是简单 keyword router | `src/agent/planner/task_planner.py` |
+| R4-02 | ToolRegistry 为什么要统一管理工具 schema 和执行？ | ⭐⭐ | tool calling 基础设施 | 统一注册、参数校验、schema 暴露、超时与错误包装，给 Agent function-calling 使用 | `src/agent/tools/base.py` |
+| R4-03 | 当前学习工具链包括哪些核心工具？ | ⭐ | 工具全景 | `knowledge_query`、`document_ingest`、`review_summary`、`quiz_generator`、`quiz_evaluator` | `src/server/app.py`, `src/agent/tools/` |
+| R4-04 | 为什么说 quiz/review/knowledge_query 共同构成了学习闭环？ | ⭐⭐⭐ | 产品闭环 | 问答获取知识、复习总结考点、出题练习、判题回写 memory，形成持续学习路径 | `src/agent/tools/`, `src/agent/memory/enhancer.py` |
 
 ---
 
-## 第 5 章：Ingestion Pipeline 与索引
+## 第 5 章：Knowledge Query 与 HybridSearch
 
 | # | 题目 | 难度 | 考察要点 | 参考答案要点 | 关键文件 |
 |---|------|------|---------|--------------|----------|
-| R5-01 | `IngestionPipeline` 的阶段顺序是什么？ | ⭐ | 入库主流程 | 完整性检查 -> load -> split -> transform -> embed -> upsert / persist | `src/ingestion/pipeline.py` |
-| R5-02 | 为什么这个项目要特别区分课件、教材和题库这几类 source type？ | ⭐⭐ | 课程导向 | 学习场景需要不同的解析与下游使用方式，题库还会走 `QuestionParser` | `src/ingestion/pipeline.py`, `src/ingestion/transform/question_parser.py` |
-| R5-03 | transform 阶段里为什么会同时存在 refiner、metadata、contextual enrich、caption、dedup？ | ⭐⭐⭐ | 多阶段增强 | 它们分别补齐 chunk 质量、语义元数据、上下文信息、图片可检索性和重复控制 | `src/ingestion/transform/*.py` |
-| R5-04 | 为什么这个项目要同时写 Chroma、BM25 和图片相关存储？ | ⭐⭐⭐ | 多存储协同 | Dense 检索、Sparse 检索和图片返回不是一类数据；需要协同存储支持完整检索体验 | `src/ingestion/storage/*.py`, `src/libs/vector_store/*.py` |
+| R5-01 | 为什么 `knowledge_query` 不能简化成“直接查向量库”？ | ⭐⭐ | 工具编排层 | 它前后还有 QueryRouter、Semantic Cache、query rewrite、HyDE、多 query、parent chunk 和冲突检测 | `src/agent/tools/knowledge_query.py` |
+| R5-02 | QueryRouter 和 Semantic Cache 分别在解决什么问题？ | ⭐⭐ | 路由与缓存 | Router 决定是否需要 RAG 和偏好来源；cache 避免高相似查询重复检索 | `src/core/query_engine/query_router.py`, `src/core/cache/redis_semantic_cache.py` |
+| R5-03 | `HybridSearch` 的主链路有哪些步骤？ | ⭐⭐ | 混合检索 | QueryProcessor -> dense/sparse -> RRF -> rerank -> MMR -> min_score / post-dedup | `src/core/query_engine/hybrid_search.py` |
+| R5-04 | rerank、MMR、min_score、冲突检测为什么不能混成一个步骤？ | ⭐⭐⭐ | 后处理边界 | 它们分别处理排序精度、多样性、低质结果过滤和知识冲突，不是同一类问题 | `src/core/query_engine/`, `src/core/conflict/` |
 
 ---
 
-## 第 6 章：Memory、Skills 与 Hooks
+## 第 6 章：Ingestion Pipeline 与文档生命周期
 
 | # | 题目 | 难度 | 考察要点 | 参考答案要点 | 关键文件 |
 |---|------|------|---------|--------------|----------|
-| R6-01 | 这个项目的 memory 大致分几类？各自存什么？ | ⭐⭐ | memory 分类 | student profile、error memory、knowledge map、skill memory、session memory 各自负责偏好、错题、掌握度、技能命中、会话记忆 | `src/agent/memory/*.py` |
-| R6-02 | `MemoryContextEnhancer` 和 `MemoryRecordHook` 的职责为什么不同？ | ⭐⭐⭐ | 读写分离 | enhancer 负责把已有记忆注入上下文；record hook 负责从对话中抽取并写回记忆 | `src/agent/memory/enhancer.py` |
-| R6-03 | `review_schedule` 和 `context_filter` 在学习产品里分别有什么价值？ | ⭐⭐⭐ | 学习体验 | review schedule 负责主动复习提示；context filter 负责长上下文压缩，避免对话越聊越失控 | `src/agent/hooks/review_schedule.py`, `src/agent/memory/context_filter.py` |
-| R6-04 | skill workflow 和 guardrails 在这个项目里分别扮演什么角色？ | ⭐⭐ | 技能与安全 | workflow 负责识别/注入技能型流程；guardrails 负责高风险输入输出拦截与脱敏 | `src/agent/skills/workflow.py`, `src/agent/hooks/guardrails.py` |
+| R6-01 | `IngestionPipeline` 的阶段顺序是什么？ | ⭐ | 入库主流程 | 完整性检查 -> loader -> chunking -> transform -> encoding -> storage | `src/ingestion/pipeline.py` |
+| R6-02 | 为什么课程场景要特别区分教材、课件和题库？ | ⭐⭐ | source type 设计 | 三类资料在解析方式、检索用途和下游生成场景上不同，题库还会走 QuestionParser | `src/ingestion/pipeline.py`, `src/ingestion/transform/question_parser.py` |
+| R6-03 | transform 阶段为什么不只是 metadata enrichment？ | ⭐⭐⭐ | 多阶段增强 | 还包含 refiner、contextual enrich、image caption、dedup，分别提升可读性、上下文、图文可检索性和去重 | `src/ingestion/transform/` |
+| R6-04 | `DocumentManager.delete_document()` 为什么是一个跨存储问题？ | ⭐⭐⭐ | 生命周期治理 | 删除文档要协调向量、BM25、图片索引、对象存储引用和完整性记录，不是只删一处 | `src/ingestion/document_manager.py`, `src/storage/runtime.py` |
 
 ---
 
-## 第 7 章：Web 与 MCP 接口层
+## 第 7 章：Conversation、Memory 与上下文工程
 
 | # | 题目 | 难度 | 考察要点 | 参考答案要点 | 关键文件 |
 |---|------|------|---------|--------------|----------|
-| R7-01 | `routes.py`、`models.py`、`chat_handler.py` 在 Web 层是怎么分工的？ | ⭐⭐ | Web 分层 | routes 暴露 API，models 定义请求响应模型，chat_handler 串接 Agent 并产出 SSE | `src/server/routes.py`, `src/server/models.py`, `src/server/chat_handler.py` |
-| R7-02 | 前端为什么适合通过 SSE 接收回答？ | ⭐⭐ | 前端交互 | 当前主要是服务端单向事件流，不需要先引入更复杂的双向协议；实现简单且与 Agent streaming 匹配 | `src/web/app.js`, `src/web/index.html` |
-| R7-03 | MCP 这一层的真实实现在哪里？默认注册了哪些工具？ | ⭐⭐ | MCP 实现 | `src/mcp_server/server.py` 和 `protocol_handler.py` 里创建 server 并注册 `query_knowledge_hub`、`list_collections`、`get_document_summary` | `src/mcp_server/*.py` |
-| R7-04 | 为什么说“Web 主路径更完整，但 MCP 仍然是重要接口”？ | ⭐⭐⭐ | 双接口定位 | Web 更贴近当前学习产品体验；MCP 适合对外部 Agent 暴露标准工具接口，两者定位不同 | `src/server/app.py`, `src/mcp_server/server.py` |
+| R7-01 | 聊天记录、长期记忆、上下文窗口分别是什么？ | ⭐⭐ | 概念边界 | conversation 是原始会话，long-term memory 是结构化沉淀，上下文窗口是本次送进模型的临时材料 | `src/agent/conversation.py`, `src/agent/memory/enhancer.py`, `src/agent/agent.py` |
+| R7-02 | 多次 request 之间，系统是怎么延续上下文的？ | ⭐⭐ | 跨请求连续性 | 上一轮先持久化 conversation / memory，下一轮根据 `conversation_id` 和 `user_id` 重新读回来 | `src/agent/agent.py`, `src/storage/postgres_backends.py` |
+| R7-03 | `MemoryContextEnhancer` 和 `MemoryRecordHook` 为什么要分开？ | ⭐⭐⭐ | 读写分离 | 一个负责读取已有记忆并注入 prompt，一个负责从对话中抽取并写回长期记忆 | `src/agent/memory/enhancer.py` |
+| R7-04 | `ContextEngineeringFilter` 的 4 级压缩各自解决什么问题？ | ⭐⭐⭐ | 长上下文治理 | 最近消息滑窗、超长工具结果卸载、旧历史摘要压缩、token budget 控制 | `src/agent/memory/context_filter.py` |
 
 ---
 
-## 第 8 章：配置、存储、观测与测试
+## 第 8 章：Web、前端与 MCP 接口
 
 | # | 题目 | 难度 | 考察要点 | 参考答案要点 | 关键文件 |
 |---|------|------|---------|--------------|----------|
-| R8-01 | 为什么这个仓库会同时出现 typed settings 和原始 YAML dict 两种配置读取方式？ | ⭐⭐⭐ | 配置双轨 | 基础设施大量走 `src/core/settings.py` typed settings；Agent / Web 装配不少地方直接读 YAML dict，这也是当前需要理解的现实 | `config/settings.yaml`, `src/core/settings.py`, `src/server/app.py` |
-| R8-02 | LLM、Embedding、VectorStore、Reranker 是怎么做到可插拔的？ | ⭐⭐ | 工厂模式 | 通过 Base 抽象 + Factory + 配置切换 provider | `src/agent/llm/factory.py`, `src/libs/*/*factory*.py` |
-| R8-03 | trace、dashboard、evaluation 在这个项目里分别解决什么问题？ | ⭐⭐ | 可观测性 | trace 记录链路，dashboard 提供可视化查看，evaluation 用于质量评估和回归比较 | `src/core/trace/*.py`, `src/observability/dashboard/*`, `src/observability/evaluation/*` |
-| R8-04 | 测试和当前环境里最值得注意的一个 caveat 是什么？ | ⭐⭐⭐ | 工程现实 | 测试体系覆盖 unit/integration；当前环境若缺 `mcp` 依赖，会让 MCP 相关 smoke import 失败，这属于环境问题不是主链路设计问题 | `tests/`, `pyproject.toml` |
+| R8-01 | `routes.py`、`models.py`、`chat_handler.py` 在 Web 层是怎么分工的？ | ⭐⭐ | Web 分层 | routes 暴露 HTTP/SSE 接口，models 约束输入输出，chat_handler 把 Agent 事件流转成前端 chunk | `src/server/` |
+| R8-02 | 为什么当前用 SSE 就够了？ | ⭐⭐ | 协议选择 | 当前主要是服务端单向推流，SSE 已能满足文本增量和工具事件展示 | `src/server/routes.py`, `src/web/app.js` |
+| R8-03 | MCP 这一层的真实实现在哪里？ | ⭐⭐ | MCP 事实边界 | `src/mcp_server/server.py` 和 `protocol_handler.py`；默认注册查询知识库、列集合、文档摘要工具 | `src/mcp_server/` |
+| R8-04 | 为什么要区分“真实 MCP 实现”和“历史脚本入口”？ | ⭐⭐⭐ | 历史债识别 | 真实协议逻辑和当前包脚本不是同一层；不区分会把入口和实现混淆 | `main.py`, `src/mcp_server/server.py`, `pyproject.toml` |
+
+---
+
+## 第 9 章：观测、评估、测试与工程化
+
+| # | 题目 | 难度 | 考察要点 | 参考答案要点 | 关键文件 |
+|---|------|------|---------|--------------|----------|
+| R9-01 | trace、dashboard、evaluation runner 在这个项目里分别做什么？ | ⭐⭐ | 可观测性全景 | trace 记录链路，dashboard 做可视化查看，evaluation runner 跑数据集评估与回归 | `src/core/trace/`, `src/observability/` |
+| R9-02 | retry、rate limit、circuit breaker 分别解决什么问题？ | ⭐⭐⭐ | 稳定性机制 | retry 处理偶发错误，rate limit 控制用户流量，circuit breaker 避免持续轰炸上游 | `src/agent/hooks/` |
+| R9-03 | 为什么分布式熔断状态要放进 Redis，而不是只放进单机内存？ | ⭐⭐⭐ | 多实例生产化 | 多实例下需要共享 breaker 状态，否则某个 Pod 熔断后其他 Pod 仍会继续打上游 | `src/agent/hooks/redis_circuit_breaker.py`, `src/storage/runtime.py` |
+| R9-04 | 当前测试结构能说明什么？还要特别提醒什么 caveat？ | ⭐⭐ | 工程现实 | 有 unit/integration/e2e 分层；环境依赖缺失会影响部分链路，但不能把环境问题等同于主架构问题 | `tests/`, `pyproject.toml` |
 
 ---
 
@@ -119,4 +131,5 @@
 | 第 6 章 | 4 |
 | 第 7 章 | 4 |
 | 第 8 章 | 4 |
-| 合计 | 32 |
+| 第 9 章 | 4 |
+| 合计 | 36 |

@@ -1,76 +1,109 @@
-# 简历编写原则（针对当前仓库）
+# 简历编写原则（基于当前仓库）
 
-## 1. 先讲产品，再讲技术
+## 1. 先定主叙事，再写 bullet
 
-这个项目最容易写偏的地方，是把它写成“一个传统 RAG demo”。
+这个项目当前最稳的 4 条叙事：
 
-更准确的表述通常是三选一：
+1. 课程学习 Agent
+2. Agent runtime / tool orchestration
+3. RAG 基础设施
+4. 生产化运行时与共享存储
 
-- 面向课程学习场景的 Agent 平台
-- 带混合检索与资料入库能力的 RAG 基础设施
-- 同时支持 Web 对话与 MCP 集成的知识系统
+一份简历里只选 1 条主线，最多补 1 条副线。
 
-写之前先选主叙事，不要三个方向平均用力。
+## 2. 每条 bullet 都要能落到文件级
 
-## 2. 只写自己能在面试里落到文件级的内容
+最少能回答下面 3 个问题：
 
-每条 bullet 最好都能回答下面三个问题：
+1. 在哪条链路里做的
+2. 落在哪些文件
+3. 为什么这样设计
 
-1. 具体在哪个模块做的
-2. 这条链路前后依赖什么
-3. 为什么这么设计，而不是别的方案
+答不出来，就弱化，不要硬写。
 
-如果答不出，宁可弱化，不要硬写。
+## 3. 推荐 bullet 公式
 
-## 3. 推荐的 bullet 结构
+每条 bullet 尽量同时包含：
 
-每条 bullet 尽量包含三段：
+- 动作：设计 / 实现 / 重构 / 编排 / 治理 / 接入
+- 机制：Agent、HybridSearch、IngestionPipeline、Memory、Postgres/Redis、SSE、MCP
+- 价值：提升体验、增强稳定性、补齐生产共享状态、支持学习闭环
 
-- 动作：设计 / 实现 / 重构 / 编排 / 优化
-- 手段：用了什么模块、机制或架构
-- 结果：解决了什么问题，或补齐了哪种能力
+示例结构：
 
-示例：
+- 设计基于 ReAct 的 Agent 运行时，将会话管理、技能注入、工具调用与 SSE 流式输出统一到单次对话编排链路中
+- 实现 dense + sparse 混合检索，并通过 RRF、rerank 和 MMR 组合提升课程知识问答的召回与排序稳定性
 
-- 设计基于 ReAct 的 Agent 编排链路，将工具调用、会话持久化与 SSE 流式输出统一到单次对话执行模型中
-- 实现 dense + sparse 混合检索，并通过 RRF、rerank 和 MMR 组合提升知识问答的召回与排序质量
-
-## 4. 量化规则
+## 4. 数字使用规则
 
 优先级如下：
 
-1. 用户提供的真实业务指标
-2. 当前仓库重新验证过的本地事实
-3. 无法核实时，不写具体数字
+1. 用户提供的真实业务数据
+2. 你从当前仓库重新核实过的数据
+3. 明确标注为“建议补充”的数字
 
-不建议直接写：
+没有证据时，不写：
 
-- “准确率提升 30%”
-- “QPS 提升 X 倍”
-- “支持万级并发”
+- 准确率提升百分比
+- QPS / TPS
+- 并发规模
+- 用户规模
+- 团队规模
 
-除非这些数字被明确证明。
+## 5. 岗位映射建议
 
-## 5. 关键词建议
+### LLM / Agent 岗
 
-可按岗位选择关键词，不要机械堆满：
+优先强调：
 
-- RAG/检索：Hybrid Search、BM25、Dense Retrieval、RRF、Rerank、MMR、Semantic Cache
-- Agent：ReAct、Tool Calling、Memory、Skill Workflow、Guardrails、SSE Streaming
-- 后端/平台：FastAPI、Factory Pattern、Config-Driven、SQLite、Chroma、Observability
-- 集成：MCP、JSON-RPC、Protocol Handler、Tool Registry
+- `src/server/app.py`
+- `src/agent/agent.py`
+- `src/agent/planner/task_planner.py`
+- `src/agent/tools/`
+- `src/agent/memory/`
 
-## 6. 当前仓库的高风险误区
+### RAG / 检索岗
 
-- 把 `main.py` 当成当前主入口
-- 把早期规划写成“现已完成”
-- 使用旧文档里的测试数、任务数、skill 数、开发周期等数字
-- 把“MCP”写成唯一产品形态，忽略现在的 Web Agent 主链路
+优先强调：
 
-## 7. 收尾时要主动补的内容
+- `src/agent/tools/knowledge_query.py`
+- `src/core/query_engine/`
+- `src/ingestion/pipeline.py`
+- `src/ingestion/transform/`
+- `src/ingestion/document_manager.py`
 
-最终输出后，默认再给用户补三样东西：
+### 后端 / 平台岗
+
+优先强调：
+
+- `src/server/app.py`
+- `src/storage/runtime.py`
+- `src/storage/postgres_backends.py`
+- `src/agent/hooks/`
+- `src/core/settings.py`
+
+## 6. 当前仓库最稳的安全事实
+
+- 当前主产品是课程学习 Agent
+- Web 主入口是 `run_server.py` -> `src/server/app.py`
+- `Agent.chat()` 串起会话、记忆、planner、tool loop 和 streaming
+- 长期记忆是结构化持久化记忆，生产可走 Postgres
+- 共享运行时状态可走 Redis，例如限流、语义缓存、分布式熔断
+- 入库链路支持 PDF/PPTX/DOCX、题库解析、多模态增强
+- 仓库同时提供 Web Agent 与 MCP 接口
+
+## 7. 高风险误区
+
+- 把 `main.py` 当当前主入口
+- 把 MCP 说成当前唯一产品形态
+- 把 Redis 说成长期记忆主存储
+- 把上下文窗口说成“长期保存的记忆”
+- 把历史规划、旧测试数字、旧任务分期写成当前事实
+
+## 8. 默认收尾
+
+生成简历内容后，默认再补：
 
 1. 技术栈关键词
-2. 3-5 个面试追问
-3. 哪些数字还需要用户自己确认
+2. 高频追问
+3. 仍待用户确认的数字

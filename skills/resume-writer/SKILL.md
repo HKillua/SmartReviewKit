@@ -1,117 +1,144 @@
 ---
 name: resume-writer
-description: "基于当前代码与 DEV_SPEC，为本项目生成可面试自圆其说的简历项目经历、技术亮点和中英文 bullet。Use when user says '写简历', 'resume', '项目经历', '简历项目', or asks to package this repository into a resume-ready project story."
+description: "基于当前仓库源码，为本项目生成简历项目经历、技术亮点、中英文 bullet 和面试防守话术。Use when the user asks to write resume bullets, package this repository into a project story, prepare interview-safe project experience, or defend a resume entry with current code facts."
 ---
 
 # Resume Writer
 
-为这个仓库写简历时，必须把“项目当前真实状态”放在第一位。
+目标：把当前仓库整理成“面试能自圆其说”的项目经历，而不是把历史入口、旧规划或未经核实的数据写进简历。
 
-## 事实来源
+默认输出中文。只有在事实校准后再给英文版。
 
-按这个顺序取材：
+## 事实边界
 
-1. `DEV_SPEC.md`，用于理解当前产品定位
-2. `references/resume_principles.md`
-3. `references/project_highlights.md`
-4. `references/interview_followups.md`
-5. 需要补证据时，再读对应源码文件
+- 先信源码，再信 `DEV_SPEC.md`，最后才信 README 和旧说明文档。
+- 当前主产品形态是课程学习 Agent；RAG 是底座，不是全部。
+- Web 主入口是 `run_server.py` -> `src/server/app.py`。
+- `src/mcp_server/` 有真实 MCP 实现；`main.py` 和 `pyproject.toml` 中的 `mcp-server` 仍带历史残留。
+- 聊天记录、长期记忆、反馈、文档注册、任务记录在生产环境可切到 Postgres。
+- 限流、分布式熔断、语义缓存在生产环境可切到 Redis。
+- 对象存储可切到 MinIO；默认本地开发仍可走本地目录。
 
-如果资料冲突：
+## 先读什么
 
-- 先信当前源码
+按这个顺序建立上下文：
+
+1. `skills/resume-writer/references/resume_principles.md`
+2. `skills/resume-writer/references/project_highlights.md`
+3. `skills/resume-writer/references/interview_followups.md`
+4. `DEV_SPEC.md`
+5. `src/server/app.py`
+6. `src/agent/agent.py`
+7. `src/storage/runtime.py`
+8. 需要补证据时，再读对应模块源码
+
+如果材料冲突：
+
+- 先信源码
 - 再信 `DEV_SPEC.md`
-- 其他长期未维护文档默认低优先级，除非用户明确要求引用
+- 旧引用材料只作辅助，不可反向覆盖当前实现
 
-## 你要先确认的 4 件事
+## 开始前最多确认 4 件事
 
-一次性问清，不要来回盘问：
+一次性确认，不要来回盘问：
 
 1. 目标岗位
-   例如：RAG/LLM 应用、后端、Agent、平台架构、全栈 AI
-2. 项目包装角度
-   例如：课程学习 Agent、RAG 基础设施、MCP 集成、综合型
-3. 真实业务背景
-   如果没有真实业务，就明确按“通用学习/知识检索平台”来写
-4. 输出约束
-   例如：中文/英文、几条 bullet、是否要量化、是否需要面试追问
+   例如：LLM 应用、RAG/检索、Agent、后端平台、教育 AI
+2. 主叙事角度
+   例如：课程学习 Agent、RAG 基建、生产化 runtime、Web/MCP 双接口
+3. 输出形式
+   例如：4-6 条简历 bullet、项目经历段、英文版、面试防守版
+4. 数字边界
+   用户是否提供了真实业务数据；如果没有，就不要编数字
 
-## 生成流程
+如果用户没给信息，默认按：
 
-### 1. 先定叙事，不先堆技术名词
+- 岗位：LLM 应用 / 后端平台
+- 主叙事：课程学习 Agent + Agent runtime + RAG 基础设施
+- 输出：中文简历版 + 技术栈关键词 + 面试追问
 
-优先从以下三种叙事里选一个：
+## 工作流
 
-- 学习产品型：课程学习 Agent，强调问答、测验、复习、记忆闭环
-- RAG 基建型：文档摄取、混合检索、重排、缓存、路由、幂等入库
-- Agent 平台型：ReAct tool loop、memory、hooks、guardrails、SSE streaming
+### 1. 先选主叙事，不先堆技术名词
 
-如果用户想写得更全面，可以组合，但主线只能有一条。
+优先从这 4 条主线里选 1 条作为主线，最多补 1 条副线：
 
-### 2. 从亮点库里选 3-5 个可证明亮点
+- 课程学习 Agent
+- Agent runtime / tool orchestration
+- RAG / ingestion / hybrid retrieval
+- 生产化 runtime / storage stack
 
-只能选 `references/project_highlights.md` 里能被当前代码支撑的点。
+不要把 4 条主线平均展开，简历会失焦。
 
-默认优先级：
+### 2. 只挑能落到代码文件的亮点
 
-- RAG/检索岗位：混合检索、数据摄取、Query Tool 编排、评估/可观测性
-- 后端/平台岗位：FastAPI 装配、Agent 编排、配置驱动、存储协同、MCP
-- Agent 岗位：ReAct Agent、Memory、Skills、Hooks/Guardrails、知识工具链
+优先从 `references/project_highlights.md` 里选 3-5 个亮点。
 
-### 3. 输出时遵循“四段式”或“高密度 bullet”
+每个亮点至少能回答：
 
-默认用四段式：
+- 做了什么
+- 在哪条链路里
+- 落在哪些文件
+- 为什么要这样设计
 
-- 背景：用户场景或平台定位
-- 目标：要解决什么问题
-- 过程：4-6 条 bullet，写架构和关键实现
-- 结果：只写真实数字或明确标注“建议补充/待确认”
+### 3. 把亮点写成“动作 + 机制 + 价值”
 
-如果用户只要简历条目，就直接输出 4-6 条 bullet。
+推荐句式：
 
-### 4. 量化规则必须保守
+- 动作：设计 / 实现 / 重构 / 编排 / 治理 / 接入
+- 机制：Agent、HybridSearch、IngestionPipeline、Memory、Postgres/Redis、SSE、MCP
+- 价值：提升学习闭环、增强检索稳定性、补齐生产共享状态、支持多接口访问
 
-允许使用的数字只有三类：
+### 4. 量化必须保守
+
+只允许 3 类数字：
 
 1. 用户亲自提供的真实数据
-2. 你在当前仓库重新核实过的数据
-3. 明确标注为“示例/建议补充”的占位数字
+2. 你现场从当前仓库核实出的数据
+3. 明确标注为“建议补充”的占位数字
 
-禁止直接沿用旧文档中的失真数据。
+没有证据时，不写准确率、QPS、线上规模、团队规模、用户数。
 
-## 这个项目当前可安全主张的方向
+### 5. 默认补“面试防守”
 
-优先表述这些已被当前代码验证的事实：
+只要用户不是明确拒绝，输出简历内容后默认补：
 
-- 这是一个“课程学习 Agent”平台，不只是早期的 MCP/RAG demo
-- Web 主入口是 `run_server.py` + `src/server/app.py`
-- Agent 主链路包含 ReAct tool loop、memory、hooks、skills、SSE streaming
-- 检索链路包含 query routing、semantic cache、query enhancement、HybridSearch
-- `HybridSearch` 是 dense + sparse + RRF + rerank + MMR + 去重/过滤
-- 入库链路支持 PDF/PPTX/DOCX、题库解析、chunk transform、dense/sparse 双写入
-- 系统同时暴露 Web Agent 与 MCP Server 两种接口
+1. 技术栈关键词
+2. 5-8 个高频深挖问题
+3. 哪些数字仍需用户确认
+
+如果用户说“面试安全版”或“防守版”，再额外补：
+
+- 3-5 个 killer questions
+- 哪些说法不能写
+
+## 当前项目可安全主张的方向
+
+优先围绕这些事实展开：
+
+- 课程学习 Agent，而不是单纯 RAG demo
+- `create_app()` 统一装配 LLM、检索、记忆、工具、技能、存储和 Web 路由
+- `Agent.chat()` 串起会话加载、memory/review/skill 注入、planner、tool loop、streaming 和后台保存
+- `knowledge_query` 不是裸查向量库，而是工具编排层
+- 检索链路是 dense + sparse + RRF + rerank + MMR + 过滤/去重
+- 入库链路支持 PDF/PPTX/DOCX、题库解析、多模态增强、双路索引写入
+- 长期记忆是结构化记忆，不是 Markdown 记事本，也不是单纯向量记忆
+- 生产运行时支持 Postgres + Redis + object store 的共享状态切换
+- Web 与 MCP 双接口并存，但 Web 产品链路更完整
 
 ## 必须避免的说法
 
-- 不要把 `main.py` 写成当前主运行入口
-- 不要把早期规划项写成“已上线功能”
-- 不要编造线上规模、团队规模、QPS、准确率提升
-- 不要声称用了代码里没有真正落地的技术栈
-- 不要把旧 skill、旧测试数字、旧任务数当成事实直接写进简历
+- 不要把 `main.py` 写成当前主入口
+- 不要把“未来规划”写成“已完成上线能力”
+- 不要把历史文档里的旧数字直接写进简历
+- 不要把聊天记录、长期记忆、上下文窗口混成一个概念
+- 不要把 Redis 说成长期记忆主存储
+- 不要把 MCP 说成当前唯一产品形态
+- 不要把“生产可切换”写成“已经大规模线上验证”
 
-## 输出格式
+## 输出要求
 
-默认输出：
-
-1. 简历版项目经历
-2. 技术栈关键词
-3. 5-8 个面试高频追问
-
-如果用户明确说要“面试安全版”“深挖版”“防守版”，则改为输出：
-
-1. 简历版项目经历
-2. 技术栈关键词
-3. 8-12 个高频深挖问题
-4. 其中 3-5 个“最容易露馅”的 killer questions
-
-如果用户要英文版，再给英文，不要省略中文事实校验。
+- 默认给 1 个主版本，不要一次给 4 种互相竞争的版本
+- 如果给英文版，先给中文事实版，再给英文版
+- 语言风格偏简洁、硬核、可落地
+- 所有亮点都优先指向真实文件和真实链路

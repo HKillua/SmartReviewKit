@@ -1,106 +1,106 @@
 # 项目学习地图（按当前代码组织）
 
 > 用于 `project-learner` 选择学习域和阅读路径。  
-> 当前版本扩展为 9 个知识域、45 个知识点。
+> 当前版本按 9 个知识域、45 个知识点组织。
 
 ## 推荐阅读顺序
 
 1. D1 项目定位与入口
-2. D2 Agent 运行时与流式链路
-3. D3 学习工具与课程闭环
-4. D4 检索查询链路
-5. D5 数据摄取与索引
-6. D6 Memory、Skills 与 Hooks
-7. D7 配置、Provider 与存储
-8. D8 Web 与 MCP 接口层
-9. D9 质量保障与可观测性
+2. D2 App factory、配置与生产存储
+3. D3 Agent 运行时与流式链路
+4. D4 Planner、ToolRegistry 与学习工具
+5. D5 检索查询链路
+6. D6 数据摄取与文档生命周期
+7. D7 Conversation、Memory 与上下文工程
+8. D8 Web、前端与 MCP 接口
+9. D9 可观测性、评估与测试
 
 ## D1 项目定位与入口
 
 | 子主题 | 学什么 | 关键文件 |
 |--------|--------|----------|
-| D1.1 当前产品定位与演化 | 理解为什么它现在更像课程学习 Agent | `DEV_SPEC.md`, `src/server/app.py` |
-| D1.2 Web 主入口与 app 装配 | 看服务启动时怎么把 Agent、Tools、Memory、RAG 装起来 | `run_server.py`, `src/server/app.py` |
-| D1.3 MCP 实现与历史占位入口 | 区分真实 MCP 实现和 `main.py` 历史入口 | `src/mcp_server/server.py`, `src/mcp_server/protocol_handler.py`, `main.py`, `pyproject.toml` |
-| D1.4 默认配置与启动自动 ingest | 看默认课程、默认 collection、自动入库目录 | `config/settings.yaml`, `src/server/app.py` |
-| D1.5 当前数据资产与目录布局 | 看 `docs/`、`data/`、本地 collection 与课程资料布局 | `docs/computer_internet/`, `data/`, `config/settings.yaml` |
+| D1.1 当前产品定位 | 理解为什么它现在更像课程学习 Agent，而不是单纯 MCP/RAG demo | `DEV_SPEC.md`, `src/server/app.py` |
+| D1.2 Web 主入口 | 看 `run_server.py` 如何启动 `create_app()` | `run_server.py`, `src/server/app.py` |
+| D1.3 MCP 实现与历史入口 | 区分真实 MCP 实现和 `main.py` 历史脚本 | `src/mcp_server/server.py`, `src/mcp_server/protocol_handler.py`, `main.py`, `pyproject.toml` |
+| D1.4 主链路脑图 | 用一条链把 Web、Agent、Tools、Retrieval、Memory、Persistence 串起来 | `src/server/routes.py`, `src/agent/agent.py`, `src/storage/runtime.py` |
+| D1.5 当前目录现实 | 看 `config/`、`data/`、`docs/`、`src/` 分别承载什么 | `config/`, `data/`, `docs/`, `src/` |
 
-## D2 Agent 运行时与流式链路
-
-| 子主题 | 学什么 | 关键文件 |
-|--------|--------|----------|
-| D2.1 Conversation 与 prompt 组装 | 会话如何持久化，system prompt 如何构造 | `src/agent/conversation.py`, `src/agent/prompt_builder.py` |
-| D2.2 ReAct tool loop 主流程 | Agent 何时调工具、何时结束、如何处理工具结果 | `src/agent/agent.py` |
-| D2.3 StreamEvent 与 SSE 输出 | 后端怎样把模型增量输出和工具事件发给前端 | `src/agent/types.py`, `src/server/chat_handler.py` |
-| D2.4 Hooks 与 middleware 扩展点 | 生命周期 hook、retry、reflection、rate limit 如何插进去 | `src/agent/hooks/*.py` |
-| D2.5 后台保存、flush 与错误处理 | 会话保存、background tasks、flush 与异常路径怎么兜底 | `src/agent/agent.py` |
-
-## D3 学习工具与课程闭环
+## D2 App factory、配置与生产存储
 
 | 子主题 | 学什么 | 关键文件 |
 |--------|--------|----------|
-| D3.1 knowledge_query 问答主工具 | 用户问题如何进入检索与回答链路 | `src/agent/tools/knowledge_query.py` |
-| D3.2 document_ingest 资料导入工具 | 用户上传资料后如何触发入库 | `src/agent/tools/document_ingest.py` |
-| D3.3 review_summary 考点总结工具 | 如何围绕课程资料做复习总结 | `src/agent/tools/review_summary.py` |
-| D3.4 quiz_generator 与 quiz_evaluator | 如何出题、判题并回写学习状态 | `src/agent/tools/quiz_generator.py`, `src/agent/tools/quiz_evaluator.py` |
-| D3.5 ToolRegistry 与工具装配 | 工具是如何注册、暴露 schema 并被 Agent 调用的 | `src/agent/tools/base.py`, `src/server/app.py` |
+| D2.1 create_app 装配 | 启动时如何把 LLM、检索、memory、tools、skills 接起来 | `src/server/app.py` |
+| D2.2 typed settings 与原始 YAML | 为什么这个项目同时存在 typed settings 和 raw dict | `src/core/settings.py`, `config/settings.yaml` |
+| D2.3 runtime factories | conversation、memory、feedback、cache、breaker 如何按环境切换 | `src/storage/runtime.py` |
+| D2.4 Postgres 持久化 | 生产环境下 conversation / memory / feedback / registry / task store 怎么落库 | `src/storage/postgres_backends.py` |
+| D2.5 Redis 共享状态 | Redis 在 rate limit、semantic cache、distributed circuit breaker 里的角色 | `src/agent/hooks/redis_rate_limit.py`, `src/agent/hooks/redis_circuit_breaker.py`, `src/core/cache/redis_semantic_cache.py` |
 
-## D4 检索查询链路
-
-| 子主题 | 学什么 | 关键文件 |
-|--------|--------|----------|
-| D4.1 QueryRouter 与 Semantic Cache | 如何决定走哪种策略，何时直接命中缓存 | `src/core/query_engine/query_router.py`, `src/core/cache/semantic_cache.py` |
-| D4.2 QueryEnhancer 与查询改写 | rewrite、HyDE、多 query 在哪里接入 | `src/core/query_engine/query_enhancer.py`, `src/agent/tools/knowledge_query.py` |
-| D4.3 HybridSearch 混合检索 | dense/sparse 并行、RRF 融合、排序裁剪 | `src/core/query_engine/hybrid_search.py`, `dense_retriever.py`, `sparse_retriever.py`, `fusion.py` |
-| D4.4 Rerank、MMR、过滤与冲突处理 | rerank、MMR、低分过滤、冲突检测的收尾逻辑 | `src/core/query_engine/reranker.py`, `src/core/query_engine/mmr.py`, `src/core/conflict/*.py` |
-| D4.5 Parent chunk、结果格式化与引用 | parent 解析、返回内容和引用展示如何收尾 | `src/agent/tools/knowledge_query.py`, `src/core/response/*.py` |
-
-## D5 数据摄取与索引
+## D3 Agent 运行时与流式链路
 
 | 子主题 | 学什么 | 关键文件 |
 |--------|--------|----------|
-| D5.1 Loader 与 source type 推断 | PDF/PPTX/DOCX 如何解析，题库如何识别 | `src/libs/loader/*.py`, `src/ingestion/pipeline.py` |
-| D5.2 Chunking、Parent-Child 与 QuestionParser | 分块、父子块和题目解析如何配合 | `src/ingestion/chunking/document_chunker.py`, `src/ingestion/transform/question_parser.py` |
-| D5.3 Transform 链路与多模态增强 | refiner、metadata、caption、dedup 的执行顺序 | `src/ingestion/transform/*.py` |
-| D5.4 Dense/Sparse 编码与写库 | encoder、vector upsert、BM25、图片索引怎么协同 | `src/ingestion/embedding/*.py`, `src/ingestion/storage/*.py` |
-| D5.5 DocumentManager 与跨存储一致性 | 文档列表、详情、删除如何跨多个存储协调 | `src/ingestion/document_manager.py` |
+| D3.1 会话加载与消息追加 | conversation 如何读取、新消息何时进入会话对象 | `src/agent/agent.py`, `src/agent/conversation.py` |
+| D3.2 prompt 预处理 | memory/review/skill 为什么要在 tool loop 前预取 | `src/agent/agent.py`, `src/agent/prompt_builder.py` |
+| D3.3 ReAct tool loop | Agent 如何多轮调工具、继续生成、结束回答 | `src/agent/agent.py` |
+| D3.4 流式事件链路 | LLM 流、Agent 事件流、SSE 推流怎么接起来 | `src/agent/types.py`, `src/server/chat_handler.py`, `src/server/routes.py` |
+| D3.5 后台保存与 flush | 为什么保存 conversation / after hooks 放到后台做 | `src/agent/agent.py` |
 
-## D6 Memory、Skills 与 Hooks
-
-| 子主题 | 学什么 | 关键文件 |
-|--------|--------|----------|
-| D6.1 Context filter 与 session memory | 长上下文如何压缩，会话记忆如何保存 | `src/agent/memory/context_filter.py`, `src/agent/memory/session_memory.py` |
-| D6.2 StudentProfile、ErrorMemory、KnowledgeMap | 长期记忆的数据模型与更新逻辑 | `src/agent/memory/student_profile.py`, `src/agent/memory/error_memory.py`, `src/agent/memory/knowledge_map.py` |
-| D6.3 Memory enhancer 与 review schedule | 记忆如何注入 prompt，复习推荐怎么触发 | `src/agent/memory/enhancer.py`, `src/agent/hooks/review_schedule.py` |
-| D6.4 Skill registry、workflow 与 guardrails | 技能匹配、workflow 注入、安全防护如何协同 | `src/agent/skills/registry.py`, `src/agent/skills/workflow.py`, `src/agent/hooks/guardrails.py` |
-| D6.5 课程内置 skills 与学习引导策略 | 内置学习 skills 如何被组织和用于课程场景 | `src/agent/skills/definitions/*/SKILL.md`, `src/agent/skills/registry.py` |
-
-## D7 配置、Provider 与存储
+## D4 Planner、ToolRegistry 与学习工具
 
 | 子主题 | 学什么 | 关键文件 |
 |--------|--------|----------|
-| D7.1 settings.yaml 与 typed settings | 为什么有 YAML dict 和 typed settings 两套入口 | `config/settings.yaml`, `src/core/settings.py` |
-| D7.2 Provider 工厂 | LLM、Embedding、Reranker、VectorStore 如何可插拔 | `src/agent/llm/factory.py`, `src/libs/*/*factory*.py` |
-| D7.3 Chroma、BM25、SQLite、image storage | 每种存储各存什么，为什么不能混成一个 | `src/libs/vector_store/*.py`, `src/ingestion/storage/*.py`, `data/` |
-| D7.4 默认课程数据与 collection 组织 | 默认课程、默认 collection 和本地数据布局 | `config/settings.yaml`, `docs/computer_internet/` |
-| D7.5 Routing、Cache、Memory、Guardrails 配置开关 | 检索、缓存、记忆、安全这些能力在哪些配置项上打开 | `config/settings.yaml` |
+| D4.1 TaskPlanner | task intent、control mode、composite subtask 是怎么判定的 | `src/agent/planner/task_planner.py` |
+| D4.2 ToolRegistry | 工具 schema、参数校验、超时与错误包装如何统一 | `src/agent/tools/base.py` |
+| D4.3 knowledge_query / review_summary | 问答与复习摘要工具分别解决什么问题 | `src/agent/tools/knowledge_query.py`, `src/agent/tools/review_summary.py` |
+| D4.4 quiz_generator / quiz_evaluator | 出题、判题、记忆回写怎么形成学习闭环 | `src/agent/tools/quiz_generator.py`, `src/agent/tools/quiz_evaluator.py` |
+| D4.5 document_ingest | 用户上传文件后如何进入异步/同步入库链路 | `src/agent/tools/document_ingest.py`, `src/server/routes.py` |
 
-## D8 Web 与 MCP 接口层
-
-| 子主题 | 学什么 | 关键文件 |
-|--------|--------|----------|
-| D8.1 FastAPI routes、models、chat handler | HTTP 层如何接消息、上传文件、返回 SSE | `src/server/routes.py`, `src/server/models.py`, `src/server/chat_handler.py` |
-| D8.2 前端 SSE 交互与页面结构 | Web 前端如何消费事件流 | `src/web/index.html`, `src/web/app.js`, `src/web/style.css` |
-| D8.3 MCP server、protocol handler、tools | MCP 工具是如何注册和调度的 | `src/mcp_server/server.py`, `src/mcp_server/protocol_handler.py`, `src/mcp_server/tools/*.py` |
-| D8.4 包脚本与真实运行路径的偏差 | 为什么需要分清 `agent-server` 和 `mcp-server` | `pyproject.toml`, `run_server.py`, `main.py` |
-| D8.5 上传文件、静态资源与启动方式 | Web 启动后如何挂静态资源、处理上传和页面入口 | `src/server/app.py`, `src/server/routes.py`, `src/web/*` |
-
-## D9 质量保障与可观测性
+## D5 检索查询链路
 
 | 子主题 | 学什么 | 关键文件 |
 |--------|--------|----------|
-| D9.1 Trace 系统与链路观测 | ingestion/query trace 如何记录和查看 | `src/core/trace/*.py` |
-| D9.2 Dashboard 页面与服务层 | 观测面板如何组织数据和页面 | `src/observability/dashboard/pages/*.py`, `src/observability/dashboard/services/*.py` |
-| D9.3 Evaluation runner 与指标体系 | 评估流程、检索指标和 ragas 如何挂接 | `src/observability/evaluation/*.py`, `src/libs/evaluator/*.py` |
-| D9.4 测试结构与当前环境 caveat | unit/integration 测试布局，以及 MCP 依赖缺失这类环境问题 | `tests/`, `pyproject.toml` |
-| D9.5 Golden set、回归思路与质量闭环 | 为什么评估、trace、测试要形成闭环 | `tests/fixtures/`, `src/observability/evaluation/eval_runner.py` |
+| D5.1 QueryRouter | 为什么要先判断是否需要 RAG、偏好什么来源 | `src/core/query_engine/query_router.py` |
+| D5.2 Semantic Cache 与查询增强 | 查询缓存、rewrite、HyDE、多 query 的组合位置 | `src/core/cache/redis_semantic_cache.py`, `src/core/query_engine/query_enhancer.py`, `src/agent/tools/knowledge_query.py` |
+| D5.3 HybridSearch | dense/sparse 并行、RRF、rerank、MMR 的主链路 | `src/core/query_engine/hybrid_search.py`, `src/core/query_engine/` |
+| D5.4 冲突检测 | 知识冲突为什么作为检索后处理存在 | `src/core/conflict/`, `src/agent/tools/knowledge_query.py` |
+| D5.5 引用与结果格式化 | parent chunk、citation、result formatting 怎么收尾 | `src/core/response/`, `src/agent/tools/knowledge_query.py` |
+
+## D6 数据摄取与文档生命周期
+
+| 子主题 | 学什么 | 关键文件 |
+|--------|--------|----------|
+| D6.1 Loader 与 source type | PDF/PPTX/DOCX 如何解析，题库如何识别 | `src/libs/loader/`, `src/ingestion/pipeline.py` |
+| D6.2 Chunking 与 QuestionParser | parent-child、题库抽题和 chunk 结构怎么配合 | `src/ingestion/chunking/document_chunker.py`, `src/ingestion/transform/question_parser.py` |
+| D6.3 Transform 链路 | refiner、metadata、caption、dedup、contextual enrich 的顺序和作用 | `src/ingestion/transform/` |
+| D6.4 编码与写库 | dense/sparse 编码、向量写库、BM25 和图片索引怎么协同 | `src/ingestion/embedding/`, `src/ingestion/storage/` |
+| D6.5 DocumentManager | 已入库文档的 list/detail/delete 为什么是跨存储问题 | `src/ingestion/document_manager.py` |
+
+## D7 Conversation、Memory 与上下文工程
+
+| 子主题 | 学什么 | 关键文件 |
+|--------|--------|----------|
+| D7.1 ConversationStore | 聊天记录本地和生产环境分别怎么存 | `src/agent/conversation.py`, `src/storage/postgres_backends.py` |
+| D7.2 长期记忆结构 | profile、error、knowledge_map、skill、session 各存什么 | `src/agent/memory/`, `src/storage/postgres_backends.py` |
+| D7.3 Memory enhancer / record hook | 记忆什么时候读，什么时候写 | `src/agent/memory/enhancer.py` |
+| D7.4 ContextEngineeringFilter | 长上下文压缩、工具结果卸载、token budget 为什么重要 | `src/agent/memory/context_filter.py` |
+| D7.5 三个概念的边界 | 聊天记录、长期记忆、上下文窗口为什么不能混为一谈 | `src/agent/agent.py`, `src/agent/memory/enhancer.py` |
+
+## D8 Web、前端与 MCP 接口
+
+| 子主题 | 学什么 | 关键文件 |
+|--------|--------|----------|
+| D8.1 FastAPI 分层 | routes、models、chat_handler 的职责边界 | `src/server/` |
+| D8.2 前端 SSE 页面 | 前端如何消费消息流、显示会话和上传结果 | `src/web/index.html`, `src/web/app.js`, `src/web/style.css` |
+| D8.3 Conversation API | 历史会话列表、详情、删除接口如何暴露 | `src/server/routes.py` |
+| D8.4 MCP server | server、protocol handler、默认工具如何接起来 | `src/mcp_server/` |
+| D8.5 Web 与 MCP 定位差异 | 为什么 Web 更像当前产品接口，MCP 更像集成接口 | `src/server/app.py`, `src/mcp_server/server.py` |
+
+## D9 可观测性、评估与测试
+
+| 子主题 | 学什么 | 关键文件 |
+|--------|--------|----------|
+| D9.1 Trace 系统 | query / ingestion / agent / memory trace 如何记录 | `src/core/trace/` |
+| D9.2 Dashboard | observability dashboard 的页面和 services 如何组织 | `src/observability/dashboard/*` |
+| D9.3 Evaluation runner | golden set、eval runner、ragas evaluator 如何配合 | `src/observability/evaluation/`, `tests/fixtures/` |
+| D9.4 测试分层 | unit / integration / e2e 各在验证什么 | `tests/` |
+| D9.5 稳定性机制 | retry、rate limit、distributed circuit breaker 的工程价值 | `src/agent/hooks/`, `src/storage/runtime.py` |
