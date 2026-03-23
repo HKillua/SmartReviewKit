@@ -40,6 +40,7 @@ from src.agent.planner import (
     TaskPlanner,
 )
 from src.agent.pacing import compute_pacing_from_conversation
+from src.agent.quiz_batch import build_quiz_batch_alignment
 from src.agent.prompt_builder import SystemPromptBuilder
 from src.agent.skills.registry import SkillPolicy
 from src.agent.tools.base import ToolRegistry
@@ -425,6 +426,25 @@ def _build_evidence_metadata(
     if assessment is not None:
         metadata.update(assessment.to_metadata())
     return metadata
+
+
+def _build_batch_evaluation_metadata(metadata: dict[str, Any] | None) -> dict[str, object]:
+    if not metadata:
+        return {}
+    keys = (
+        "batch_evaluation",
+        "question_count",
+        "batch_results",
+        "alignment_mode",
+        "alignment_status",
+        "split_confidence",
+        "score_aggregation",
+    )
+    return {
+        key: metadata[key]
+        for key in keys
+        if key in metadata
+    }
 
 
 def _accumulate_tool_calls(chunks: list[LlmStreamChunk]) -> list[ToolCallData] | None:
@@ -1135,23 +1155,54 @@ class Agent:
                 },
             )
         if planner_decision.task_intent == TaskIntent.QUIZ_EVALUATOR:
-            parsed = _extract_evaluator_fields(user_message)
-            question = parsed.get("question") or _clean_topic_text(user_message) or user_message
-            if not question:
-                return None
-            return ToolCallData(
-                id="direct_quiz_evaluator",
-                name=selected_tool,
-                arguments={
-                    "question": question,
-                    "user_answer": parsed.get("user_answer", ""),
-                    "correct_answer": parsed.get("correct_answer", ""),
-                    "question_type": _extract_question_type(user_message) or "选择题",
-                    "topic": _extract_shared_topic(user_message) or question,
-                    "concepts": [],
-                },
-            )
+            return None
         return None
+
+    @staticmethod
+    def _recent_alignment_messages(conversation: Conversation) -> list[dict[str, Any]]:
+        return [
+            {"role": message.role, "content": message.content or ""}
+            for message in conversation.messages[-8:]
+            if message.role in {"user", "assistant"} and (message.content or "").strip()
+        ]
+
+    async def _build_quiz_evaluator_arguments(
+        self,
+        *,
+        message: str,
+        recent_messages: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        alignment = await build_quiz_batch_alignment(
+            message=message,
+            recent_messages=recent_messages,
+            llm_service=self.llm,
+            max_items=5,
+        )
+        return {
+            "items": [item.to_tool_payload() for item in alignment.items],
+            "alignment_mode": alignment.alignment_mode,
+            "alignment_status": alignment.alignment_status,
+            "split_confidence": alignment.split_confidence,
+            "clarification_reason": alignment.clarification_reason,
+        }
+
+    async def _build_direct_quiz_evaluator_call(
+        self,
+        conversation: Conversation,
+        planner_decision: PlannerDecision,
+    ) -> ToolCallData | None:
+        user_message = _latest_user_message(conversation)
+        if not user_message:
+            return None
+        arguments = await self._build_quiz_evaluator_arguments(
+            message=user_message,
+            recent_messages=self._recent_alignment_messages(conversation),
+        )
+        return ToolCallData(
+            id="direct_quiz_evaluator",
+            name=planner_decision.selected_tool or planner_decision.task_intent.value,
+            arguments=arguments,
+        )
 
     async def _generate_direct_knowledge_answer(
         self,
@@ -1258,7 +1309,10 @@ class Agent:
         trace: TraceContext | None = None,
         response_state: dict[str, object] | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
-        tool_call = self._build_direct_tool_call(conversation, tool_ctx, planner_decision)
+        if planner_decision.task_intent == TaskIntent.QUIZ_EVALUATOR:
+            tool_call = await self._build_direct_quiz_evaluator_call(conversation, planner_decision)
+        else:
+            tool_call = self._build_direct_tool_call(conversation, tool_ctx, planner_decision)
         if tool_call is None:
             return
 
@@ -1311,6 +1365,14 @@ class Agent:
                 "success": tool_result_obj.success,
                 **tool_result_obj.metadata,
             },
+        )
+        conversation.messages.append(
+            Message(
+                role="tool",
+                content=tool_result_obj.result_for_llm if tool_result_obj.success else (tool_result_obj.error or ""),
+                tool_call_id=tool_call.id,
+                metadata=dict(tool_result_obj.metadata),
+            )
         )
 
         if trace is not None:
@@ -1413,6 +1475,7 @@ class Agent:
             )
         if response_state is not None:
             response_state.update(_build_evidence_metadata(evidence_bundle, grounding_assessment))
+            response_state.update(_build_batch_evaluation_metadata(tool_result_obj.metadata))
             if generation_mode:
                 response_state["generation_mode"] = generation_mode
             if evaluation_mode:
@@ -1550,6 +1613,7 @@ class Agent:
         completed_intents: set[TaskIntent] = set()
         last_generation_mode = ""
         last_evaluation_mode = ""
+        last_batch_metadata: dict[str, object] = {}
 
         if trace is not None:
             trace.record_stage(
@@ -1562,11 +1626,22 @@ class Agent:
             )
 
         for subtask_index, subtask in enumerate(planner_decision.subtasks):
-            arguments = self._build_composite_tool_args(
-                subtask,
-                original_request=original_request,
-                handoff=handoff,
-            )
+            if subtask.task_intent == TaskIntent.QUIZ_EVALUATOR:
+                recent_messages = list(tool_ctx.recent_messages)
+                latest_result_text = str(handoff.get("latest_result_text", "") or "").strip()
+                if latest_result_text:
+                    recent_messages.append({"role": "assistant", "content": latest_result_text})
+                segment_text = str(subtask.segment_text or original_request).strip() or original_request
+                arguments = await self._build_quiz_evaluator_arguments(
+                    message=segment_text,
+                    recent_messages=recent_messages,
+                )
+            else:
+                arguments = self._build_composite_tool_args(
+                    subtask,
+                    original_request=original_request,
+                    handoff=handoff,
+                )
             sub_ctx = self._build_composite_tool_context(
                 tool_ctx,
                 subtask=subtask,
@@ -1636,6 +1711,14 @@ class Agent:
                     "success": tool_result_obj.success,
                     **tool_result_obj.metadata,
                 },
+            )
+            conversation.messages.append(
+                Message(
+                    role="tool",
+                    content=tool_result_obj.result_for_llm if tool_result_obj.success else (tool_result_obj.error or ""),
+                    tool_call_id=tool_call.id,
+                    metadata=dict(tool_result_obj.metadata),
+                )
             )
 
             if trace is not None:
@@ -1715,6 +1798,9 @@ class Agent:
             last_evaluation_mode = str(
                 tool_result_obj.metadata.get("evaluation_mode", "") or last_evaluation_mode
             )
+            batch_metadata = _build_batch_evaluation_metadata(tool_result_obj.metadata)
+            if batch_metadata:
+                last_batch_metadata = batch_metadata
 
         lines: list[str] = []
         for section_title, section_text in completed_sections:
@@ -1780,6 +1866,7 @@ class Agent:
                 }
             )
             response_state.update(_build_evidence_metadata(aggregate_bundle, grounding_assessment))
+            response_state.update(last_batch_metadata)
             if last_evaluation_mode:
                 response_state["evaluation_mode"] = last_evaluation_mode
 
@@ -1876,7 +1963,20 @@ class Agent:
                 )
 
         if self._should_use_direct_tool_path(planner_decision, _latest_user_message(conversation)):
-            direct_tool_call = self._build_direct_tool_call(conversation, tool_ctx, planner_decision)
+            if (
+                planner_decision is not None
+                and planner_decision.task_intent == TaskIntent.QUIZ_EVALUATOR
+            ):
+                direct_tool_call = await self._build_direct_quiz_evaluator_call(
+                    conversation,
+                    planner_decision,
+                )
+            else:
+                direct_tool_call = self._build_direct_tool_call(
+                    conversation,
+                    tool_ctx,
+                    planner_decision,
+                )
             if direct_tool_call is not None:
                 if trace is not None:
                     trace.record_stage(
@@ -2259,6 +2359,7 @@ class Agent:
                             role="tool",
                             content=tool_result_obj.result_for_llm if tool_result_obj.success else (tool_result_obj.error or ""),
                             tool_call_id=tc.id,
+                            metadata=dict(tool_result_obj.metadata),
                         )
                     )
 
@@ -2365,6 +2466,9 @@ class Agent:
                     if response_state is not None:
                         response_state.update(
                             _build_evidence_metadata(evidence_bundle, grounding_assessment)
+                        )
+                        response_state.update(
+                            _build_batch_evaluation_metadata(passthrough_payload[1])
                         )
                     if response_state is not None and generation_mode:
                         response_state["generation_mode"] = generation_mode

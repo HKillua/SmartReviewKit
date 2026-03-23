@@ -118,6 +118,7 @@ class Message(BaseModel):
     timestamp: datetime = Field(default_factory=_utcnow)
     tool_calls: Optional[list[ToolCallData]] = None
     tool_call_id: Optional[str] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class Conversation(BaseModel):

@@ -37,6 +37,16 @@ def extract_recent_quiz_outcomes(
             continue
         if tool_names.get(str(message.tool_call_id)) != "quiz_evaluator":
             continue
+        metadata = getattr(message, "metadata", {}) or {}
+        batch_results = metadata.get("batch_results", [])
+        if isinstance(batch_results, list) and batch_results:
+            for item in batch_results:
+                if not isinstance(item, dict):
+                    continue
+                verdict = str(item.get("verdict", "") or "").strip().lower()
+                if verdict in {"correct", "incorrect", "partial"}:
+                    outcomes.append(verdict)
+            continue
         content = (message.content or "").strip()
         if not content:
             continue

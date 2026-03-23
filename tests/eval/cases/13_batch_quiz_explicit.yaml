@@ -1,0 +1,17 @@
+name: "显式双题批量判改"
+user_message: |
+  请帮我批改：
+  第1题 题目：TCP 是面向连接的吗？ 我的答案：是 正确答案：是
+  第2题 题目：UDP 是否可靠？ 我的答案：是 正确答案：否
+user_id: "eval_user_13"
+mock_state:
+  response_profile: "balanced_fast"
+expectations:
+  tool_must_include: ["quiz_evaluator"]
+  control_mode: "force_tool"
+  min_steps: 1
+  max_steps: 1
+  batch_evaluation: true
+  question_count: 2
+  alignment_status: "aligned"
+  output_must_contain: ["本次判改题数: 2", "### 第 1 题", "### 第 2 题"]

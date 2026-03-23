@@ -1,0 +1,55 @@
+name: "自由文本双题作答智能拆题"
+user_message: "请帮我批改，我觉得第一题应该选A，因为客户端先发 SYN；第二题我选B，因为 UDP 不可靠。"
+user_id: "eval_user_15"
+mock_state:
+  response_profile: "balanced_fast"
+  recent_quiz_markdown: |
+    以下是 2 道选择题：
+
+    ### 第 1 题
+
+    TCP 三次握手的第一次报文是？
+
+    <details>
+    <summary>🔑 查看答案与解析</summary>
+
+    **答案**: A
+
+    **解析**: 第一次由客户端发送 SYN。
+
+    **涉及知识点**: TCP, 三次握手
+    </details>
+
+    ### 第 2 题
+
+    UDP 是否提供可靠传输？
+
+    <details>
+    <summary>🔑 查看答案与解析</summary>
+
+    **答案**: B
+
+    **解析**: UDP 不提供可靠传输。
+
+    **涉及知识点**: UDP, 可靠传输
+    </details>
+  free_text_split_items:
+    - index: 1
+      question_text: ""
+      answer_text: "A"
+      answer_confidence: 0.92
+      alignment_notes: "从第一题作答片段映射"
+    - index: 2
+      question_text: ""
+      answer_text: "B"
+      answer_confidence: 0.89
+      alignment_notes: "从第二题作答片段映射"
+expectations:
+  tool_must_include: ["quiz_evaluator"]
+  control_mode: "force_tool"
+  min_steps: 1
+  max_steps: 1
+  batch_evaluation: true
+  question_count: 2
+  alignment_status: "aligned"
+  output_must_contain: ["本次判改题数: 2", "TCP 三次握手", "UDP 是否提供可靠传输"]

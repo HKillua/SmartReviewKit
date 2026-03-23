@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from dataclasses import dataclass
@@ -302,9 +303,23 @@ class EvalQuizGeneratorTool(Tool[EvalQuizGeneratorArgs]):
         return EvalQuizGeneratorArgs
 
     async def execute(self, context: ToolContext, args: EvalQuizGeneratorArgs) -> ToolResult:
-        lines = [f"已生成 {args.count} 道{args.question_type}："]
+        lines = [f"以下是 {args.count} 道{args.question_type}：", ""]
         for index in range(1, args.count + 1):
-            lines.append(f"{index}. {args.topic or '计算机网络'} 相关练习题")
+            lines.append(f"### 第 {index} 题")
+            lines.append("")
+            lines.append(f"{args.topic or '计算机网络'} 相关练习题 {index}")
+            lines.append("")
+            lines.append("<details>")
+            lines.append("<summary>🔑 查看答案与解析</summary>")
+            lines.append("")
+            answer = chr(ord("A") + (index - 1) % 4)
+            lines.append(f"**答案**: {answer}")
+            lines.append("")
+            lines.append(f"**解析**: 这是一道关于 {args.topic or '计算机网络'} 的示例题。")
+            lines.append("")
+            lines.append(f"**涉及知识点**: {args.topic or '计算机网络'}, 核心概念{index}")
+            lines.append("</details>")
+            lines.append("")
         return ToolResult(
             success=True,
             result_for_llm="\n".join(lines),
@@ -324,6 +339,11 @@ class EvalQuizEvaluatorArgs(BaseModel):
     topic: str = Field(default="")
     question_type: str = Field(default="选择题")
     concepts: list[str] = Field(default_factory=list)
+    items: list[dict[str, Any]] = Field(default_factory=list)
+    alignment_mode: str = Field(default="")
+    alignment_status: str = Field(default="")
+    split_confidence: float = Field(default=0.0)
+    clarification_reason: str = Field(default="")
 
 
 class EvalQuizEvaluatorTool(Tool[EvalQuizEvaluatorArgs]):
@@ -339,13 +359,116 @@ class EvalQuizEvaluatorTool(Tool[EvalQuizEvaluatorArgs]):
         return EvalQuizEvaluatorArgs
 
     async def execute(self, context: ToolContext, args: EvalQuizEvaluatorArgs) -> ToolResult:
-        is_correct = bool(args.correct_answer and args.user_answer and args.correct_answer.strip() == args.user_answer.strip())
-        verdict = "✅ 正确" if is_correct else "❌ 错误"
-        text = f"判定: {verdict}\n题目: {args.question}\n解析: 建议结合 {args.topic or '当前知识点'} 继续复习。"
+        raw_items = list(args.items or [])
+        items = [item for item in raw_items if isinstance(item, dict)]
+        if not items and (args.question or args.user_answer or args.correct_answer):
+            items = [
+                {
+                    "index": 1,
+                    "question": args.question,
+                    "user_answer": args.user_answer,
+                    "correct_answer": args.correct_answer,
+                    "topic": args.topic,
+                    "question_type": args.question_type,
+                    "concepts": list(args.concepts),
+                }
+            ]
+
+        alignment_status = args.alignment_status or ("aligned" if items else "clarification_required")
+        alignment_mode = args.alignment_mode or ("explicit_message" if items else "")
+        if alignment_status != "aligned":
+            text = (
+                "我还不能稳定对齐这次的多题作答。\n\n"
+                f"原因：{args.clarification_reason or '题目和答案的对应关系不够清晰。'}\n\n"
+                "建议：\n- 请按“第1题：... 第2题：...”逐条作答。\n- 或者把原题一起贴上来。"
+            )
+            return ToolResult(
+                success=True,
+                result_for_llm=text,
+                metadata={
+                    "tool_output_kind": "final_answer",
+                    "final_response_preferred": True,
+                    "batch_evaluation": len(items) > 1,
+                    "question_count": len(items),
+                    "batch_results": [],
+                    "alignment_mode": alignment_mode,
+                    "alignment_status": "clarification_required",
+                    "split_confidence": float(args.split_confidence or 0.0),
+                    "score_aggregation": "mean_rounded",
+                    "source_count": 0,
+                },
+            )
+
+        batch_results: list[dict[str, Any]] = []
+        lines = [
+            f"本次判改题数: {len(items)}",
+        ]
+        scores: list[int] = []
+        verdicts: list[str] = []
+        weak_concepts: list[str] = []
+        for index, item in enumerate(items, start=1):
+            user_answer = str(item.get("user_answer", "") or "").strip()
+            correct_answer = str(item.get("correct_answer", "") or "").strip()
+            is_correct = bool(correct_answer and user_answer and correct_answer == user_answer)
+            verdict_key = "correct" if is_correct else "incorrect"
+            verdict_label = "✅ 正确" if is_correct else "❌ 错误"
+            score = 100 if is_correct else 40
+            scores.append(score)
+            verdicts.append(verdict_key)
+            concepts = [str(value) for value in item.get("concepts", []) if str(value)]
+            if not is_correct:
+                weak_concepts.extend(concepts)
+            batch_results.append(
+                {
+                    "index": int(item.get("index", index) or index),
+                    "question": str(item.get("question", "") or ""),
+                    "verdict": verdict_key,
+                    "score": score,
+                    "concepts": concepts,
+                    "query_trace_ids": [],
+                    "source_count": 0,
+                }
+            )
+            lines.extend(
+                [
+                    "",
+                    f"### 第 {int(item.get('index', index) or index)} 题",
+                    f"判定: {verdict_label}",
+                    f"得分: {score}/100",
+                    f"题目: {str(item.get('question', '') or '')}",
+                    f"解析: 建议结合 {str(item.get('topic', '') or '当前知识点')} 继续复习。",
+                ]
+            )
+            if concepts:
+                lines.append(f"涉及知识点: {', '.join(concepts)}")
+
+        overall_verdict = "correct" if set(verdicts) == {"correct"} else ("incorrect" if set(verdicts) == {"incorrect"} else "partial")
+        overall_label = {"correct": "✅ 正确", "incorrect": "❌ 错误", "partial": "⚠️ 部分正确"}[overall_verdict]
+        avg_score = round(sum(scores) / len(scores)) if scores else 0
+        lines.insert(1, f"整体判定: {overall_label}")
+        lines.insert(2, f"平均得分: {avg_score}/100")
+        if weak_concepts:
+            dedup = list(dict.fromkeys(weak_concepts))
+            lines.extend(["", f"总体建议: 优先复习 {', '.join(dedup[:5])}。"])
+        else:
+            lines.extend(["", "总体建议: 当前这组题掌握较好，可以继续挑战更高阶题目。"])
         return ToolResult(
             success=True,
-            result_for_llm=text,
-            metadata={"tool_output_kind": "final_answer", "final_response_preferred": True, "source_count": 0},
+            result_for_llm="\n".join(lines).strip(),
+            metadata={
+                "tool_output_kind": "final_answer",
+                "final_response_preferred": True,
+                "batch_evaluation": len(items) > 1,
+                "question_count": len(items),
+                "batch_results": batch_results,
+                "alignment_mode": alignment_mode,
+                "alignment_status": alignment_status,
+                "split_confidence": float(args.split_confidence or 1.0),
+                "score_aggregation": "mean_rounded",
+                "verdict": overall_verdict,
+                "score": avg_score,
+                "source_count": 0,
+            },
         )
 
 
@@ -517,6 +640,16 @@ class EvalHeuristicLlm:
         available_tools = self._available_tools(request)
         last_tool_name, last_tool_content = self._last_tool(request.messages)
 
+        if "题答结构化助手" in system_text:
+            payload = self._case.mock_state.get("free_text_split_response")
+            if not payload:
+                payload = {
+                    "items": list(self._case.mock_state.get("free_text_split_items", []) or []),
+                    "unmatched_segments": list(self._case.mock_state.get("free_text_unmatched", []) or []),
+                    "clarification_needed": bool(self._case.mock_state.get("free_text_clarification_needed", False)),
+                }
+            return LlmResponse(content=json.dumps(payload, ensure_ascii=False))
+
         if last_tool_name:
             if "## [Replan Signal]" in system_text:
                 if last_tool_name == "protocol_state_simulator" and "knowledge_query" in available_tools:
@@ -590,6 +723,9 @@ class EvalHeuristicLlm:
 
 def _build_prior_conversation(mock_state: dict[str, Any], user_id: str, conversation_id: str) -> Conversation:
     messages: list[Message] = []
+    recent_quiz_markdown = str(mock_state.get("recent_quiz_markdown", "") or "").strip()
+    if recent_quiz_markdown:
+        messages.append(Message(role="assistant", content=recent_quiz_markdown))
     for index, outcome in enumerate(mock_state.get("quiz_outcomes", []) or [], start=1):
         call_id = f"quiz_history_{index}"
         messages.append(
@@ -599,13 +735,29 @@ def _build_prior_conversation(mock_state: dict[str, Any], user_id: str, conversa
                 tool_calls=[ToolCallData(id=call_id, name="quiz_evaluator", arguments={})],
             )
         )
-        if outcome == "correct":
-            content = "判定: ✅ 正确"
-        elif outcome == "incorrect":
-            content = "判定: ❌ 错误"
+        if isinstance(outcome, dict):
+            verdict = str(outcome.get("verdict", "partial") or "partial")
+            content = str(outcome.get("content", "") or "").strip()
+            batch_results = list(outcome.get("batch_results", []) or [])
         else:
-            content = "判定: ⚠️ 部分正确"
-        messages.append(Message(role="tool", tool_call_id=call_id, content=content))
+            verdict = str(outcome or "partial")
+            content = ""
+            batch_results = []
+        if not content:
+            if verdict == "correct":
+                content = "判定: ✅ 正确"
+            elif verdict == "incorrect":
+                content = "判定: ❌ 错误"
+            else:
+                content = "判定: ⚠️ 部分正确"
+        messages.append(
+            Message(
+                role="tool",
+                tool_call_id=call_id,
+                content=content,
+                metadata={"batch_results": batch_results} if batch_results else {},
+            )
+        )
     return Conversation(id=conversation_id, user_id=user_id, messages=messages)
 
 
@@ -646,7 +798,11 @@ def build_agent_for_case(case: EvalCase) -> Agent:
         llm_service=EvalHeuristicLlm(case),
         tool_registry=registry,
         conversation_store=store,
-        config=AgentConfig(stream_responses=False, max_tool_iterations=5, response_profile="quality_first"),
+        config=AgentConfig(
+            stream_responses=False,
+            max_tool_iterations=5,
+            response_profile=str(case.mock_state.get("response_profile") or "quality_first"),
+        ),
         task_planner=TaskPlanner(),
         skill_workflow=EvalSkillWorkflow(),
         review_hook=review_hook,

@@ -1,0 +1,52 @@
+name: "多题对齐失败时进入澄清"
+user_message: "请帮我批改，我前两题应该都差不多，后面那个我有点忘了。"
+user_id: "eval_user_16"
+mock_state:
+  response_profile: "balanced_fast"
+  recent_quiz_markdown: |
+    以下是 2 道选择题：
+
+    ### 第 1 题
+
+    TCP 三次握手的第一次报文是？
+
+    <details>
+    <summary>🔑 查看答案与解析</summary>
+
+    **答案**: A
+
+    **解析**: 第一次由客户端发送 SYN。
+
+    **涉及知识点**: TCP, 三次握手
+    </details>
+
+    ### 第 2 题
+
+    UDP 是否提供可靠传输？
+
+    <details>
+    <summary>🔑 查看答案与解析</summary>
+
+    **答案**: B
+
+    **解析**: UDP 不提供可靠传输。
+
+    **涉及知识点**: UDP, 可靠传输
+    </details>
+  free_text_split_response:
+    items:
+      - index: 0
+        question_text: ""
+        answer_text: "前两题应该都差不多"
+        answer_confidence: 0.35
+        alignment_notes: "只能识别到模糊整体回答"
+    unmatched_segments:
+      - "后面那个我有点忘了"
+    clarification_needed: true
+expectations:
+  tool_must_include: ["quiz_evaluator"]
+  control_mode: "force_tool"
+  min_steps: 1
+  max_steps: 1
+  alignment_status: "clarification_required"
+  output_must_contain: ["不能稳定对齐", "逐条作答"]

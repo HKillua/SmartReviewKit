@@ -81,6 +81,24 @@ class EvalRunner:
             if actual != expected:
                 failures.append(f"pacing_level 期望 {expected}，实际 {actual or 'unknown'}")
 
+        if "batch_evaluation" in expectations:
+            expected = bool(expectations["batch_evaluation"])
+            actual = bool(metadata.get("batch_evaluation", False))
+            if actual != expected:
+                failures.append(f"batch_evaluation 期望 {expected}，实际 {actual}")
+
+        if "alignment_status" in expectations:
+            expected = str(expectations["alignment_status"])
+            actual = str(metadata.get("alignment_status", ""))
+            if actual != expected:
+                failures.append(f"alignment_status 期望 {expected}，实际 {actual or 'unknown'}")
+
+        if "question_count" in expectations:
+            expected = int(expectations["question_count"])
+            actual = int(metadata.get("question_count", 0) or 0)
+            if actual != expected:
+                failures.append(f"question_count 期望 {expected}，实际 {actual}")
+
         return {
             "name": case.name,
             "passed": not failures,

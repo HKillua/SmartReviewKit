@@ -7,4 +7,4 @@ expectations:
   control_mode: "autonomous"
   min_steps: 2
   max_steps: 5
-  output_must_contain: ["已生成"]
+  output_must_contain: ["以下是 2 道"]

@@ -13,6 +13,7 @@
 - [Phase 4 - Replan And Fallback](/Users/dongjinshuo/projects/work/rag_agent/MODULAR-RAG-MCP-SERVER/docs/agent_upgrade/phase-4-replan-fallback.md)
 - [Phase 4 - Adaptive Pacing](/Users/dongjinshuo/projects/work/rag_agent/MODULAR-RAG-MCP-SERVER/docs/agent_upgrade/phase-4-adaptive-pacing.md)
 - [Phase 4 - Eval Framework](/Users/dongjinshuo/projects/work/rag_agent/MODULAR-RAG-MCP-SERVER/docs/agent_upgrade/phase-4-eval-framework.md)
+- [Phase 5 - Batch Quiz Evaluation](/Users/dongjinshuo/projects/work/rag_agent/MODULAR-RAG-MCP-SERVER/docs/agent_upgrade/phase-5-batch-quiz-evaluation.md)
 
 ## 这组文档怎么用
 
