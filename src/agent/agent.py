@@ -12,6 +12,7 @@ import logging
 import re
 import time
 import uuid
+from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Optional
 
 from src.agent.config import AgentConfig
@@ -45,12 +46,16 @@ from src.agent.prompt_builder import SystemPromptBuilder
 from src.agent.skills.registry import SkillPolicy
 from src.agent.tools.base import ToolRegistry
 from src.agent.types import (
+    AgendaGoal,
+    AgendaState,
     Conversation,
+    GoalStatus,
     LlmMessage,
     LlmRequest,
     LlmResponse,
     LlmStreamChunk,
     Message,
+    RequestStatus,
     StreamEvent,
     StreamEventType,
     ToolCallData,
@@ -121,6 +126,21 @@ REPLAN_POLICY = """
 4. network_calc 参数错误：优先向用户确认参数，不要强行计算。
 当你决定调整计划时，请在 Thought 中明确说明原因和新的工具选择。
 """.strip()
+
+_WAITING_FOR_ANSWER_RE = re.compile(
+    r"(我的答案是|用户答案|第\s*\d+\s*题|第[一二两三四五六七八九十]+\s*题|答案[:：]|回答[:：])",
+    re.IGNORECASE,
+)
+
+
+@dataclass
+class GoalExecutionResult:
+    text: str = ""
+    completion_hint: str = "step_done"
+    goal_status: str = GoalStatus.COMPLETED.value
+    metadata: dict[str, Any] = field(default_factory=dict)
+    resume_payload: dict[str, Any] = field(default_factory=dict)
+    error: str = ""
 
 
 def _serialize_subtasks(subtasks: list[PlannedSubtask]) -> list[dict[str, object]]:
@@ -194,6 +214,14 @@ def _build_planner_context(decision: PlannerDecision | None) -> str:
             f"匹配方式: {decision.match_method}",
             f"执行顺序: {decision.ordering_method or 'declared_order'}",
         ]
+        if decision.matched_skill:
+            lines.append(f"命中技能: {decision.matched_skill}")
+        if decision.skill_start_index >= 0:
+            lines.append(
+                f"技能覆盖区间: {decision.skill_start_index + 1} -> {decision.skill_end_index + 1}"
+            )
+        if decision.planner_execution_model:
+            lines.append(f"执行模型: {decision.planner_execution_model}")
         for index, subtask in enumerate(decision.subtasks, 1):
             lines.append(
                 f"子任务 {index}: {subtask.task_intent.value} -> {subtask.selected_tool}"
@@ -248,6 +276,10 @@ def _planner_metadata(decision: PlannerDecision | None) -> dict[str, object]:
             decision.primary_intent.value if decision.primary_intent is not None else ""
         ),
         "planner_ordering_method": decision.ordering_method,
+        "planner_matched_skill": decision.matched_skill,
+        "planner_skill_start_index": decision.skill_start_index,
+        "planner_skill_end_index": decision.skill_end_index,
+        "planner_execution_model": decision.planner_execution_model,
     }
     if decision.subtasks:
         metadata["subtask_plan"] = _serialize_subtasks(decision.subtasks)
@@ -416,6 +448,16 @@ def _composite_section_title(intent: TaskIntent) -> str:
     }.get(intent, intent.value)
 
 
+def _subtask_within_skill_interval(
+    planner_decision: PlannerDecision,
+    subtask_index: int,
+) -> bool:
+    return (
+        planner_decision.skill_start_index >= 0
+        and planner_decision.skill_start_index <= subtask_index <= planner_decision.skill_end_index
+    )
+
+
 def _build_evidence_metadata(
     bundle: EvidenceBundle | None,
     assessment: GroundingAssessment | None = None,
@@ -445,6 +487,338 @@ def _build_batch_evaluation_metadata(metadata: dict[str, Any] | None) -> dict[st
         for key in keys
         if key in metadata
     }
+
+
+def _tool_completion_hint(tool_name: str, metadata: dict[str, Any] | None) -> str:
+    if metadata:
+        explicit = str(metadata.get("completion_hint", "") or "").strip().lower()
+        if explicit in {"continue", "step_done", "wait_user", "clarify"}:
+            return explicit
+    return "step_done" if _tool_result_is_final_answer(tool_name, metadata) else "continue"
+
+
+def _agenda_metadata(conversation: Conversation) -> dict[str, Any]:
+    raw = conversation.metadata if isinstance(conversation.metadata, dict) else {}
+    return raw
+
+
+def _load_agenda_state(conversation: Conversation) -> AgendaState | None:
+    raw = _agenda_metadata(conversation).get("agenda_state")
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return AgendaState.model_validate(raw)
+    except Exception:
+        logger.warning("Failed to load agenda_state from conversation metadata", exc_info=True)
+        return None
+
+
+def _save_agenda_state(conversation: Conversation, agenda_state: AgendaState | None) -> None:
+    metadata = dict(_agenda_metadata(conversation))
+    if agenda_state is None:
+        metadata.pop("agenda_state", None)
+    else:
+        metadata["agenda_state"] = agenda_state.model_dump(mode="json")
+    conversation.metadata = metadata
+
+
+def _agenda_goal_from_subtask(subtask: PlannedSubtask) -> AgendaGoal:
+    return AgendaGoal(
+        goal_id=subtask.goal_id or f"goal_{subtask.source_span[0]}_{subtask.source_span[1]}",
+        intent=subtask.task_intent.value,
+        selected_tool=subtask.selected_tool,
+        segment_text=subtask.segment_text,
+        required=subtask.required,
+        depends_on_user_input=subtask.depends_on_user_input,
+        status=GoalStatus(subtask.status),
+        match_method=subtask.match_method,
+        source_span=[subtask.source_span[0], subtask.source_span[1]],
+    )
+
+
+def _agenda_goal_from_decision(decision: PlannerDecision) -> AgendaGoal:
+    return AgendaGoal(
+        goal_id="goal_1",
+        intent=decision.task_intent.value,
+        selected_tool=decision.selected_tool or decision.task_intent.value,
+        segment_text="",
+        required=True,
+        depends_on_user_input=(decision.task_intent == TaskIntent.QUIZ_EVALUATOR),
+        status=GoalStatus.PENDING,
+        match_method=decision.match_method,
+        source_span=[],
+    )
+
+
+def _should_add_quiz_follow_up_goal(
+    decision: PlannerDecision | None,
+    matched_skill: str,
+) -> bool:
+    if decision is None:
+        return False
+    if decision.is_composite:
+        if not decision.subtasks:
+            return False
+        last_subtask = decision.subtasks[-1]
+        return last_subtask.task_intent == TaskIntent.QUIZ_GENERATOR
+    if decision.task_intent != TaskIntent.QUIZ_GENERATOR:
+        return False
+    return matched_skill in {"quiz_drill", "error_review"}
+
+
+def _build_agenda_state(
+    planner_decision: PlannerDecision,
+    *,
+    matched_skill: str = "",
+) -> AgendaState | None:
+    goals: list[AgendaGoal]
+    if planner_decision.is_composite and planner_decision.subtasks:
+        goals = [_agenda_goal_from_subtask(subtask) for subtask in planner_decision.subtasks]
+    else:
+        goals = [_agenda_goal_from_decision(planner_decision)]
+    if _should_add_quiz_follow_up_goal(planner_decision, matched_skill):
+        next_goal_number = len(goals) + 1
+        goals.append(
+            AgendaGoal(
+                goal_id=f"goal_{next_goal_number}",
+                intent=TaskIntent.QUIZ_EVALUATOR.value,
+                selected_tool=TaskIntent.QUIZ_EVALUATOR.value,
+                segment_text="根据用户后续作答进行判题。",
+                required=True,
+                depends_on_user_input=True,
+                status=GoalStatus.PENDING,
+                match_method="skill_follow_up",
+                source_span=[],
+            )
+        )
+    if not goals:
+        return None
+    return AgendaState(
+        request_status=RequestStatus.ACTIVE,
+        current_goal_index=0,
+        matched_skill=matched_skill or planner_decision.matched_skill,
+        skill_start_index=planner_decision.skill_start_index,
+        skill_end_index=planner_decision.skill_end_index,
+        goals=goals,
+        resume_payload={},
+    )
+
+
+def _agenda_needs_runtime(
+    planner_decision: PlannerDecision | None,
+    matched_skill: str,
+) -> bool:
+    if planner_decision is None:
+        return False
+    if planner_decision.is_composite:
+        return True
+    return _should_add_quiz_follow_up_goal(planner_decision, matched_skill)
+
+
+def _active_goal(agenda_state: AgendaState | None) -> AgendaGoal | None:
+    if agenda_state is None:
+        return None
+    if not (0 <= agenda_state.current_goal_index < len(agenda_state.goals)):
+        return None
+    return agenda_state.goals[agenda_state.current_goal_index]
+
+
+def _set_goal_status(goal: AgendaGoal, status: GoalStatus, *, summary: str = "") -> None:
+    goal.status = status
+    if summary:
+        goal.result_summary = summary
+
+
+def _goal_statuses(agenda_state: AgendaState | None) -> list[dict[str, str]]:
+    if agenda_state is None:
+        return []
+    return [
+        {
+            "goal_id": goal.goal_id,
+            "intent": goal.intent,
+            "selected_tool": goal.selected_tool,
+            "status": goal.status.value if isinstance(goal.status, GoalStatus) else str(goal.status),
+        }
+        for goal in agenda_state.goals
+    ]
+
+
+def _goal_execution_model(agenda_state: AgendaState | None) -> str:
+    if agenda_state is None:
+        return ""
+    return "agenda_react"
+
+
+def _goal_has_resume_candidate(message: str, goal: AgendaGoal | None) -> bool:
+    if goal is None:
+        return False
+    text = (message or "").strip()
+    if not text:
+        return False
+    if goal.selected_tool == TaskIntent.QUIZ_EVALUATOR.value:
+        if _WAITING_FOR_ANSWER_RE.search(text):
+            return True
+        if re.fullmatch(r"(?:[A-Da-d](?:[\s,，、/]+|$)){1,8}", text):
+            return True
+        if re.search(r"(?:^|\n)\s*\d+\s*[.、:：)]?\s*[A-Da-d]\b", text):
+            return True
+        return False
+    if goal.selected_tool == TaskIntent.DOCUMENT_INGEST.value:
+        return bool(_extract_ingest_file_path(text))
+    return False
+
+
+def _goal_requires_waiting(goal: AgendaGoal | None) -> bool:
+    if goal is None:
+        return False
+    status = goal.status.value if isinstance(goal.status, GoalStatus) else str(goal.status)
+    return goal.depends_on_user_input or status == GoalStatus.WAITING_USER.value
+
+
+def _restore_skill_runtime(
+    skill_workflow: object | None,
+    matched_skill: str,
+) -> tuple[str, SkillPolicy | None]:
+    if not matched_skill or skill_workflow is None:
+        return "", None
+    registry = getattr(skill_workflow, "_registry", None)
+    if registry is None:
+        return "", None
+    try:
+        instruction = registry.load_instruction(matched_skill)
+        policy = registry.load_policy(matched_skill)
+    except Exception:
+        logger.warning("Failed to restore skill runtime for '%s'", matched_skill, exc_info=True)
+        return "", None
+    skill_ctx = ""
+    if instruction is not None and getattr(instruction, "raw_body", ""):
+        skill_ctx = (
+            f"你正在执行技能「{matched_skill}」。请严格按照以下步骤操作：\n\n"
+            f"{instruction.raw_body}"
+        )
+    return skill_ctx, policy
+
+
+def _planner_decision_from_agenda_state(agenda_state: AgendaState) -> PlannerDecision | None:
+    if not agenda_state.goals:
+        return None
+    subtasks: list[PlannedSubtask] = []
+    for index, goal in enumerate(agenda_state.goals):
+        try:
+            intent = TaskIntent(goal.intent)
+        except ValueError:
+            continue
+        source_span = tuple(goal.source_span[:2]) if len(goal.source_span) >= 2 else (index, index + 1)
+        subtasks.append(
+            PlannedSubtask(
+                goal_id=goal.goal_id,
+                task_intent=intent,
+                selected_tool=goal.selected_tool or intent.value,
+                confidence=1.0,
+                source_span=source_span,
+                match_method=goal.match_method or "agenda_resume",
+                segment_text=goal.segment_text,
+                required=goal.required,
+                depends_on_user_input=goal.depends_on_user_input,
+                status=goal.status.value if isinstance(goal.status, GoalStatus) else str(goal.status),
+            )
+        )
+    if not subtasks:
+        return None
+    primary_intent = subtasks[0].task_intent
+    if agenda_state.matched_skill:
+        control_mode = ControlMode.AUTONOMOUS
+    elif primary_intent == TaskIntent.KNOWLEDGE_QUERY:
+        control_mode = ControlMode.ADVISORY
+    elif primary_intent == TaskIntent.GENERAL_CHAT:
+        control_mode = ControlMode.PASS_THROUGH
+    else:
+        control_mode = ControlMode.FORCE_TOOL
+    return PlannerDecision(
+        task_intent=primary_intent,
+        confidence=1.0,
+        match_method="agenda_resume",
+        control_mode=control_mode,
+        selected_tool=subtasks[0].selected_tool,
+        planner_hint="恢复上一轮未完成的多目标任务，继续按既定 agenda 推进。",
+        is_composite=len(subtasks) > 1,
+        subtasks=subtasks,
+        primary_intent=primary_intent,
+        ordering_method="agenda_resume_order",
+        matched_skill=agenda_state.matched_skill,
+        skill_start_index=agenda_state.skill_start_index,
+        skill_end_index=agenda_state.skill_end_index,
+        planner_execution_model="agenda_resume",
+    )
+
+
+def _should_resume_existing_agenda(
+    message: str,
+    agenda_state: AgendaState | None,
+    planner_decision: PlannerDecision | None,
+) -> bool:
+    active_goal = _active_goal(agenda_state)
+    if active_goal is None:
+        return False
+    if _goal_has_resume_candidate(message, active_goal):
+        return True
+    if planner_decision is None or planner_decision.is_composite:
+        return False
+    return planner_decision.task_intent.value == active_goal.intent
+
+
+def _should_abandon_existing_agenda(
+    agenda_state: AgendaState | None,
+    planner_decision: PlannerDecision | None,
+) -> bool:
+    active_goal = _active_goal(agenda_state)
+    if active_goal is None or planner_decision is None:
+        return False
+    if planner_decision.is_composite:
+        return True
+    if planner_decision.task_intent == TaskIntent.GENERAL_CHAT:
+        return False
+    return planner_decision.task_intent.value != active_goal.intent
+
+
+def _build_goal_planner_decision(
+    planner_decision: PlannerDecision,
+    goal: AgendaGoal,
+    *,
+    goal_index: int,
+    matched_skill: str,
+    skill_policy: SkillPolicy | None,
+) -> PlannerDecision:
+    intent = TaskIntent(goal.intent)
+    skill_active = (
+        planner_decision.skill_start_index >= 0
+        and planner_decision.skill_start_index <= goal_index <= planner_decision.skill_end_index
+    )
+    if intent == TaskIntent.GENERAL_CHAT:
+        control_mode = ControlMode.PASS_THROUGH
+    elif intent == TaskIntent.KNOWLEDGE_QUERY:
+        control_mode = ControlMode.ADVISORY
+    else:
+        control_mode = ControlMode.FORCE_TOOL
+    selected_tool = goal.selected_tool or intent.value
+    planner_hint = planner_decision.planner_hint
+    if skill_active and skill_policy is not None and skill_policy.allow_autonomous:
+        control_mode = ControlMode.AUTONOMOUS
+    return PlannerDecision(
+        task_intent=intent,
+        confidence=planner_decision.confidence,
+        match_method=planner_decision.match_method,
+        control_mode=control_mode,
+        selected_tool=selected_tool,
+        planner_hint=planner_hint,
+        is_composite=False,
+        primary_intent=intent,
+        ordering_method="agenda_goal_order",
+        matched_skill=matched_skill if skill_active else "",
+        skill_start_index=planner_decision.skill_start_index,
+        skill_end_index=planner_decision.skill_end_index,
+        planner_execution_model="agenda_goal",
+    )
 
 
 def _accumulate_tool_calls(chunks: list[LlmStreamChunk]) -> list[ToolCallData] | None:
@@ -662,6 +1036,10 @@ class Agent:
             direct_response = ""
             matched_skill = ""
             skill_policy: SkillPolicy | None = None
+            stored_agenda_state = _load_agenda_state(conversation)
+            agenda_state_to_run: AgendaState | None = None
+            agenda_resumed = False
+            agenda_abandoned = False
             if wf_result is not None:
                 if hasattr(wf_result, "direct_response") and wf_result.direct_response:
                     direct_response = wf_result.direct_response
@@ -677,10 +1055,17 @@ class Agent:
             course_task = False
             if self.task_planner is not None:
                 try:
-                    planner_decision = self.task_planner.plan(
-                        effective_message,
-                        matched_skill=matched_skill or None,
-                    )
+                    try:
+                        planner_decision = self.task_planner.plan(
+                            effective_message,
+                            matched_skill=matched_skill or None,
+                            skill_policy=skill_policy,
+                        )
+                    except TypeError:
+                        planner_decision = self.task_planner.plan(
+                            effective_message,
+                            matched_skill=matched_skill or None,
+                        )
                     planner_decision = self._apply_skill_policy(
                         planner_decision,
                         matched_skill=matched_skill,
@@ -697,6 +1082,54 @@ class Agent:
                             planner_decision.control_mode = ControlMode.AUTONOMOUS
                             planner_decision.selected_tool = tool_name
                             planner_decision.planner_hint = hint
+                    if (
+                        stored_agenda_state is not None
+                        and stored_agenda_state.request_status in {
+                            RequestStatus.WAITING_USER,
+                            RequestStatus.CLARIFICATION_REQUIRED,
+                        }
+                    ):
+                        if _should_resume_existing_agenda(
+                            effective_message,
+                            stored_agenda_state,
+                            planner_decision,
+                        ):
+                            agenda_state_to_run = stored_agenda_state.model_copy(deep=True)
+                            restored_decision = _planner_decision_from_agenda_state(agenda_state_to_run)
+                            if restored_decision is not None:
+                                planner_decision = restored_decision
+                            if agenda_state_to_run.matched_skill and not matched_skill:
+                                matched_skill = agenda_state_to_run.matched_skill
+                            if agenda_state_to_run.matched_skill and skill_policy is None:
+                                restored_skill_ctx, restored_skill_policy = _restore_skill_runtime(
+                                    self.skill_workflow,
+                                    agenda_state_to_run.matched_skill,
+                                )
+                                if restored_skill_ctx and not skill_ctx:
+                                    skill_ctx = restored_skill_ctx
+                                if restored_skill_policy is not None:
+                                    skill_policy = restored_skill_policy
+                            agenda_state_to_run.request_status = RequestStatus.ACTIVE
+                            agenda_resumed = True
+                        elif _should_abandon_existing_agenda(stored_agenda_state, planner_decision):
+                            _save_agenda_state(conversation, None)
+                            agenda_abandoned = True
+                        else:
+                            agenda_state_to_run = stored_agenda_state.model_copy(deep=True)
+                            restored_decision = _planner_decision_from_agenda_state(agenda_state_to_run)
+                            if restored_decision is not None:
+                                planner_decision = restored_decision
+                            if agenda_state_to_run.matched_skill and not matched_skill:
+                                matched_skill = agenda_state_to_run.matched_skill
+                            if agenda_state_to_run.matched_skill and skill_policy is None:
+                                restored_skill_ctx, restored_skill_policy = _restore_skill_runtime(
+                                    self.skill_workflow,
+                                    agenda_state_to_run.matched_skill,
+                                )
+                                if restored_skill_ctx and not skill_ctx:
+                                    skill_ctx = restored_skill_ctx
+                                if restored_skill_policy is not None:
+                                    skill_policy = restored_skill_policy
                     planner_context = _build_planner_context(planner_decision)
                     if skill_policy is not None and matched_skill:
                         skill_policy_context = _build_skill_policy_context(matched_skill, skill_policy)
@@ -725,6 +1158,10 @@ class Agent:
             if skill_policy is not None:
                 planner_runtime["skill_allowed_tools"] = list(skill_policy.allowed_tools)
                 planner_runtime["skill_max_steps"] = min(int(skill_policy.max_steps), 5)
+            if agenda_resumed:
+                planner_runtime["agenda_resumed"] = True
+            if agenda_abandoned:
+                planner_runtime["agenda_abandoned"] = True
 
             if planner_decision is None or planner_decision.task_intent != TaskIntent.DOCUMENT_INGEST:
                 tool_schemas = _exclude_tool_schema(tool_schemas, "document_ingest")
@@ -842,14 +1279,39 @@ class Agent:
             )
 
             use_composite_runtime = False
+            use_agenda_runtime = False
             response_state: dict[str, object] = dict(preprocess_metadata)
+            if agenda_resumed:
+                response_state["agenda_resumed"] = True
+            if agenda_abandoned:
+                response_state["agenda_abandoned"] = True
             try:
+                if agenda_state_to_run is None and _agenda_needs_runtime(planner_decision, matched_skill):
+                    agenda_state_to_run = _build_agenda_state(
+                        planner_decision,
+                        matched_skill=matched_skill,
+                    )
+                use_agenda_runtime = planner_decision is not None and agenda_state_to_run is not None
                 use_composite_runtime = (
-                    planner_decision is not None
+                    not use_agenda_runtime
+                    and planner_decision is not None
                     and planner_decision.is_composite
-                    and planner_decision.control_mode != ControlMode.AUTONOMOUS
                 )
-                if use_composite_runtime:
+                if use_agenda_runtime and agenda_state_to_run is not None and planner_decision is not None:
+                    async for event in self._run_agenda_plan(
+                        conversation,
+                        system_prompt,
+                        tool_schemas,
+                        tool_ctx,
+                        planner_decision,
+                        agenda_state_to_run,
+                        matched_skill=matched_skill,
+                        skill_policy=skill_policy,
+                        trace=agent_trace,
+                        response_state=response_state,
+                    ):
+                        yield event
+                elif use_composite_runtime:
                     async for event in self._run_composite_plan(
                         conversation,
                         tool_ctx,
@@ -879,7 +1341,9 @@ class Agent:
                         "error",
                         {
                             "phase": (
-                                "composite_execution"
+                                "agenda_execution"
+                                if use_agenda_runtime
+                                else "composite_execution"
                                 if use_composite_runtime
                                 else "tool_loop"
                             ),
@@ -969,6 +1433,16 @@ class Agent:
         if planner_decision is None or skill_policy is None:
             return planner_decision
         if planner_decision.task_intent == TaskIntent.DOCUMENT_INGEST:
+            return planner_decision
+        if planner_decision.is_composite:
+            if planner_decision.skill_start_index >= 0 and matched_skill:
+                planner_decision.matched_skill = matched_skill
+                planner_decision.planner_hint = (
+                    planner_decision.planner_hint
+                    + f" 当前命中技能「{matched_skill}」，仅在覆盖区间内应用受控策略。"
+                ).strip()
+                if skill_policy.allow_autonomous:
+                    planner_decision.control_mode = ControlMode.AUTONOMOUS
             return planner_decision
         if skill_policy.allowed_tools:
             selected = planner_decision.selected_tool
@@ -1171,10 +1645,12 @@ class Agent:
         *,
         message: str,
         recent_messages: list[dict[str, Any]],
+        quiz_bundle: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         alignment = await build_quiz_batch_alignment(
             message=message,
             recent_messages=recent_messages,
+            quiz_bundle=quiz_bundle,
             llm_service=self.llm,
             max_items=5,
         )
@@ -1189,14 +1665,22 @@ class Agent:
     async def _build_direct_quiz_evaluator_call(
         self,
         conversation: Conversation,
+        tool_ctx: ToolContext,
         planner_decision: PlannerDecision,
     ) -> ToolCallData | None:
         user_message = _latest_user_message(conversation)
         if not user_message:
             return None
+        resume_payload = tool_ctx.metadata.get("agenda_resume_payload", {})
+        quiz_bundle = None
+        if isinstance(resume_payload, dict):
+            candidate = resume_payload.get("quiz_bundle")
+            if isinstance(candidate, list):
+                quiz_bundle = candidate
         arguments = await self._build_quiz_evaluator_arguments(
             message=user_message,
             recent_messages=self._recent_alignment_messages(conversation),
+            quiz_bundle=quiz_bundle,
         )
         return ToolCallData(
             id="direct_quiz_evaluator",
@@ -1308,9 +1792,12 @@ class Agent:
         planner_decision: PlannerDecision,
         trace: TraceContext | None = None,
         response_state: dict[str, object] | None = None,
+        goal_result: GoalExecutionResult | None = None,
+        suppress_text_output: bool = False,
+        suppress_assistant_append: bool = False,
     ) -> AsyncGenerator[StreamEvent, None]:
         if planner_decision.task_intent == TaskIntent.QUIZ_EVALUATOR:
-            tool_call = await self._build_direct_quiz_evaluator_call(conversation, planner_decision)
+            tool_call = await self._build_direct_quiz_evaluator_call(conversation, tool_ctx, planner_decision)
         else:
             tool_call = self._build_direct_tool_call(conversation, tool_ctx, planner_decision)
         if tool_call is None:
@@ -1397,6 +1884,11 @@ class Agent:
             )
 
         if not tool_result_obj.success:
+            if goal_result is not None:
+                goal_result.error = tool_result_obj.error or f"{tool_call.name} 执行失败"
+                goal_result.goal_status = GoalStatus.BLOCKED.value
+                goal_result.completion_hint = "clarify"
+                goal_result.metadata = dict(tool_result_obj.metadata)
             if trace is not None:
                 trace.metadata["status"] = "error"
                 trace.record_stage(
@@ -1485,9 +1977,19 @@ class Agent:
                 "effective_control_mode",
                 planner_decision.control_mode.value,
             )
-        if final_text:
+        if goal_result is not None:
+            goal_result.text = final_text or ""
+            goal_result.metadata = dict(tool_result_obj.metadata)
+            goal_result.resume_payload = dict(tool_result_obj.metadata.get("resume_payload", {}) or {})
+            goal_result.completion_hint = _tool_completion_hint(tool_call.name, tool_result_obj.metadata)
+            if goal_result.completion_hint == "wait_user":
+                goal_result.goal_status = GoalStatus.WAITING_USER.value
+            else:
+                goal_result.goal_status = GoalStatus.COMPLETED.value
+        if final_text and not suppress_text_output:
             yield StreamEvent(type=StreamEventType.TEXT_DELTA, content=final_text)
-        conversation.messages.append(Message(role="assistant", content=final_text or ""))
+        if not suppress_assistant_append:
+            conversation.messages.append(Message(role="assistant", content=final_text or ""))
 
     def _build_composite_tool_args(
         self,
@@ -1544,6 +2046,7 @@ class Agent:
         subtask: PlannedSubtask,
         subtask_index: int,
         handoff: dict[str, Any],
+        planner_decision: PlannerDecision,
     ) -> ToolContext:
         aggregate = dict(handoff.get("aggregate_evidence", {}) or {})
         handoff_snapshot = {
@@ -1573,7 +2076,346 @@ class Agent:
                 "composite_parent_request_id": base_context.request_id,
             }
         )
+        skill_active = _subtask_within_skill_interval(planner_decision, subtask_index)
+        metadata["composite_skill_active"] = skill_active
+        metadata["planner_skill_start_index"] = planner_decision.skill_start_index
+        metadata["planner_skill_end_index"] = planner_decision.skill_end_index
+        if skill_active:
+            if planner_decision.matched_skill:
+                metadata["matched_skill"] = planner_decision.matched_skill
+        else:
+            metadata["matched_skill"] = ""
+            metadata["skill_allowed_tools"] = []
+            metadata["skill_max_steps"] = 0
+            metadata["skill_post_actions"] = []
         return base_context.model_copy(update={"metadata": metadata})
+
+    def _build_agenda_tool_context(
+        self,
+        base_context: ToolContext,
+        *,
+        agenda_state: AgendaState,
+        goal: AgendaGoal,
+        goal_index: int,
+        handoff: dict[str, Any],
+        planner_decision: PlannerDecision,
+        next_goal: AgendaGoal | None,
+    ) -> ToolContext:
+        aggregate = dict(handoff.get("aggregate_evidence", {}) or {})
+        handoff_snapshot = {
+            "original_user_request": handoff.get("original_user_request", ""),
+            "shared_topic": handoff.get("shared_topic", ""),
+            "completed_subtasks": list(handoff.get("completed_subtasks", [])),
+            "latest_result_text": handoff.get("latest_result_text", ""),
+            "latest_evidence_summary": handoff.get("latest_evidence_summary", ""),
+            "latest_citations": list(handoff.get("latest_citations", [])),
+            "aggregate_evidence": {
+                "citations": list(aggregate.get("citations", [])),
+                "evidence_summary": aggregate.get("evidence_summary", ""),
+                "evidence_texts": list(aggregate.get("evidence_texts", [])),
+                "source_count": aggregate.get("source_count", 0),
+                "query_trace_ids": list(aggregate.get("query_trace_ids", [])),
+            },
+        }
+        metadata = dict(base_context.metadata)
+        metadata.update(
+            {
+                "planner_task_intent": goal.intent,
+                "agenda_mode": True,
+                "agenda_goal_id": goal.goal_id,
+                "agenda_goal_index": goal_index,
+                "agenda_request_status": agenda_state.request_status.value,
+                "agenda_resume_payload": dict(agenda_state.resume_payload),
+                "agenda_next_goal_depends_on_user_input": bool(
+                    next_goal is not None and next_goal.depends_on_user_input
+                ),
+                "composite": True,
+                "composite_mode": True,
+                "composite_handoff": handoff_snapshot,
+                "composite_subtask_index": goal_index,
+                "composite_subtask_intent": goal.intent,
+                "composite_parent_request_id": base_context.request_id,
+            }
+        )
+        skill_active = (
+            agenda_state.skill_start_index >= 0
+            and agenda_state.skill_start_index <= goal_index <= agenda_state.skill_end_index
+        )
+        metadata["planner_skill_start_index"] = agenda_state.skill_start_index
+        metadata["planner_skill_end_index"] = agenda_state.skill_end_index
+        metadata["composite_skill_active"] = skill_active
+        if skill_active and agenda_state.matched_skill:
+            metadata["matched_skill"] = agenda_state.matched_skill
+        else:
+            metadata["matched_skill"] = ""
+            metadata["skill_allowed_tools"] = []
+            metadata["skill_max_steps"] = 0
+            metadata["skill_post_actions"] = []
+        return base_context.model_copy(update={"metadata": metadata})
+
+    @staticmethod
+    def _agenda_waiting_prompt(goal: AgendaGoal | None) -> str:
+        if goal is None:
+            return "当前任务还缺少后续输入，请继续补充信息。"
+        if goal.selected_tool == TaskIntent.QUIZ_EVALUATOR.value:
+            return "请直接回复你的作答内容，我会继续逐题批改。"
+        return "请补充下一步需要的输入，我会继续完成剩余目标。"
+
+    async def _run_agenda_plan(
+        self,
+        conversation: Conversation,
+        system_prompt: str,
+        tool_schemas: list[dict],
+        tool_ctx: ToolContext,
+        planner_decision: PlannerDecision,
+        agenda_state: AgendaState,
+        *,
+        matched_skill: str,
+        skill_policy: SkillPolicy | None,
+        trace: TraceContext | None = None,
+        response_state: dict[str, object] | None = None,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        original_request = next(
+            (
+                msg.content
+                for msg in reversed(conversation.messages)
+                if msg.role == "user" and msg.content
+            ),
+            "",
+        )
+        handoff: dict[str, Any] = {
+            "original_user_request": original_request,
+            "shared_topic": _extract_shared_topic(original_request),
+            "completed_subtasks": [],
+            "latest_result_text": "",
+            "latest_evidence_summary": "",
+            "latest_citations": [],
+            "aggregate_evidence": {
+                "citations": [],
+                "evidence_summary": "",
+                "evidence_texts": [],
+                "source_count": 0,
+                "query_trace_ids": [],
+            },
+        }
+        completed_sections: list[tuple[str, str]] = []
+        completed_subtasks: list[dict[str, object]] = []
+        last_generation_mode = ""
+        last_evaluation_mode = ""
+        last_batch_metadata: dict[str, object] = {}
+        waiting_prompt = ""
+        active_goal = _active_goal(agenda_state)
+        latest_user_message = _latest_user_message(conversation)
+
+        if trace is not None:
+            trace.record_stage(
+                "agenda_plan",
+                {
+                    "goal_count": len(agenda_state.goals),
+                    "current_goal_index": agenda_state.current_goal_index,
+                    "matched_skill": agenda_state.matched_skill,
+                },
+            )
+
+        for goal_index in range(agenda_state.current_goal_index, len(agenda_state.goals)):
+            goal = agenda_state.goals[goal_index]
+            if goal.status == GoalStatus.COMPLETED:
+                continue
+            agenda_state.current_goal_index = goal_index
+            next_goal = agenda_state.goals[goal_index + 1] if goal_index + 1 < len(agenda_state.goals) else None
+            if goal.depends_on_user_input and not _goal_has_resume_candidate(latest_user_message, goal):
+                goal.status = GoalStatus.WAITING_USER
+                agenda_state.request_status = RequestStatus.WAITING_USER
+                waiting_prompt = self._agenda_waiting_prompt(goal)
+                _save_agenda_state(conversation, agenda_state)
+                break
+
+            goal.status = GoalStatus.ACTIVE
+            goal_decision = _build_goal_planner_decision(
+                planner_decision,
+                goal,
+                goal_index=goal_index,
+                matched_skill=matched_skill,
+                skill_policy=skill_policy,
+            )
+            goal_ctx = self._build_agenda_tool_context(
+                tool_ctx,
+                agenda_state=agenda_state,
+                goal=goal,
+                goal_index=goal_index,
+                handoff=handoff,
+                planner_decision=planner_decision,
+                next_goal=next_goal,
+            )
+            goal_result = GoalExecutionResult()
+            goal_response_state: dict[str, object] = {}
+            async for event in self._tool_loop(
+                conversation,
+                system_prompt,
+                tool_schemas,
+                goal_ctx,
+                trace=trace,
+                planner_decision=goal_decision,
+                planner_runtime={
+                    "final_control_mode": goal_decision.control_mode.value,
+                    "violation_count": 0,
+                    "force_retry_count": 0,
+                    "knowledge_retry_count": 0,
+                },
+                response_state=goal_response_state,
+                skill_policy=skill_policy if goal_decision.matched_skill else None,
+                goal_result=goal_result,
+                suppress_text_output=True,
+                suppress_assistant_append=True,
+            ):
+                if event.type in {
+                    StreamEventType.TOOL_START,
+                    StreamEventType.TOOL_RESULT,
+                    StreamEventType.ERROR,
+                }:
+                    yield event
+
+            if response_state is not None and goal_response_state:
+                tool_path = list(response_state.get("tool_path", []))
+                for tool_name in goal_response_state.get("tool_path", []):
+                    if tool_name not in tool_path:
+                        tool_path.append(tool_name)
+                if tool_path:
+                    response_state["tool_path"] = tool_path
+                for key in (
+                    "generation_mode",
+                    "evaluation_mode",
+                    "batch_evaluation",
+                    "question_count",
+                    "batch_results",
+                    "alignment_mode",
+                    "alignment_status",
+                    "split_confidence",
+                    "score_aggregation",
+                    "pacing_level",
+                    "pacing_reason",
+                    "replan_triggered",
+                    "replan_reason",
+                    "replan_count",
+                    "fallback_strategy",
+                ):
+                    if key in goal_response_state:
+                        response_state[key] = goal_response_state[key]
+
+            if goal_result.error:
+                goal.status = GoalStatus.BLOCKED
+                agenda_state.request_status = RequestStatus.FAILED
+                _save_agenda_state(conversation, agenda_state)
+                waiting_prompt = goal_result.error
+                break
+
+            if goal_result.text:
+                completed_sections.append((_composite_section_title(TaskIntent(goal.intent)), goal_result.text))
+
+            citations = list(goal_result.metadata.get("citations", []) or [])
+            evidence_texts = list(goal_result.metadata.get("evidence_texts", []) or [])
+            query_trace_ids = [
+                str(value)
+                for value in goal_result.metadata.get("query_trace_ids", [])
+                if str(value)
+            ]
+            query_trace_id = str(goal_result.metadata.get("query_trace_id", "") or "")
+            if query_trace_id and query_trace_id not in query_trace_ids:
+                query_trace_ids.append(query_trace_id)
+            aggregate = handoff["aggregate_evidence"]
+            aggregate["citations"].extend(citations)
+            aggregate["evidence_texts"].extend(evidence_texts)
+            seen_query_trace_ids = set(aggregate["query_trace_ids"])
+            for trace_id in query_trace_ids:
+                if trace_id not in seen_query_trace_ids:
+                    aggregate["query_trace_ids"].append(trace_id)
+                    seen_query_trace_ids.add(trace_id)
+            aggregate["source_count"] = len(aggregate["citations"])
+            aggregate["evidence_summary"] = (
+                build_evidence_summary(aggregate["citations"])
+                if aggregate["citations"]
+                else str(goal_result.metadata.get("evidence_summary", "") or "")
+            )
+            handoff["latest_result_text"] = goal_result.text
+            handoff["latest_evidence_summary"] = str(goal_result.metadata.get("evidence_summary", "") or "")
+            handoff["latest_citations"] = citations
+            completed_subtasks.append(
+                {
+                    "goal_id": goal.goal_id,
+                    "task_intent": goal.intent,
+                    "selected_tool": goal.selected_tool,
+                }
+            )
+            handoff["completed_subtasks"] = list(completed_subtasks)
+            if goal_result.metadata.get("generation_mode"):
+                last_generation_mode = str(goal_result.metadata.get("generation_mode") or "")
+            if goal_result.metadata.get("evaluation_mode"):
+                last_evaluation_mode = str(goal_result.metadata.get("evaluation_mode") or "")
+            batch_metadata = _build_batch_evaluation_metadata(goal_result.metadata)
+            if batch_metadata:
+                last_batch_metadata = batch_metadata
+
+            completion_hint = goal_result.completion_hint or "step_done"
+            if completion_hint == "clarify":
+                goal.status = GoalStatus.BLOCKED
+                agenda_state.request_status = RequestStatus.CLARIFICATION_REQUIRED
+                agenda_state.resume_payload = dict(goal_result.resume_payload)
+                _save_agenda_state(conversation, agenda_state)
+                waiting_prompt = goal_result.text or self._agenda_waiting_prompt(goal)
+                break
+
+            goal.status = GoalStatus.COMPLETED
+            goal.result_summary = _truncate_text(goal_result.text, limit=160)
+
+            if completion_hint == "wait_user":
+                agenda_state.resume_payload = dict(goal_result.resume_payload)
+                if next_goal is not None:
+                    next_goal.status = GoalStatus.WAITING_USER
+                    agenda_state.current_goal_index = goal_index + 1
+                    waiting_prompt = self._agenda_waiting_prompt(next_goal)
+                else:
+                    goal.status = GoalStatus.WAITING_USER
+                    agenda_state.current_goal_index = goal_index
+                    waiting_prompt = self._agenda_waiting_prompt(goal)
+                agenda_state.request_status = RequestStatus.WAITING_USER
+                _save_agenda_state(conversation, agenda_state)
+                break
+
+        else:
+            agenda_state.request_status = RequestStatus.COMPLETED
+            _save_agenda_state(conversation, None)
+
+        lines: list[str] = []
+        for section_title, section_text in completed_sections:
+            lines.append(f"## {section_title}")
+            lines.append(section_text.strip())
+            lines.append("")
+        if waiting_prompt:
+            lines.append(waiting_prompt.strip())
+        final_text = "\n".join(line for line in lines if line is not None).strip()
+        if not final_text:
+            final_text = "当前多目标任务未生成可展示结果。"
+
+        if response_state is not None:
+            response_state.update(
+                {
+                    "agenda_mode": True,
+                    "request_status": agenda_state.request_status.value,
+                    "current_goal_index": agenda_state.current_goal_index,
+                    "goal_statuses": _goal_statuses(agenda_state),
+                    "agenda_execution_model": _goal_execution_model(agenda_state),
+                    "completed_subtasks": list(completed_subtasks),
+                }
+            )
+            if last_generation_mode:
+                response_state["generation_mode"] = last_generation_mode
+            if last_evaluation_mode:
+                response_state["evaluation_mode"] = last_evaluation_mode
+            if last_batch_metadata:
+                response_state.update(last_batch_metadata)
+
+        yield StreamEvent(type=StreamEventType.TEXT_DELTA, content=final_text)
+        conversation.messages.append(Message(role="assistant", content=final_text))
 
     async def _run_composite_plan(
         self,
@@ -1647,6 +2489,7 @@ class Agent:
                 subtask=subtask,
                 subtask_index=subtask_index,
                 handoff=handoff,
+                planner_decision=planner_decision,
             )
             tool_call = ToolCallData(
                 id=f"composite_{subtask_index + 1}",
@@ -1895,6 +2738,9 @@ class Agent:
         planner_runtime: dict[str, object] | None = None,
         response_state: dict[str, object] | None = None,
         skill_policy: SkillPolicy | None = None,
+        goal_result: GoalExecutionResult | None = None,
+        suppress_text_output: bool = False,
+        suppress_assistant_append: bool = False,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Inner ReAct loop: call LLM -> execute tools -> repeat.
 
@@ -1969,6 +2815,7 @@ class Agent:
             ):
                 direct_tool_call = await self._build_direct_quiz_evaluator_call(
                     conversation,
+                    tool_ctx,
                     planner_decision,
                 )
             else:
@@ -1995,6 +2842,9 @@ class Agent:
                     planner_decision=planner_decision,
                     trace=trace,
                     response_state=response_state,
+                    goal_result=goal_result,
+                    suppress_text_output=suppress_text_output,
+                    suppress_assistant_append=suppress_assistant_append,
                 ):
                     yield event
                 return
@@ -2478,7 +3328,16 @@ class Agent:
                         response_state["evaluation_mode"] = evaluation_mode
                     if trace is not None and evaluation_mode:
                         trace.metadata["evaluation_mode"] = evaluation_mode
-                    if final_text:
+                    if goal_result is not None:
+                        goal_result.text = final_text or ""
+                        goal_result.metadata = dict(passthrough_payload[1])
+                        goal_result.resume_payload = dict(passthrough_payload[1].get("resume_payload", {}) or {})
+                        goal_result.completion_hint = _tool_completion_hint(tc.name, passthrough_payload[1])
+                        if goal_result.completion_hint == "wait_user":
+                            goal_result.goal_status = GoalStatus.WAITING_USER.value
+                        else:
+                            goal_result.goal_status = GoalStatus.COMPLETED.value
+                    if final_text and not suppress_text_output:
                         yield StreamEvent(type=StreamEventType.TEXT_DELTA, content=final_text)
                     if trace is not None:
                         trace.record_stage(
@@ -2492,7 +3351,8 @@ class Agent:
                             },
                         )
                     _update_autonomous_state("tool_final_answer")
-                    conversation.messages.append(Message(role="assistant", content=final_text or ""))
+                    if not suppress_assistant_append:
+                        conversation.messages.append(Message(role="assistant", content=final_text or ""))
                     return
 
                 if force_active:
@@ -2563,7 +3423,7 @@ class Agent:
                 evidence_bundle=evidence_bundle,
                 fallback_text=latest_grounded_tool_text,
             )
-            if final_content and not request.stream:
+            if final_content and not request.stream and not suppress_text_output:
                 yield StreamEvent(type=StreamEventType.TEXT_DELTA, content=final_content)
             if trace is not None and grounding_assessment is not None:
                 trace.record_stage(
@@ -2599,7 +3459,14 @@ class Agent:
                     },
                 )
             _update_autonomous_state("assistant_answer")
-            conversation.messages.append(Message(role="assistant", content=final_content or ""))
+            if goal_result is not None:
+                goal_result.text = final_content or ""
+                goal_result.metadata = {}
+                goal_result.resume_payload = {}
+                goal_result.completion_hint = "step_done"
+                goal_result.goal_status = GoalStatus.COMPLETED.value
+            if not suppress_assistant_append:
+                conversation.messages.append(Message(role="assistant", content=final_content or ""))
             return
 
         if trace is not None:
@@ -2612,6 +3479,12 @@ class Agent:
                 },
             )
         _update_autonomous_state("max_iterations_exceeded")
+        if goal_result is not None:
+            goal_result.error = (
+                f"达到最大工具调用轮次 ({autonomous_max_steps if autonomous_active else self.config.max_tool_iterations})"
+            )
+            goal_result.goal_status = GoalStatus.BLOCKED.value
+            goal_result.completion_hint = "clarify"
         yield StreamEvent(
             type=StreamEventType.ERROR,
             content=f"达到最大工具调用轮次 ({autonomous_max_steps if autonomous_active else self.config.max_tool_iterations})，请简化问题后重试。",

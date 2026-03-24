@@ -574,6 +574,7 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                     "query_trace_ids": [query_trace.trace_id] if query_trace is not None else [],
                     "final_response_preferred": True,
                     "tool_output_kind": "final_answer",
+                    "completion_hint": "step_done",
                 }
                 if composite_mode:
                     metadata.update(
@@ -626,6 +627,7 @@ class KnowledgeQueryTool(Tool[KnowledgeQueryArgs]):
                 "query_trace_ids": query_trace_ids,
                 "fast_mode": fast_mode,
                 "tool_output_kind": "evidence_context",
+                "completion_hint": "continue",
             }
             metadata.update(normalized_metadata)
             if composite_mode:

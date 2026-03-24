@@ -128,4 +128,46 @@ class Conversation(BaseModel):
     messages: list[Message] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
-    schema_version: int = 1
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    schema_version: int = 2
+
+
+class GoalStatus(str, Enum):
+    PENDING = "pending"
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    WAITING_USER = "waiting_user"
+    BLOCKED = "blocked"
+    ABANDONED = "abandoned"
+
+
+class RequestStatus(str, Enum):
+    ACTIVE = "active"
+    WAITING_USER = "waiting_user"
+    CLARIFICATION_REQUIRED = "clarification_required"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    ABANDONED = "abandoned"
+
+
+class AgendaGoal(BaseModel):
+    goal_id: str
+    intent: str
+    selected_tool: str
+    segment_text: str = ""
+    required: bool = True
+    depends_on_user_input: bool = False
+    status: GoalStatus = GoalStatus.PENDING
+    result_summary: str = ""
+    match_method: str = ""
+    source_span: list[int] = Field(default_factory=list)
+
+
+class AgendaState(BaseModel):
+    request_status: RequestStatus = RequestStatus.ACTIVE
+    current_goal_index: int = 0
+    matched_skill: str = ""
+    skill_start_index: int = -1
+    skill_end_index: int = -1
+    goals: list[AgendaGoal] = Field(default_factory=list)
+    resume_payload: dict[str, Any] = Field(default_factory=dict)

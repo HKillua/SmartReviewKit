@@ -51,6 +51,53 @@ def _response_profile(context: ToolContext) -> str:
     value = str(context.metadata.get("response_profile", "") or "").strip().lower()
     return value if value in {"balanced_fast", "quality_first"} else "quality_first"
 
+
+def _should_wait_for_user(context: ToolContext) -> bool:
+    if bool(context.metadata.get("agenda_next_goal_depends_on_user_input", False)):
+        return True
+    matched_skill = str(context.metadata.get("matched_skill", "") or "").strip()
+    return matched_skill in {"quiz_drill", "error_review"}
+
+
+def _quiz_bundle_from_questions(
+    questions: list[dict[str, Any]],
+    *,
+    question_type: str,
+    topic: str,
+) -> list[dict[str, Any]]:
+    bundle: list[dict[str, Any]] = []
+    for index, question in enumerate(questions, start=1):
+        concepts = [
+            str(value).strip()
+            for value in question.get("concepts", [])
+            if str(value).strip()
+        ]
+        bundle.append(
+            {
+                "index": index,
+                "question": str(question.get("question", "") or "").strip(),
+                "correct_answer": str(question.get("answer", "") or "").strip(),
+                "question_type": question_type,
+                "topic": topic,
+                "concepts": concepts,
+            }
+        )
+    return bundle
+
+
+def _apply_completion_metadata(
+    metadata: dict[str, Any],
+    *,
+    context: ToolContext,
+    quiz_bundle: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    updated = dict(metadata)
+    wait_for_user = _should_wait_for_user(context)
+    updated["completion_hint"] = "wait_user" if wait_for_user else "step_done"
+    if quiz_bundle:
+        updated["resume_payload"] = {"quiz_bundle": quiz_bundle}
+    return updated
+
 QUIZ_PROMPT_TEMPLATE = """请根据以下知识内容，生成 {count} 道{question_type}，难度级别 {difficulty}/5。
 
 知识内容:
@@ -211,7 +258,22 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
         # --- Tier 1: try question bank ---
         qb_results = await self._search_question_bank(args.topic, args.count)
         if qb_results and len(qb_results) >= args.count:
-            formatted = self._format_existing_questions(qb_results[: args.count], args.question_type)
+            question_bank_questions: list[dict[str, Any]] = []
+            for result in qb_results[: args.count]:
+                question: dict[str, Any] = {
+                    "question": sanitize_retrieval_text(result.text)[:800],
+                    "answer": result.metadata.get("answer", ""),
+                    "explanation": result.metadata.get("explanation", ""),
+                    "concepts": result.metadata.get("tags", []),
+                }
+                options = result.metadata.get("options")
+                if options:
+                    question["options"] = options
+                question_bank_questions.append(question)
+            formatted = "以下题目来自课程题库：\n\n" + _format_questions(
+                question_bank_questions,
+                args.question_type,
+            )
             citations = [
                 citation.to_dict()
                 for citation in self._citation_generator.generate(qb_results[: args.count])
@@ -219,7 +281,8 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
             return ToolResult(
                 success=True,
                 result_for_llm=formatted,
-                metadata={
+                metadata=_apply_completion_metadata(
+                    {
                     "question_count": min(len(qb_results), args.count),
                     "source": "question_bank",
                     "generation_mode": "question_bank",
@@ -228,7 +291,14 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
                     "evidence_summary": build_evidence_summary(citations),
                     "source_count": len(citations),
                     "final_response_preferred": True,
-                },
+                    },
+                    context=context,
+                    quiz_bundle=_quiz_bundle_from_questions(
+                        question_bank_questions,
+                        question_type=args.question_type,
+                        topic=args.topic,
+                    ),
+                ),
             )
 
         # --- Tier 2: RAG context + LLM generation ---
@@ -260,7 +330,8 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
                 "暂不生成正式题目。请缩小范围（如指定章节、协议或知识点），"
                 "或先导入相关课件后再试。"
             ),
-            metadata={
+            metadata=_apply_completion_metadata(
+                {
                 "question_count": 0,
                 "generation_mode": "insufficient_evidence",
                 "grounding_capable": True,
@@ -268,7 +339,9 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
                 "evidence_summary": "",
                 "source_count": 0,
                 "final_response_preferred": True,
-            },
+                },
+                context=context,
+            ),
         )
 
     async def _search_question_bank(self, topic: str, count: int) -> list:
@@ -389,7 +462,8 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
             return ToolResult(
                 success=True,
                 result_for_llm=formatted,
-                metadata={
+                metadata=_apply_completion_metadata(
+                    {
                     "question_count": len(questions),
                     "source": "rag_backed",
                     "generation_mode": "rag_backed",
@@ -398,7 +472,14 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
                     "evidence_summary": build_evidence_summary(citations),
                     "source_count": len(citations),
                     "final_response_preferred": True,
-                },
+                    },
+                    context=context,
+                    quiz_bundle=_quiz_bundle_from_questions(
+                        questions,
+                        question_type=args.question_type,
+                        topic=args.topic,
+                    ),
+                ),
             )
 
         result_chars = 220 if response_profile == "balanced_fast" else 500
@@ -431,6 +512,8 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
             source="rag_backed",
             citations=citations,
             response_profile=response_profile,
+            topic=args.topic,
+            context=context,
         )
 
     async def _generate_from_handoff_context(
@@ -454,6 +537,8 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
             source="composite_handoff",
             citations=citations or [],
             response_profile="quality_first",
+            topic=args.topic,
+            context=context,
         )
 
     async def _generate_from_llm_knowledge(self, args: "QuizGeneratorArgs", weak_hint: str) -> ToolResult:
@@ -471,6 +556,8 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
             args.question_type,
             source="llm_fallback",
             response_profile="quality_first",
+            topic=args.topic,
+            context=context,
         )
 
     async def _call_llm_for_quiz(
@@ -480,6 +567,8 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
         source: str = "rag_backed",
         citations: Optional[list[dict[str, Any]]] = None,
         response_profile: str = "quality_first",
+        topic: str = "",
+        context: ToolContext | None = None,
     ) -> ToolResult:
         if self._llm is None:
             return ToolResult(success=False, error="LLM 服务未初始化")
@@ -503,7 +592,8 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
                 return ToolResult(
                     success=True,
                     result_for_llm=resp.content or "",
-                    metadata={
+                    metadata=_apply_completion_metadata(
+                        {
                         "question_count": 0,
                         "source": source,
                         "generation_mode": source,
@@ -512,14 +602,17 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
                         "evidence_summary": build_evidence_summary(citations or []),
                         "source_count": len(citations or []),
                         "final_response_preferred": True,
-                    },
+                        },
+                        context=context or ToolContext(user_id="", conversation_id=""),
+                    ),
                 )
 
             formatted = _format_questions(questions, question_type)
             return ToolResult(
                 success=True,
                 result_for_llm=formatted,
-                metadata={
+                metadata=_apply_completion_metadata(
+                    {
                     "question_count": len(questions),
                     "source": source,
                     "generation_mode": source,
@@ -528,7 +621,14 @@ class QuizGeneratorTool(Tool[QuizGeneratorArgs]):
                     "evidence_summary": build_evidence_summary(citations or []),
                     "source_count": len(citations or []),
                     "final_response_preferred": True,
-                },
+                    },
+                    context=context or ToolContext(user_id="", conversation_id=""),
+                    quiz_bundle=_quiz_bundle_from_questions(
+                        questions,
+                        question_type=question_type,
+                        topic=topic,
+                    ),
+                ),
             )
         except Exception as exc:
             logger.exception("QuizGeneratorTool LLM call failed")

@@ -372,6 +372,7 @@ def create_app(settings_path: str = "config/settings.yaml") -> FastAPI:
     skill_workflow = SkillWorkflowHandler(skill_registry)
     task_planner = TaskPlanner(
         embedding_fn=cached_embedding.embed if cached_embedding is not None else None,
+        skill_match_fn=skill_registry.match_skill,
     )
 
     # --- Conversation ---

@@ -14,6 +14,8 @@
 - [Phase 4 - Adaptive Pacing](/Users/dongjinshuo/projects/work/rag_agent/MODULAR-RAG-MCP-SERVER/docs/agent_upgrade/phase-4-adaptive-pacing.md)
 - [Phase 4 - Eval Framework](/Users/dongjinshuo/projects/work/rag_agent/MODULAR-RAG-MCP-SERVER/docs/agent_upgrade/phase-4-eval-framework.md)
 - [Phase 5 - Batch Quiz Evaluation](/Users/dongjinshuo/projects/work/rag_agent/MODULAR-RAG-MCP-SERVER/docs/agent_upgrade/phase-5-batch-quiz-evaluation.md)
+- [Phase 6 - Simplified Planner Refactor](/Users/dongjinshuo/projects/work/rag_agent/MODULAR-RAG-MCP-SERVER/docs/agent_upgrade/phase-6-simplified-planner-refactor.md)
+- [Phase 7 - Agenda ReAct Multi Goal](/Users/dongjinshuo/projects/work/rag_agent/MODULAR-RAG-MCP-SERVER/docs/agent_upgrade/phase-7-agenda-react-multi-goal.md)
 
 ## 这组文档怎么用
 

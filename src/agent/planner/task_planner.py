@@ -7,9 +7,14 @@ import math
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional
+
+from src.agent.types import GoalStatus
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from src.agent.skills.registry import SkillPolicy
 
 
 class TaskIntent(str, Enum):
@@ -30,21 +35,29 @@ class ControlMode(str, Enum):
 
 @dataclass
 class PlannedSubtask:
+    goal_id: str
     task_intent: TaskIntent
     selected_tool: str
     confidence: float
     source_span: tuple[int, int]
     match_method: str = "rule"
     segment_text: str = ""
+    required: bool = True
+    depends_on_user_input: bool = False
+    status: str = GoalStatus.PENDING.value
 
     def to_metadata(self) -> Dict[str, object]:
         return {
+            "goal_id": self.goal_id,
             "task_intent": self.task_intent.value,
             "selected_tool": self.selected_tool,
             "confidence": round(self.confidence, 3),
             "source_span": [self.source_span[0], self.source_span[1]],
             "match_method": self.match_method,
             "segment_text": self.segment_text,
+            "required": self.required,
+            "depends_on_user_input": self.depends_on_user_input,
+            "status": self.status,
         }
 
 
@@ -60,6 +73,10 @@ class PlannerDecision:
     subtasks: list[PlannedSubtask] = field(default_factory=list)
     primary_intent: TaskIntent | None = None
     ordering_method: str = ""
+    matched_skill: str = ""
+    skill_start_index: int = -1
+    skill_end_index: int = -1
+    planner_execution_model: str = "legacy_single"
 
     def to_metadata(self) -> Dict[str, object]:
         return {
@@ -74,6 +91,10 @@ class PlannerDecision:
                 self.primary_intent.value if self.primary_intent is not None else ""
             ),
             "ordering_method": self.ordering_method,
+            "matched_skill": self.matched_skill,
+            "skill_start_index": self.skill_start_index,
+            "skill_end_index": self.skill_end_index,
+            "planner_execution_model": self.planner_execution_model,
             "subtasks": [subtask.to_metadata() for subtask in self.subtasks],
         }
 
@@ -102,6 +123,8 @@ _CHAT_RULES = re.compile(
     r"^(你好|hi|hello|谢谢|感谢|再见|bye|帮助|help|/help)$",
     re.IGNORECASE,
 )
+_EXPLICIT_SEQUENCE_RE = re.compile(r"(再|然后|接着|最后)")
+_SEQUENCE_SPLIT_RE = re.compile(r"(再|然后|接着|最后)")
 
 _SKILL_TO_INTENT: Dict[str, PlannerDecision] = {
     "quiz_drill": PlannerDecision(
@@ -180,14 +203,6 @@ _TASK_PROTOTYPES: Dict[TaskIntent, List[str]] = {
     ],
 }
 
-_COMPOSITE_TASK_PATTERNS: list[tuple[TaskIntent, re.Pattern[str]]] = [
-    (TaskIntent.KNOWLEDGE_QUERY, _KNOWLEDGE_RULES),
-    (TaskIntent.REVIEW_SUMMARY, _REVIEW_RULES),
-    (TaskIntent.QUIZ_GENERATOR, _QUIZ_GENERATOR_RULES),
-    (TaskIntent.QUIZ_EVALUATOR, _QUIZ_EVALUATOR_RULES),
-]
-
-
 def _cosine_similarity(a: List[float], b: List[float]) -> float:
     dot = sum(x * y for x, y in zip(a, b))
     norm_a = math.sqrt(sum(x * x for x in a)) or 1e-9
@@ -205,8 +220,10 @@ class TaskPlanner:
         self,
         *,
         embedding_fn: Optional[Callable[[List[str]], List[List[float]]]] = None,
+        skill_match_fn: Optional[Callable[[str], Optional[str]]] = None,
     ) -> None:
         self._embedding_fn = embedding_fn
+        self._skill_match_fn = skill_match_fn
         self._prototypes: List[tuple[TaskIntent, List[float]]] = []
         self._embedding_ready = False
         if embedding_fn is not None:
@@ -240,19 +257,13 @@ class TaskPlanner:
         message: str,
         *,
         matched_skill: str | None = None,
+        skill_policy: SkillPolicy | None = None,
     ) -> PlannerDecision:
-        if matched_skill and matched_skill in _SKILL_TO_INTENT:
-            decision = _SKILL_TO_INTENT[matched_skill]
-            return PlannerDecision(
-                task_intent=decision.task_intent,
-                confidence=decision.confidence,
-                match_method=decision.match_method,
-                control_mode=decision.control_mode,
-                selected_tool=decision.selected_tool,
-                planner_hint=decision.planner_hint,
-            )
-
-        composite_decision = self._composite_rule_match(message)
+        composite_decision = self._explicit_sequence_composite_match(
+            message,
+            matched_skill=matched_skill or "",
+            skill_policy=skill_policy,
+        )
         if composite_decision is not None:
             return composite_decision
 
@@ -266,71 +277,6 @@ class TaskPlanner:
                 return embedding_decision
 
         return self._default_decision(message)
-
-    def _composite_rule_match(self, message: str) -> PlannerDecision | None:
-        text = message.strip()
-        if not text:
-            return None
-        if _CHAT_RULES.match(text):
-            return None
-        if _DOCUMENT_RULES.search(text) or self._looks_like_file_ingest(text):
-            return None
-        if _QUIZ_EVALUATOR_RULES.search(text):
-            return None
-
-        ordered_hits = self._collect_composite_hits(text)
-        if len(ordered_hits) < 2:
-            return None
-        if ordered_hits[0][0] in {TaskIntent.REVIEW_SUMMARY, TaskIntent.QUIZ_GENERATOR}:
-            trailing_intents = {intent for intent, *_ in ordered_hits[1:]}
-            if trailing_intents and trailing_intents <= {TaskIntent.KNOWLEDGE_QUERY}:
-                return None
-
-        subtasks: list[PlannedSubtask] = []
-        for index, (intent, start, end, matched_text) in enumerate(ordered_hits):
-            next_start = ordered_hits[index + 1][1] if index + 1 < len(ordered_hits) else len(text)
-            segment_text = text[start:next_start].strip()
-            if not segment_text:
-                segment_text = matched_text
-            subtasks.append(
-                PlannedSubtask(
-                    task_intent=intent,
-                    selected_tool=intent.value,
-                    confidence=1.0,
-                    source_span=(start, end),
-                    match_method="rule",
-                    segment_text=segment_text,
-                )
-            )
-
-        primary_intent = subtasks[0].task_intent
-        return PlannerDecision(
-            task_intent=primary_intent,
-            confidence=1.0,
-            match_method="rule_composite",
-            control_mode=ControlMode.AUTONOMOUS,
-            selected_tool=subtasks[0].selected_tool,
-            planner_hint=self._build_composite_hint(subtasks, autonomous=True),
-            is_composite=True,
-            subtasks=subtasks,
-            primary_intent=primary_intent,
-            ordering_method="rule_span_order",
-        )
-
-    def _collect_composite_hits(
-        self,
-        message: str,
-    ) -> list[tuple[TaskIntent, int, int, str]]:
-        hits: list[tuple[TaskIntent, int, int, str]] = []
-        seen_intents: set[TaskIntent] = set()
-        for intent, pattern in _COMPOSITE_TASK_PATTERNS:
-            match = pattern.search(message)
-            if match is None or intent in seen_intents:
-                continue
-            seen_intents.add(intent)
-            hits.append((intent, match.start(), match.end(), match.group(0)))
-        hits.sort(key=lambda item: item[1])
-        return hits
 
     def _rule_match(self, message: str) -> PlannerDecision | None:
         text = message.strip()
@@ -408,6 +354,194 @@ class TaskPlanner:
             match_method="default",
         )
 
+    def _plan_segment(self, message: str) -> PlannerDecision:
+        rule_decision = self._rule_match(message)
+        if rule_decision is not None:
+            return rule_decision
+        if self._embedding_ready and self._embedding_fn is not None:
+            embedding_decision = self._embedding_match(message)
+            if embedding_decision is not None:
+                return embedding_decision
+        return self._default_decision(message)
+
+    def _explicit_sequence_composite_match(
+        self,
+        message: str,
+        *,
+        matched_skill: str,
+        skill_policy: SkillPolicy | None,
+    ) -> PlannerDecision | None:
+        segments = self._split_explicit_sequence_segments(message)
+        if len(segments) < 2:
+            return None
+
+        subtasks: list[PlannedSubtask] = []
+        for start, end, segment_text in segments:
+            decision = self._plan_segment(segment_text)
+            if decision.task_intent == TaskIntent.GENERAL_CHAT and not decision.selected_tool:
+                return None
+            subtasks.append(
+                PlannedSubtask(
+                    goal_id=f"goal_{len(subtasks) + 1}",
+                    task_intent=decision.task_intent,
+                    selected_tool=decision.selected_tool or decision.task_intent.value,
+                    confidence=decision.confidence,
+                    source_span=(start, end),
+                    match_method=decision.match_method,
+                    segment_text=segment_text,
+                    depends_on_user_input=self._segment_requires_user_input(
+                        decision.task_intent,
+                        segment_text,
+                    ),
+                )
+            )
+
+        skill_start_index, skill_end_index = self._compute_skill_interval(
+            subtasks,
+            matched_skill=matched_skill,
+            skill_policy=skill_policy,
+        )
+        primary_intent = subtasks[0].task_intent
+        planner_hint = self._build_composite_hint(
+            subtasks,
+            autonomous=bool(
+                skill_policy is not None
+                and getattr(skill_policy, "allow_autonomous", False)
+                and skill_start_index >= 0
+            ),
+            matched_skill=matched_skill if skill_start_index >= 0 else "",
+            skill_start_index=skill_start_index,
+            skill_end_index=skill_end_index,
+        )
+        return PlannerDecision(
+            task_intent=primary_intent,
+            confidence=1.0,
+            match_method="rule_sequence_composite",
+            control_mode=ControlMode.AUTONOMOUS,
+            selected_tool=subtasks[0].selected_tool,
+            planner_hint=planner_hint,
+            is_composite=True,
+            subtasks=subtasks,
+            primary_intent=primary_intent,
+            ordering_method="explicit_sequence_order",
+            matched_skill=matched_skill if skill_start_index >= 0 else "",
+            skill_start_index=skill_start_index,
+            skill_end_index=skill_end_index,
+            planner_execution_model=(
+                "skill_guided_agenda" if skill_start_index >= 0 else "legacy_composite"
+            ),
+        )
+
+    def _split_explicit_sequence_segments(
+        self,
+        message: str,
+    ) -> list[tuple[int, int, str]]:
+        text = message.strip()
+        if not text or not _EXPLICIT_SEQUENCE_RE.search(text):
+            return []
+
+        matches: list[re.Match[str]] = []
+        for match in _SEQUENCE_SPLIT_RE.finditer(text):
+            marker = match.group(1)
+            if marker in {"然后", "接着", "最后"}:
+                matches.append(match)
+                continue
+            prefix = text[: match.start()]
+            previous_char = prefix.rstrip()[-1:] if prefix.strip() else ""
+            if previous_char in {"，", ",", "；", ";", "、"} or "先" in prefix:
+                matches.append(match)
+        if not matches:
+            return []
+
+        segments: list[tuple[int, int, str]] = []
+        segment_start = 0
+        for match in matches:
+            if match.start() <= segment_start:
+                continue
+            segment_text = text[segment_start:match.start()].strip(" ，。！？；,!?;：:")
+            if segment_text:
+                segments.append((segment_start, match.start(), segment_text))
+            segment_start = match.start()
+        tail_text = text[segment_start:].strip(" ，。！？；,!?;：:")
+        if tail_text:
+            segments.append((segment_start, len(text), tail_text))
+        if len(segments) < 2:
+            return []
+        return segments
+
+    def _compute_skill_interval(
+        self,
+        subtasks: list[PlannedSubtask],
+        *,
+        matched_skill: str,
+        skill_policy: SkillPolicy | None,
+    ) -> tuple[int, int]:
+        if not matched_skill or skill_policy is None or not subtasks:
+            return -1, -1
+        allowed_tools = {
+            str(name) for name in getattr(skill_policy, "allowed_tools", []) if str(name).strip()
+        }
+        if not allowed_tools:
+            return -1, -1
+
+        skill_start_index = -1
+        for index, subtask in enumerate(subtasks):
+            if self._segment_matches_skill(subtask, matched_skill):
+                skill_start_index = index
+                break
+        if skill_start_index < 0:
+            return -1, -1
+
+        max_steps = max(1, min(int(getattr(skill_policy, "max_steps", 5) or 5), 5))
+        skill_end_index = skill_start_index
+        covered_steps = 1
+        if subtasks[skill_start_index].selected_tool not in allowed_tools:
+            mapped_tool = self._mapped_skill_tool(matched_skill)
+            if mapped_tool and mapped_tool in allowed_tools:
+                subtasks[skill_start_index].selected_tool = mapped_tool
+            else:
+                subtasks[skill_start_index].selected_tool = list(allowed_tools)[0]
+
+        for index in range(skill_start_index + 1, len(subtasks)):
+            if covered_steps >= max_steps:
+                break
+            if subtasks[index].selected_tool not in allowed_tools:
+                break
+            skill_end_index = index
+            covered_steps += 1
+        return skill_start_index, skill_end_index
+
+    def _segment_matches_skill(self, subtask: PlannedSubtask, matched_skill: str) -> bool:
+        if not matched_skill:
+            return False
+        segment_text = str(subtask.segment_text or "").strip()
+        if segment_text and self._skill_match_fn is not None:
+            try:
+                if self._skill_match_fn(segment_text) == matched_skill:
+                    return True
+            except Exception:
+                logger.warning("TaskPlanner segment skill match failed", exc_info=True)
+        mapped_intent = _SKILL_TO_INTENT.get(matched_skill)
+        if mapped_intent is not None and subtask.task_intent == mapped_intent.task_intent:
+            return True
+        return False
+
+    @staticmethod
+    def _mapped_skill_tool(matched_skill: str) -> str:
+        decision = _SKILL_TO_INTENT.get(matched_skill)
+        return decision.selected_tool if decision is not None else ""
+
+    @staticmethod
+    def _segment_requires_user_input(intent: TaskIntent, segment_text: str) -> bool:
+        if intent != TaskIntent.QUIZ_EVALUATOR:
+            return False
+        text = segment_text.strip()
+        if not text:
+            return True
+        if re.search(r"(我的答案是|用户答案|正确答案|第\s*\d+\s*题|第[一二两三四五六七八九十]+\s*题)", text):
+            return False
+        return True
+
     @staticmethod
     def _looks_like_file_ingest(message: str) -> bool:
         lowered = message.lower()
@@ -462,14 +596,31 @@ class TaskPlanner:
         )
 
     @staticmethod
-    def _build_composite_hint(subtasks: list[PlannedSubtask], *, autonomous: bool = False) -> str:
+    def _build_composite_hint(
+        subtasks: list[PlannedSubtask],
+        *,
+        autonomous: bool = False,
+        matched_skill: str = "",
+        skill_start_index: int = -1,
+        skill_end_index: int = -1,
+    ) -> str:
         ordered_tools = " -> ".join(subtask.selected_tool for subtask in subtasks)
+        skill_note = ""
+        if matched_skill and skill_start_index >= 0:
+            skill_note = (
+                f" 技能「{matched_skill}」在子任务 {skill_start_index + 1}"
+                f" 到 {skill_end_index + 1} 区间内生效。"
+            )
         if autonomous:
             return (
                 "这是复合学习任务。以下是初始分解建议："
                 f"{ordered_tools}。请在观察结果后可控地调整下一步，但不要偏离用户目标。"
+                f"{skill_note}"
             )
-        return f"这是复合学习任务，请严格按用户表达顺序依次执行子任务：{ordered_tools}。"
+        return (
+            "这是复合学习任务，请严格按用户表达顺序依次执行子任务："
+            f"{ordered_tools}。{skill_note}".strip()
+        )
 
     @property
     def embedding_ready(self) -> bool:

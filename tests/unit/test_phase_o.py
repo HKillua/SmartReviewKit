@@ -127,14 +127,16 @@ class TestSchemaVersion:
         from src.agent.types import Conversation
 
         conv = Conversation(id="test", user_id="u1")
-        assert conv.schema_version == 1
+        assert conv.schema_version == 2
+        assert conv.metadata == {}
 
     def test_old_data_migration(self):
         from src.agent.conversation import FileConversationStore
 
         data = {"id": "old", "user_id": "u1", "messages": []}
         migrated = FileConversationStore._migrate_schema(data)
-        assert migrated["schema_version"] == 1
+        assert migrated["schema_version"] == 2
+        assert migrated["metadata"] == {}
 
 
 # =========================================================================

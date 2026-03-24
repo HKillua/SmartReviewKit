@@ -235,6 +235,7 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
                 "final_response_preferred": True,
                 "grounding_passthrough": True,
                 "tool_output_kind": "final_answer",
+                "completion_hint": "step_done",
                 "batch_evaluation": len(batch_items) > 1,
                 "question_count": len(batch_items),
                 "batch_results": aggregated["batch_results"],
@@ -256,6 +257,12 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
         context: ToolContext,
         args: QuizEvaluatorArgs,
     ) -> QuizBatchAlignment:
+        resume_payload = context.metadata.get("agenda_resume_payload", {})
+        resume_quiz_bundle: list[dict[str, Any]] = []
+        if isinstance(resume_payload, dict):
+            candidate = resume_payload.get("quiz_bundle", [])
+            if isinstance(candidate, list):
+                resume_quiz_bundle = candidate
         items = self._normalize_items(args)
         if args.alignment_status == "aligned" and items:
             return QuizBatchAlignment(
@@ -290,6 +297,7 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
         return await build_quiz_batch_alignment(
             message=latest_user,
             recent_messages=context.recent_messages,
+            quiz_bundle=resume_quiz_bundle,
             llm_service=self._llm,
             max_items=5,
         )
@@ -363,6 +371,7 @@ class QuizEvaluatorTool(Tool[QuizEvaluatorArgs]):
                 "final_response_preferred": True,
                 "grounding_passthrough": True,
                 "tool_output_kind": "final_answer",
+                "completion_hint": "clarify",
                 "batch_evaluation": item_count > 1,
                 "question_count": item_count,
                 "batch_results": [

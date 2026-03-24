@@ -58,6 +58,7 @@ class ProtocolStateSimulatorTool(Tool[ProtocolStateSimulatorArgs]):
                 "tool_output_kind": "final_answer",
                 "final_response_preferred": True,
                 "grounding_passthrough": True,
+                "completion_hint": "step_done",
                 "simulation_protocol": protocol,
                 "simulation_steps": payload["steps"],
                 "mermaid": payload.get("mermaid", ""),

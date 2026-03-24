@@ -61,6 +61,7 @@ class NetworkCalcTool(Tool[NetworkCalcArgs]):
                 "tool_output_kind": "final_answer",
                 "final_response_preferred": True,
                 "grounding_passthrough": True,
+                "completion_hint": "step_done",
                 "structured_result": payload["structured"],
                 "calculation_type": calc_type,
             },

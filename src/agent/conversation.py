@@ -73,7 +73,7 @@ class FileConversationStore(ConversationStore):
         await self.update(conv)
         return conv
 
-    _CURRENT_SCHEMA_VERSION = 1
+    _CURRENT_SCHEMA_VERSION = 2
 
     async def get(self, conversation_id: str, user_id: str) -> Optional[Conversation]:
         path = self._conv_path(user_id, conversation_id)
@@ -97,6 +97,10 @@ class FileConversationStore(ConversationStore):
         if version < 1:
             data.setdefault("schema_version", 1)
             data.setdefault("title", "")
+            version = 1
+        if version < 2:
+            data.setdefault("metadata", {})
+            data["schema_version"] = 2
         return data
 
     async def _get_write_lock(self, conversation_id: str) -> asyncio.Lock:
@@ -131,6 +135,7 @@ class FileConversationStore(ConversationStore):
         for p in sorted(d.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
             try:
                 data = json.loads(p.read_text(encoding="utf-8"))
+                data = self._migrate_schema(data)
                 conv = Conversation.model_validate(data)
                 if conv.user_id == user_id:
                     convs.append(conv)

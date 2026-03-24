@@ -433,12 +433,15 @@ async def build_quiz_batch_alignment(
     *,
     message: str,
     recent_messages: list[dict[str, Any]] | None = None,
+    quiz_bundle: list[dict[str, Any]] | list[QuizBatchItem] | None = None,
     llm_service: Any = None,
     max_items: int = 5,
 ) -> QuizBatchAlignment:
     raw_text = (message or "").strip()
     text = _normalize_space(message)
-    bundle = extract_recent_quiz_bundle(recent_messages or [])
+    bundle = _normalize_quiz_bundle(quiz_bundle)
+    if not bundle:
+        bundle = extract_recent_quiz_bundle(recent_messages or [])
 
     explicit_items = extract_explicit_quiz_items(raw_text)
     if explicit_items:
@@ -516,3 +519,36 @@ async def build_quiz_batch_alignment(
         split_confidence=llm_confidence,
         clarification_reason=reason,
     )
+
+
+def _normalize_quiz_bundle(
+    quiz_bundle: list[dict[str, Any]] | list[QuizBatchItem] | None,
+) -> list[QuizBatchItem]:
+    normalized: list[QuizBatchItem] = []
+    for index, raw in enumerate(quiz_bundle or [], start=1):
+        if isinstance(raw, QuizBatchItem):
+            item = raw
+        elif isinstance(raw, dict):
+            item = QuizBatchItem(
+                question=_normalize_space(str(raw.get("question", "") or "")),
+                user_answer=_normalize_space(str(raw.get("user_answer", "") or "")),
+                correct_answer=_normalize_space(str(raw.get("correct_answer", "") or "")),
+                question_type=_normalize_space(str(raw.get("question_type", "") or "选择题")) or "选择题",
+                topic=_normalize_space(str(raw.get("topic", "") or "")),
+                concepts=[
+                    _normalize_space(str(value))
+                    for value in raw.get("concepts", [])
+                    if _normalize_space(str(value))
+                ],
+                index=int(raw.get("index", index) or index),
+                alignment_notes=_normalize_space(str(raw.get("alignment_notes", "") or "")),
+                answer_confidence=float(raw.get("answer_confidence", 1.0) or 1.0),
+            )
+        else:
+            continue
+        if not item.index:
+            item.index = index
+        if item.question or item.correct_answer:
+            normalized.append(item)
+    normalized.sort(key=lambda item: (item.index or 999, item.question))
+    return normalized

@@ -158,6 +158,7 @@ class DocumentIngestTool(Tool[DocumentIngestArgs]):
                         "final_response_preferred": True,
                         "grounding_passthrough": True,
                         "generation_mode": "direct_passthrough",
+                        "completion_hint": "step_done",
                     },
                 )
             except Exception:
@@ -244,6 +245,7 @@ class DocumentIngestTool(Tool[DocumentIngestArgs]):
                         "final_response_preferred": True,
                         "grounding_passthrough": True,
                         "generation_mode": "direct_passthrough",
+                        "completion_hint": "step_done",
                     },
                 )
             else:

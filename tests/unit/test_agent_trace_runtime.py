@@ -460,6 +460,103 @@ class _CompositeReviewTool:
         }
 
 
+class _ScopedPrefixKnowledgeTool:
+    @property
+    def name(self) -> str:
+        return "knowledge_query"
+
+    @property
+    def description(self) -> str:
+        return "scoped composite prefix knowledge tool"
+
+    def get_args_schema(self):
+        class _Args(BaseModel):
+            query: str = Field(default="")
+
+        return _Args
+
+    async def execute(self, context, args):
+        from src.agent.types import ToolResult
+
+        assert context.metadata["composite_mode"] is True
+        assert context.metadata.get("composite_skill_active") is False
+        assert context.metadata.get("matched_skill", "") == ""
+        assert context.metadata.get("skill_allowed_tools", []) == []
+        return ToolResult(
+            success=True,
+            result_for_llm="TCP 和 UDP 的区别在于是否面向连接。",
+            metadata={
+                "tool_output_kind": "final_answer",
+                "completion_hint": "step_done",
+            },
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.get_args_schema().model_json_schema(),
+            },
+        }
+
+
+class _ScopedCompositeReviewTool(_CompositeReviewTool):
+    async def execute(self, context, args):
+        from src.agent.types import ToolResult
+
+        assert context.metadata["composite_mode"] is True
+        assert context.metadata.get("composite_skill_active") is True
+        assert context.metadata.get("matched_skill", "") == "exam_prep"
+        return ToolResult(
+            success=True,
+            result_for_llm="传输层考前复习重点包括三次握手、流量控制和拥塞控制。",
+            metadata={
+                "tool_output_kind": "final_answer",
+                "completion_hint": "step_done",
+            },
+        )
+
+
+class _ScopedCompositeQuizTool:
+    @property
+    def name(self) -> str:
+        return "quiz_generator"
+
+    @property
+    def description(self) -> str:
+        return "scoped composite quiz tool"
+
+    def get_args_schema(self):
+        class _Args(BaseModel):
+            topic: str = Field(default="")
+            question_type: str = Field(default="选择题")
+            count: int = Field(default=3)
+            difficulty: int = Field(default=3)
+
+        return _Args
+
+    async def execute(self, context, args):
+        from src.agent.types import ToolResult
+
+        assert context.metadata.get("composite_skill_active") is True
+        assert context.metadata.get("matched_skill", "") == "exam_prep"
+        handoff = context.metadata["composite_handoff"]
+        assert handoff["latest_result_text"].startswith("传输层考前复习重点")
+        return ToolResult(success=True, result_for_llm="### 第 1 题\n\n运输层的核心功能是什么？")
+
+    def get_schema(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.get_args_schema().model_json_schema(),
+            },
+        }
+
+
 class _CompositeQuizTool:
     @property
     def name(self) -> str:
@@ -483,6 +580,7 @@ class _CompositeQuizTool:
 
         handoff = context.metadata["composite_handoff"]
         assert handoff["latest_result_text"].startswith("TCP 的复习重点")
+        wait_for_user = bool(context.metadata.get("agenda_next_goal_depends_on_user_input", False))
         return ToolResult(
             success=True,
             result_for_llm="### 第 1 题\n\nTCP 为什么需要三次握手？",
@@ -490,6 +588,19 @@ class _CompositeQuizTool:
                 "grounding_capable": True,
                 "final_response_preferred": True,
                 "generation_mode": "composite_handoff",
+                "completion_hint": "wait_user" if wait_for_user else "step_done",
+                "resume_payload": {
+                    "quiz_bundle": [
+                        {
+                            "index": 1,
+                            "question": "TCP 为什么需要三次握手？",
+                            "correct_answer": "为了确认双方收发能力并同步初始序号。",
+                            "question_type": "简答题",
+                            "topic": "TCP",
+                            "concepts": ["三次握手"],
+                        }
+                    ]
+                },
                 "citations": [
                     {"index": 1, "source": "tcp.pdf", "text_snippet": "TCP 使用三次握手建立连接。"}
                 ],
@@ -516,15 +627,62 @@ class _CompositeQuizFailTool(_CompositeQuizTool):
         return ToolResult(success=False, error="quiz generation failed")
 
 
+class _CompositeQuizEvaluatorTool:
+    @property
+    def name(self) -> str:
+        return "quiz_evaluator"
+
+    @property
+    def description(self) -> str:
+        return "composite quiz evaluator tool"
+
+    def get_args_schema(self):
+        class _Args(BaseModel):
+            items: list[dict[str, Any]] = Field(default_factory=list)
+            alignment_mode: str = Field(default="")
+            alignment_status: str = Field(default="")
+            split_confidence: float = Field(default=1.0)
+            clarification_reason: str = Field(default="")
+
+        return _Args
+
+    async def execute(self, context, args):
+        from src.agent.types import ToolResult
+
+        assert context.metadata.get("agenda_resume_payload", {}).get("quiz_bundle")
+        assert args.items
+        assert args.items[0]["question"] == "TCP 为什么需要三次握手？"
+        return ToolResult(
+            success=True,
+            result_for_llm="第 1 题：回答基本正确，注意补充初始序号同步。",
+            metadata={
+                "tool_output_kind": "final_answer",
+                "completion_hint": "step_done",
+                "evaluation_mode": "agenda_resume",
+            },
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.get_args_schema().model_json_schema(),
+            },
+        }
+
+
 class _CompositePlanner:
     def __init__(self, *, fail_second: bool = False) -> None:
         self.fail_second = fail_second
 
-    def plan(self, message, matched_skill=None):
+    def plan(self, message, matched_skill=None, skill_policy=None):
         from src.agent.planner import ControlMode, PlannedSubtask, PlannerDecision, TaskIntent
 
         subtasks = [
             PlannedSubtask(
+                goal_id="goal_1",
                 task_intent=TaskIntent.REVIEW_SUMMARY,
                 selected_tool="review_summary",
                 confidence=1.0,
@@ -532,6 +690,7 @@ class _CompositePlanner:
                 segment_text="总结 TCP 的重点",
             ),
             PlannedSubtask(
+                goal_id="goal_2",
                 task_intent=TaskIntent.QUIZ_GENERATOR,
                 selected_tool="quiz_generator",
                 confidence=1.0,
@@ -550,6 +709,54 @@ class _CompositePlanner:
             subtasks=subtasks,
             primary_intent=TaskIntent.REVIEW_SUMMARY,
             ordering_method="rule_span_order",
+        )
+
+
+class _ScopedCompositePlanner:
+    def plan(self, message, matched_skill=None, skill_policy=None):
+        from src.agent.planner import ControlMode, PlannedSubtask, PlannerDecision, TaskIntent
+
+        subtasks = [
+            PlannedSubtask(
+                goal_id="goal_1",
+                task_intent=TaskIntent.KNOWLEDGE_QUERY,
+                selected_tool="knowledge_query",
+                confidence=1.0,
+                source_span=(0, 10),
+                segment_text="讲 TCP 和 UDP 的区别",
+            ),
+            PlannedSubtask(
+                goal_id="goal_2",
+                task_intent=TaskIntent.REVIEW_SUMMARY,
+                selected_tool="review_summary",
+                confidence=1.0,
+                source_span=(11, 25),
+                segment_text="考前复习传输层",
+            ),
+            PlannedSubtask(
+                goal_id="goal_3",
+                task_intent=TaskIntent.QUIZ_GENERATOR,
+                selected_tool="quiz_generator",
+                confidence=1.0,
+                source_span=(26, 35),
+                segment_text="出两道题",
+            ),
+        ]
+        return PlannerDecision(
+            task_intent=TaskIntent.KNOWLEDGE_QUERY,
+            confidence=1.0,
+            match_method="rule_sequence_composite",
+            control_mode=ControlMode.AUTONOMOUS,
+            selected_tool="knowledge_query",
+            planner_hint="Scoped composite execution",
+            is_composite=True,
+            subtasks=subtasks,
+            primary_intent=TaskIntent.KNOWLEDGE_QUERY,
+            ordering_method="explicit_sequence_order",
+            matched_skill="exam_prep",
+            skill_start_index=1,
+            skill_end_index=2,
+            planner_execution_model="skill_guided_agenda",
         )
 
 
@@ -1187,18 +1394,66 @@ async def test_composite_plan_executes_subtasks_in_order(tmp_path: Path) -> None
     final_text = "".join(event.content or "" for event in events if event.type.value == "text_delta")
     assert "## 复习总结" in final_text
     assert "## 练习题" in final_text
+    assert "请直接回复你的作答内容，我会继续逐题批改。" in final_text
     done_event = next(event for event in events if event.type.value == "done")
-    assert done_event.metadata["composite"] is True
+    assert done_event.metadata["agenda_mode"] is True
+    assert done_event.metadata["request_status"] == "waiting_user"
     assert len(done_event.metadata["completed_subtasks"]) == 2
-    assert done_event.metadata["failed_subtask"] == {}
+    assert done_event.metadata["current_goal_index"] == 2
     assert llm.calls == 0
 
     trace = TraceService(trace_path).get_trace(done_event.metadata["trace_id"])
     assert trace is not None
     stage_names = [stage["stage"] for stage in trace["stages"]]
-    assert "composite_plan" in stage_names
-    assert "composite_subtask_execution" in stage_names
-    assert "composite_finalize" in stage_names
+    assert "agenda_plan" in stage_names
+
+
+@pytest.mark.asyncio
+async def test_composite_plan_applies_skill_only_within_scoped_interval(tmp_path: Path) -> None:
+    from src.agent.agent import Agent
+    from src.agent.config import AgentConfig
+    from src.agent.conversation import ConversationStore
+    from src.agent.tools.base import ToolRegistry
+
+    conversation = Conversation(id="conv_composite_scoped", user_id="u1", messages=[])
+    store = AsyncMock(spec=ConversationStore)
+    store.get.return_value = conversation
+    store.create.return_value = conversation
+    store.update.return_value = None
+
+    registry = ToolRegistry()
+    registry.register(_ScopedPrefixKnowledgeTool())
+    registry.register(_ScopedCompositeReviewTool())
+    registry.register(_ScopedCompositeQuizTool())
+
+    llm = _NoLlmExpected()
+    agent = Agent(
+        llm_service=llm,
+        tool_registry=registry,
+        conversation_store=store,
+        config=AgentConfig(stream_responses=False, max_tool_iterations=5),
+        task_planner=_ScopedCompositePlanner(),
+        trace_enabled=False,
+    )
+
+    events = [
+        event
+        async for event in agent.chat(
+            "先讲一下 TCP 和 UDP 的区别，再帮我考前复习传输层，再出两道题",
+            "u1",
+            "conv_composite_scoped",
+        )
+    ]
+
+    tool_starts = [event.tool_name for event in events if event.type.value == "tool_start"]
+    assert tool_starts == ["knowledge_query", "review_summary", "quiz_generator"]
+    done_event = next(event for event in events if event.type.value == "done")
+    assert done_event.metadata["planner_matched_skill"] == "exam_prep"
+    assert done_event.metadata["planner_skill_start_index"] == 1
+    assert done_event.metadata["planner_skill_end_index"] == 2
+    assert done_event.metadata["planner_execution_model"] == "skill_guided_agenda"
+    assert done_event.metadata["agenda_mode"] is True
+    assert done_event.metadata["request_status"] == "waiting_user"
 
 
 @pytest.mark.asyncio
@@ -1232,7 +1487,98 @@ async def test_composite_plan_returns_partial_success_on_failure(tmp_path: Path)
 
     final_text = "".join(event.content or "" for event in events if event.type.value == "text_delta")
     assert "## 复习总结" in final_text
-    assert "## 未完成项" in final_text
+    assert "quiz generation failed" in final_text
     done_event = next(event for event in events if event.type.value == "done")
     assert len(done_event.metadata["completed_subtasks"]) == 1
-    assert done_event.metadata["failed_subtask"]["selected_tool"] == "quiz_generator"
+    assert done_event.metadata["request_status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_agenda_runtime_resumes_quiz_evaluator_from_waiting_state() -> None:
+    from src.agent.agent import Agent
+    from src.agent.config import AgentConfig
+    from src.agent.conversation import ConversationStore
+    from src.agent.planner import TaskPlanner
+    from src.agent.tools.base import ToolRegistry
+
+    conversation = Conversation(id="conv_agenda_resume", user_id="u1", messages=[])
+    store = AsyncMock(spec=ConversationStore)
+    store.get.return_value = conversation
+    store.create.return_value = conversation
+    store.update.return_value = None
+
+    registry = ToolRegistry()
+    registry.register(_CompositeReviewTool())
+    registry.register(_CompositeQuizTool())
+    registry.register(_CompositeQuizEvaluatorTool())
+
+    agent = Agent(
+        llm_service=_NoLlmExpected(),
+        tool_registry=registry,
+        conversation_store=store,
+        config=AgentConfig(stream_responses=False, max_tool_iterations=3),
+        task_planner=TaskPlanner(),
+    )
+
+    first_events = [
+        event async for event in agent.chat("帮我先总结 TCP 的重点，再出 3 道题", "u1", "conv_agenda_resume")
+    ]
+    first_done = next(event for event in first_events if event.type.value == "done")
+    assert first_done.metadata["request_status"] == "waiting_user"
+    assert conversation.metadata["agenda_state"]["current_goal_index"] == 2
+
+    second_events = [
+        event async for event in agent.chat("第1题：为了确认双方收发能力。", "u1", "conv_agenda_resume")
+    ]
+    second_text = "".join(event.content or "" for event in second_events if event.type.value == "text_delta")
+    second_done = next(event for event in second_events if event.type.value == "done")
+
+    assert "判题结果" in second_text
+    assert "回答基本正确" in second_text
+    assert second_done.metadata["agenda_mode"] is True
+    assert second_done.metadata["agenda_resumed"] is True
+    assert second_done.metadata["request_status"] == "completed"
+    assert "agenda_state" not in conversation.metadata
+
+
+@pytest.mark.asyncio
+async def test_agenda_runtime_abandons_waiting_quiz_for_unrelated_request() -> None:
+    from src.agent.agent import Agent
+    from src.agent.config import AgentConfig
+    from src.agent.conversation import ConversationStore
+    from src.agent.planner import TaskPlanner
+    from src.agent.tools.base import ToolRegistry
+
+    conversation = Conversation(id="conv_agenda_abandon", user_id="u1", messages=[])
+    store = AsyncMock(spec=ConversationStore)
+    store.get.return_value = conversation
+    store.create.return_value = conversation
+    store.update.return_value = None
+
+    registry = ToolRegistry()
+    registry.register(_CompositeReviewTool())
+    registry.register(_CompositeQuizTool())
+    registry.register(_DocumentIngestTool())
+
+    agent = Agent(
+        llm_service=_NoLlmExpected(),
+        tool_registry=registry,
+        conversation_store=store,
+        config=AgentConfig(stream_responses=False, max_tool_iterations=3),
+        task_planner=TaskPlanner(),
+    )
+
+    first_events = [
+        event async for event in agent.chat("帮我先总结 TCP 的重点，再出 3 道题", "u1", "conv_agenda_abandon")
+    ]
+    first_done = next(event for event in first_events if event.type.value == "done")
+    assert first_done.metadata["request_status"] == "waiting_user"
+    assert "agenda_state" in conversation.metadata
+
+    events = [
+        event async for event in agent.chat("把这个 /tmp/test.pdf 导入知识库", "u1", "conv_agenda_abandon")
+    ]
+    done_event = next(event for event in events if event.type.value == "done")
+
+    assert done_event.metadata["agenda_abandoned"] is True
+    assert done_event.metadata["planner_task_intent"] == "document_ingest"

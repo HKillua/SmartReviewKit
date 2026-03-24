@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from src.agent.planner import ControlMode, TaskIntent, TaskPlanner
+from src.agent.skills.registry import SkillPolicy
 
 
 def _fake_embed(texts):
@@ -22,6 +23,21 @@ def _fake_embed(texts):
         else:
             vectors.append([0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
     return vectors
+
+
+def _fake_skill_match(text: str) -> str | None:
+    lowered = text.lower()
+    if "考前复习" in text or "期末复习" in text or "考试复习" in text:
+        return "exam_prep"
+    if "错题复盘" in text or "错题回顾" in text:
+        return "error_review"
+    if "刷题" in text or "出题" in text:
+        return "quiz_drill"
+    if "章节深入" in text or "深入讲" in text:
+        return "chapter_deep_dive"
+    if "知识图谱" in text or "掌握度" in text:
+        return "knowledge_check"
+    return None
 
 
 def test_rule_hit_review_summary_forces_tool() -> None:
@@ -102,3 +118,73 @@ def test_embedding_only_fallback_does_not_create_composite_plan() -> None:
 
     assert decision.is_composite is False
     assert decision.task_intent == TaskIntent.QUIZ_GENERATOR
+
+
+def test_plain_message_with_zai_does_not_false_split() -> None:
+    planner = TaskPlanner()
+    decision = planner.plan("我们再看一下 HTTP 为什么需要 TLS")
+
+    assert decision.is_composite is False
+    assert decision.task_intent == TaskIntent.KNOWLEDGE_QUERY
+
+
+def test_sequence_composite_tracks_skill_interval() -> None:
+    planner = TaskPlanner(skill_match_fn=_fake_skill_match)
+    policy = SkillPolicy(
+        allowed_tools=[
+            "concept_graph_query",
+            "knowledge_query",
+            "review_summary",
+            "quiz_generator",
+            "network_calc",
+        ],
+        allow_autonomous=True,
+        max_steps=5,
+    )
+
+    decision = planner.plan(
+        "先讲一下 TCP 和 UDP 的区别，再帮我考前复习传输层，再出两道题",
+        matched_skill="exam_prep",
+        skill_policy=policy,
+    )
+
+    assert decision.is_composite is True
+    assert decision.matched_skill == "exam_prep"
+    assert decision.skill_start_index == 1
+    assert decision.skill_end_index == 2
+    assert decision.planner_execution_model == "skill_guided_agenda"
+    assert [subtask.task_intent for subtask in decision.subtasks] == [
+        TaskIntent.KNOWLEDGE_QUERY,
+        TaskIntent.REVIEW_SUMMARY,
+        TaskIntent.QUIZ_GENERATOR,
+    ]
+
+
+def test_skill_interval_stops_at_incompatible_tool() -> None:
+    planner = TaskPlanner(skill_match_fn=_fake_skill_match)
+    policy = SkillPolicy(
+        allowed_tools=[
+            "concept_graph_query",
+            "knowledge_query",
+            "review_summary",
+            "quiz_generator",
+            "network_calc",
+        ],
+        allow_autonomous=True,
+        max_steps=5,
+    )
+
+    decision = planner.plan(
+        "先帮我考前复习传输层，再把这个 PDF 导入知识库，最后出两道题",
+        matched_skill="exam_prep",
+        skill_policy=policy,
+    )
+
+    assert decision.is_composite is True
+    assert decision.skill_start_index == 0
+    assert decision.skill_end_index == 0
+    assert [subtask.selected_tool for subtask in decision.subtasks] == [
+        "review_summary",
+        "document_ingest",
+        "quiz_generator",
+    ]

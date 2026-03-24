@@ -162,6 +162,7 @@ class ConceptGraphQueryTool(Tool[ConceptGraphQueryArgs]):
             result_for_llm="\n".join(lines).strip(),
             metadata={
                 "tool_output_kind": "analysis_context",
+                "completion_hint": "continue",
                 "graph_topic": node["title"],
                 "graph_query_type": query_type,
                 "graph_rows": rows,
